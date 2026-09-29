@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="color-scheme" content="dark"/>
+<title>MEME SNIPER — Multi-Wallet Solana Sniper</title>
+<meta name="description" content="A self-hosted Solana sniping bot with per-wallet strategies, real exit rules and no custody. Your keys, your RPC, your machine."/>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2064%2064%22%20width%3D%22256%22%20height%3D%22256%22%20role%3D%22img%22%20aria-label%3D%22Meme%20Sniper%22%3E%20%3Cdefs%3E%20%3CclipPath%20id%3D%22msLens%22%3E%20%3Ccircle%20cx%3D%2223.5%22%20cy%3D%2231.5%22%20r%3D%2212.6%22%2F%3E%20%3Ccircle%20cx%3D%2240.5%22%20cy%3D%2231.5%22%20r%3D%2212.6%22%2F%3E%20%3C%2FclipPath%3E%20%3C%2Fdefs%3E%20%3C%21--%20badge%20--%3E%20%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2214%22%20fill%3D%22%23080f0a%22%2F%3E%20%3C%21--%20Binocular%20barrels%3A%20a%20bright%20filled%20ring%20with%20the%20glass%20laid%20on%20top%2C%20rather%20than%20a%20stroked%20circle.%20Strokes%20with%20fill%3D%22none%22%20are%20dropped%20outright%20by%20some%20SVG%20renderers%20%28ImageMagick%2C%20for%20one%29%2C%20and%20an%20app%20icon%20has%20to%20survive%20a%20favicon%2C%20a%20PWA%20install%20and%20a%20link%20preview%20alike.%20--%3E%20%3Ccircle%20cx%3D%2223.5%22%20cy%3D%2231.5%22%20r%3D%2215.6%22%20fill%3D%22%2300e05c%22%2F%3E%20%3Ccircle%20cx%3D%2240.5%22%20cy%3D%2231.5%22%20r%3D%2215.6%22%20fill%3D%22%2300e05c%22%2F%3E%20%3Ccircle%20cx%3D%2223.5%22%20cy%3D%2231.5%22%20r%3D%2212.6%22%20fill%3D%22%230c4026%22%2F%3E%20%3Ccircle%20cx%3D%2240.5%22%20cy%3D%2231.5%22%20r%3D%2212.6%22%20fill%3D%22%230c4026%22%2F%3E%20%3C%21--%20the%20meme%2C%20seen%20through%20the%20field%20of%20view%20--%3E%20%3Cg%20clip-path%3D%22url%28%23msLens%29%22%3E%20%3Cellipse%20cx%3D%2224.6%22%20cy%3D%2227.6%22%20rx%3D%225.4%22%20ry%3D%226.2%22%20fill%3D%22%23ffffff%22%2F%3E%20%3Cellipse%20cx%3D%2239.4%22%20cy%3D%2227.6%22%20rx%3D%225.4%22%20ry%3D%226.2%22%20fill%3D%22%23ffffff%22%2F%3E%20%3Ccircle%20cx%3D%2225.8%22%20cy%3D%2228.8%22%20r%3D%222.7%22%20fill%3D%22%2304140a%22%2F%3E%20%3Ccircle%20cx%3D%2238.2%22%20cy%3D%2228.8%22%20r%3D%222.7%22%20fill%3D%22%2304140a%22%2F%3E%20%3Ccircle%20cx%3D%2226.8%22%20cy%3D%2227.7%22%20r%3D%220.95%22%20fill%3D%22%23ffffff%22%2F%3E%20%3Ccircle%20cx%3D%2239.2%22%20cy%3D%2227.7%22%20r%3D%220.95%22%20fill%3D%22%23ffffff%22%2F%3E%20%3Cpath%20d%3D%22M21.8%2036.6c2.2%205.2%206%207.8%2010.2%207.8s8-2.6%2010.2-7.8z%22%20fill%3D%22%23ffffff%22%2F%3E%20%3Cpath%20d%3D%22M28.8%2042.1c0%201.9%201.5%203.4%203.2%203.4s3.2-1.5%203.2-3.4z%22%20fill%3D%22%23ff6b81%22%2F%3E%20%3C%2Fg%3E%20%3C%21--%20reticle%20ticks%2C%20clear%20of%20the%20glass%20so%20they%20read%20at%20favicon%20size%20--%3E%20%3Crect%20x%3D%2230.7%22%20y%3D%225.5%22%20width%3D%222.6%22%20height%3D%225.6%22%20rx%3D%221.3%22%20fill%3D%22%2300ff66%22%2F%3E%20%3Crect%20x%3D%2230.7%22%20y%3D%2252.9%22%20width%3D%222.6%22%20height%3D%225.6%22%20rx%3D%221.3%22%20fill%3D%22%2300ff66%22%2F%3E%20%3Crect%20x%3D%225.5%22%20y%3D%2230.2%22%20width%3D%225.6%22%20height%3D%222.6%22%20rx%3D%221.3%22%20fill%3D%22%2300ff66%22%2F%3E%20%3Crect%20x%3D%2252.9%22%20y%3D%2230.2%22%20width%3D%225.6%22%20height%3D%222.6%22%20rx%3D%221.3%22%20fill%3D%22%2300ff66%22%2F%3E%20%3C%2Fsvg%3E"/>
+<style>
+  :root{
+    --bg:#08090b; --panel:#0e1014; --panel-2:#14171d; --border:#1e232c; --border-hi:#2a313d;
+    --text:#e8ecf5; --dim:#a8b0c2; --mute:#8b93a7;
+    --accent:#00ff66; --accent-dk:#00b34a;
+    --red:#ff4d5e; --amber:#ffb020; --blue:#7cc4ff;
+    --mono:'SF Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.6;-webkit-font-smoothing:antialiased}
+  a{color:inherit}
+  .wrap{max-width:1140px;margin:0 auto;padding:0 20px}
+  .mono{font-family:var(--mono)}
+
+  /* ------------------------------- nav ------------------------------- */
+  nav{position:sticky;top:0;z-index:50;background:rgba(8,9,11,.86);backdrop-filter:blur(14px);border-bottom:1px solid var(--border)}
+  .nav-in{display:flex;align-items:center;gap:22px;height:64px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:800;letter-spacing:-.4px;font-size:17px;text-decoration:none}
+  .mark{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;flex:0 0 auto}
+  .mark svg{width:100%;height:100%;display:block}
+  .nav-links{display:flex;gap:20px;margin-left:8px}
+  .nav-links a{color:var(--dim);text-decoration:none;font-size:13.5px;font-weight:600}
+  .nav-links a:hover{color:var(--text)}
+  .spacer{flex:1}
+  .btn{display:inline-flex;align-items:center;gap:8px;padding:11px 18px;border-radius:10px;border:1px solid var(--border-hi);background:var(--panel-2);color:var(--text);font-weight:700;font-size:14px;text-decoration:none;cursor:pointer;font-family:var(--sans)}
+  .btn:hover{border-color:#3a4351}
+  .btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent-dk));border-color:transparent;color:#04140a}
+  .btn-ghost{background:transparent}
+  .btn-lg{padding:15px 26px;font-size:15.5px;border-radius:12px}
+
+  /* ------------------------------ hero ------------------------------ */
+  header.hero{padding:76px 0 60px;position:relative;overflow:hidden}
+  .hero:before{content:'';position:absolute;inset:-40% 30% auto;height:520px;background:radial-gradient(closest-side,rgba(0,255,102,.10),transparent 70%);pointer-events:none}
+  .pill{display:inline-flex;align-items:center;gap:9px;padding:7px 14px;border-radius:999px;border:1px solid var(--border-hi);background:var(--panel);font-size:12px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--dim)}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);animation:p 1.6s infinite}
+  @keyframes p{0%,100%{opacity:1}50%{opacity:.3}}
+  h1{font-size:clamp(34px,6vw,58px);line-height:1.06;letter-spacing:-2px;margin:22px 0 18px;font-weight:800}
+  h1 em{font-style:normal;color:var(--accent)}
+  .lede{font-size:clamp(16px,2.1vw,19px);color:var(--dim);max-width:660px;margin:0 0 30px}
+  .cta{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  .fine{font-size:12.5px;color:var(--mute);margin-top:16px}
+
+  /* live strip — real data from THIS instance, or an honest nothing */
+  .live{margin-top:44px;border:1px solid var(--border);background:var(--panel);border-radius:14px;overflow:hidden}
+  .live-head{display:flex;align-items:center;gap:10px;padding:11px 16px;border-bottom:1px solid var(--border);font-size:11.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--mute);font-weight:700}
+  .live-grid{display:grid;grid-template-columns:repeat(4,1fr)}
+  .live-cell{padding:16px;border-right:1px solid var(--border)}
+  .live-cell:last-child{border-right:0}
+  .live-k{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--mute);font-weight:700;margin-bottom:6px}
+  .live-v{font-family:var(--mono);font-size:19px;font-weight:700}
+  .ok{color:var(--accent)} .warnc{color:var(--amber)} .livec{color:var(--red)}
+
+  /* --------------------------- sections --------------------------- */
+  section{padding:66px 0;border-top:1px solid var(--border)}
+  h2{font-size:clamp(24px,3.6vw,34px);letter-spacing:-1px;margin:0 0 12px;font-weight:800}
+  .sub{color:var(--dim);max-width:720px;margin:0 0 34px;font-size:16px}
+  .eyebrow{font-size:11.5px;letter-spacing:1.4px;text-transform:uppercase;color:var(--accent);font-weight:800;margin-bottom:12px}
+
+  .grid{display:grid;gap:16px}
+  .g3{grid-template-columns:repeat(3,1fr)}
+  .g2{grid-template-columns:repeat(2,1fr)}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:22px}
+  .card h3{margin:0 0 8px;font-size:16.5px;letter-spacing:-.3px}
+  .card p{margin:0;color:var(--dim);font-size:14px}
+  .ico{font-size:20px;margin-bottom:12px;display:block}
+
+  /* claims table */
+  .cmp{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden;font-size:14.5px}
+  .cmp th,.cmp td{padding:14px 16px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
+  .cmp th{font-size:11.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--mute);background:var(--panel-2)}
+  .cmp tr:last-child td{border-bottom:0}
+  .cmp td:first-child{color:var(--mute);width:34%}
+  .van{color:var(--dim)}
+  .yes{color:var(--accent);font-weight:700}
+  .no{color:var(--red);font-weight:700}
+
+  ol.steps{counter-reset:s;list-style:none;padding:0;margin:0;display:grid;gap:14px}
+  ol.steps li{counter-increment:s;position:relative;padding:18px 18px 18px 62px;background:var(--panel);border:1px solid var(--border);border-radius:13px}
+  ol.steps li:before{content:counter(s);position:absolute;left:16px;top:16px;width:30px;height:30px;border-radius:9px;background:rgba(0,255,102,.12);color:var(--accent);display:grid;place-items:center;font-weight:800;font-family:var(--mono)}
+  ol.steps b{display:block;margin-bottom:3px}
+  ol.steps span{color:var(--dim);font-size:14px}
+
+  details{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:15px 18px;margin-bottom:10px}
+  details summary{cursor:pointer;font-weight:700;font-size:15px;list-style:none}
+  details summary::-webkit-details-marker{display:none}
+  details summary:before{content:'+ ';color:var(--accent);font-family:var(--mono)}
+  details[open] summary:before{content:'− '}
+  details p{color:var(--dim);margin:12px 0 0;font-size:14.5px}
+
+  .note{border:1px solid rgba(255,176,32,.28);background:rgba(255,176,32,.07);border-radius:12px;padding:16px 18px;color:#ffd88a;font-size:14.5px}
+  .note b{color:#ffe9b8}
+
+  footer{border-top:1px solid var(--border);padding:34px 0 54px;color:var(--mute);font-size:13px}
+  .foot-in{display:flex;gap:18px;flex-wrap:wrap;align-items:center}
+
+  @media(max-width:900px){.g3{grid-template-columns:1fr 1fr}.live-grid{grid-template-columns:1fr 1fr}.live-cell:nth-child(2){border-right:0}}
+  @media(max-width:640px){
+    .nav-links{display:none}
+    .g3,.g2{grid-template-columns:1fr}
+    .live-grid{grid-template-columns:1fr 1fr}
+    header.hero{padding:48px 0 40px}
+    section{padding:48px 0}
+    .cmp{font-size:13.5px}
+    .cmp th,.cmp td{padding:11px 12px}
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap nav-in">
+    <a class="brand" href="/"><span class="mark"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="26" height="26" role="img" aria-label="Meme Sniper"> <defs> <clipPath id="msLens"> <circle cx="23.5" cy="31.5" r="12.6"/> <circle cx="40.5" cy="31.5" r="12.6"/> </clipPath> </defs> <!-- badge --> <rect width="64" height="64" rx="14" fill="#080f0a"/> <!-- Binocular barrels: a bright filled ring with the glass laid on top, rather than a stroked circle. Strokes with fill="none" are dropped outright by some SVG renderers (ImageMagick, for one), and an app icon has to survive a favicon, a PWA install and a link preview alike. --> <circle cx="23.5" cy="31.5" r="15.6" fill="#00e05c"/> <circle cx="40.5" cy="31.5" r="15.6" fill="#00e05c"/> <circle cx="23.5" cy="31.5" r="12.6" fill="#0c4026"/> <circle cx="40.5" cy="31.5" r="12.6" fill="#0c4026"/> <!-- the meme, seen through the field of view --> <g clip-path="url(#msLens)"> <ellipse cx="24.6" cy="27.6" rx="5.4" ry="6.2" fill="#ffffff"/> <ellipse cx="39.4" cy="27.6" rx="5.4" ry="6.2" fill="#ffffff"/> <circle cx="25.8" cy="28.8" r="2.7" fill="#04140a"/> <circle cx="38.2" cy="28.8" r="2.7" fill="#04140a"/> <circle cx="26.8" cy="27.7" r="0.95" fill="#ffffff"/> <circle cx="39.2" cy="27.7" r="0.95" fill="#ffffff"/> <path d="M21.8 36.6c2.2 5.2 6 7.8 10.2 7.8s8-2.6 10.2-7.8z" fill="#ffffff"/> <path d="M28.8 42.1c0 1.9 1.5 3.4 3.2 3.4s3.2-1.5 3.2-3.4z" fill="#ff6b81"/> </g> <!-- reticle ticks, clear of the glass so they read at favicon size --> <rect x="30.7" y="5.5" width="2.6" height="5.6" rx="1.3" fill="#00ff66"/> <rect x="30.7" y="52.9" width="2.6" height="5.6" rx="1.3" fill="#00ff66"/> <rect x="5.5" y="30.2" width="5.6" height="2.6" rx="1.3" fill="#00ff66"/> <rect x="52.9" y="30.2" width="5.6" height="2.6" rx="1.3" fill="#00ff66"/> </svg></span> MEME SNIPER</a>
+    <div class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#honest">Honest limits</a>
+      <a href="#how">How it works</a>
+      <a href="#faq">FAQ</a>
+    </div>
+    <div class="spacer"></div>
+    <a class="btn btn-primary" href="/terminal">▶ Open Terminal</a>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="pill"><span class="dot"></span> Self-hosted · Non-custodial · Dry-run by default</span>
+    <h1>The sniping bot that tells you<br/><em>the truth</em> about your bag.</h1>
+    <p class="lede">
+      Every wallet gets its own strategy — its own take-profit tiers, trailing stop, loss limit and
+      liquidity range. The bot runs on your machine, signs from keys you hold, and can only move funds
+      you deliberately moved into a burner first.
+    </p>
+    <div class="cta">
+      <a class="btn btn-primary btn-lg" href="/terminal">▶ Open Terminal</a>
+      <a class="btn btn-ghost btn-lg" href="#honest">What it does not do</a>
+    </div>
+    <p class="fine">No sign-up. No email. No telemetry. No address of ours to send your SOL to.</p>
+
+    <!-- Real numbers from THIS instance, or nothing. Never invented. -->
+    <div class="live">
+      <div class="live-head"><span class="dot" id="liveDot"></span><span id="liveLabel">Checking this instance…</span></div>
+      <div class="live-grid">
+        <div class="live-cell"><div class="live-k">Engine</div><div class="live-v" id="lvEngine">—</div></div>
+        <div class="live-cell"><div class="live-k">Mode</div><div class="live-v" id="lvMode">—</div></div>
+        <div class="live-cell"><div class="live-k">Wallets</div><div class="live-v" id="lvWallets">—</div></div>
+        <div class="live-cell"><div class="live-k">Keystore</div><div class="live-v" id="lvKeys">—</div></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ============================ FEATURES ============================ -->
+<section id="features">
+  <div class="wrap">
+    <div class="eyebrow">What is actually in the box</div>
+    <h2>Features that exist in the code</h2>
+    <p class="sub">
+      Not a feature list copied from a marketing page — every item below is implemented, tested, and
+      documented in the project README.
+    </p>
+
+    <div class="grid g3">
+      <div class="card"><span class="ico">📉</span><h3>Trailing stop</h3>
+        <p>Activates at a gain you set, then ratchets up with the peak and never loosens. The peak is
+        preserved across a restart, so a long hold keeps the gains it already earned.</p></div>
+
+      <div class="card"><span class="ico">🛡️</span><h3>Hard loss limit</h3>
+        <p>Per trade and per day. Hit the daily number and that wallet stops opening anything new —
+        the circuit breaker is per wallet, not a global panic that takes the others down with it.</p></div>
+
+      <div class="card"><span class="ico">🎯</span><h3>Partial sells</h3>
+        <p>Sell X% at +Y%, in as many tiers as you like, highest threshold first. Sizes are absolute
+        token amounts, so several tiers firing in one tick cannot undersell each other.</p></div>
+
+      <div class="card"><span class="ico">👛</span><h3>A strategy per wallet</h3>
+        <p>Each wallet carries its own sizing, exits, limits, filters and AI settings. One can scalp
+        tight while another holds for a large target. They do not share anything.</p></div>
+
+      <div class="card"><span class="ico">🌊</span><h3>Liquidity range</h3>
+        <p>Snipe tokens whose bonding curve holds between a floor and a ceiling of real SOL. Because
+        that number grows as others buy, it doubles as a timing control: how early you are willing to enter.</p></div>
+
+      <div class="card"><span class="ico">🔬</span><h3>Rug checks before the buy</h3>
+        <p>Mint and freeze authority, top-holder concentration, dev holdings, bonding-curve progress,
+        metadata and socials. Hard fails block the trade; unknown data never does.</p></div>
+
+      <div class="card"><span class="ico">🤖</span><h3>Optional AI veto</h3>
+        <p>Bring your own key (OpenAI, Anthropic, Gemini, xAI) and the model gets a yes/no veto over
+        every candidate. Leave it off and nothing changes. It fails open, and it never moves money.</p></div>
+
+      <div class="card"><span class="ico">💸</span><h3>Fund and withdraw in-app</h3>
+        <p>Connect your own wallet, approve a transfer, and the burner is funded. Withdraw all of it or
+        an amount you type — to your own address, never to one of ours.</p></div>
+
+      <div class="card"><span class="ico">⛔</span><h3>Kill switches that work</h3>
+        <p>Kill one position, kill a wallet (and stop it), or panic everything. They market-sell at any
+        price and report honestly if they could not.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= HONEST LIMITS ======================= -->
+<section id="honest">
+  <div class="wrap">
+    <div class="eyebrow">The part other bots leave out</div>
+    <h2>What it does <em>not</em> do</h2>
+    <p class="sub">
+      This project started as a source-level audit of a sniping site that turned out to be a wallet
+      drainer wrapped in a fake terminal. It advertised everything and built nothing. So here is the
+      comparison, side by side.
+    </p>
+
+    <table class="cmp">
+      <thead><tr><th>Claim</th><th>The drainer site</th><th>This bot</th></tr></thead>
+      <tbody>
+        <tr><td>Execution speed</td><td class="van">“Sub-10ms, private nodes.”</td><td><span class="no">No claim.</span> Your latency is your RPC. Jito bundles and priority fees are supported and configurable.</td></tr>
+        <tr><td>Rug detection</td><td class="van">“Neural net, 2.4M scams, 99.2% accurate.”</td><td><span class="yes">Real checks</span> on authority, holders, dev, curve, metadata. No invented accuracy figure.</td></tr>
+        <tr><td>Copy trading</td><td class="van">“Mirror top snipers by PnL.”</td><td><span class="no">Not built.</span></td></tr>
+        <tr><td>Multi-chain</td><td class="van">“Base, Blast, L2s coming Q1.”</td><td><span class="no">Solana only.</span></td></tr>
+        <tr><td>Social proof</td><td class="van">“42,000 traders · 4.7 on Trustpilot · CertiK audited.”</td><td><span class="no">None, because it would be a lie.</span> There is no user count to quote.</td></tr>
+        <tr><td>Live profit ticker</td><td class="van">Synthetic handles showing fabricated profits.</td><td><span class="yes">Your own P&amp;L</span> from your own positions. The strip above reports this instance only.</td></tr>
+        <tr><td>Who holds the keys</td><td class="van">18 wallet adapters wired for <span class="mono">signMessage</span> and <span class="mono">signAllTransactions</span>.</td><td><span class="yes">You do.</span> Keys are AES-256-GCM encrypted locally, held in memory only, and the bot locks itself on restart.</td></tr>
+        <tr><td>Recovery from a restart</td><td class="van">“Auto-restart on network glitches.”</td><td><span class="yes">Positions are written down</span> and re-adopted after a restart, verified against the on-chain balance before they are trusted.</td></tr>
+        <tr><td>Profitability</td><td class="van">“Best today +184x.”</td><td><span class="no">No promise.</span> Most memecoin snipes lose money. Size like it.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="note" style="margin-top:18px">
+      <b>Read this before you fund anything.</b> Sniping new launches is close to zero-sum against
+      bots that are faster than you, and the tokens that pump are the minority. This tool gives you
+      discipline and honest accounting — it does not give you an edge you did not have. Start in
+      dry-run, stay small, and never fund a burner with more than you would shrug off.
+    </div>
+  </div>
+</section>
+
+<!-- ========================== HOW IT WORKS ========================== -->
+<section id="how">
+  <div class="wrap">
+    <div class="eyebrow">From nothing to funded</div>
+    <h2>How it works</h2>
+    <p class="sub">Four steps, all inside the Terminal. No account, no KYC, no deposit address.</p>
+
+    <ol class="steps">
+      <li><b>Set a passphrase</b><span>The keystore is created on your machine and encrypted with AES-256-GCM. It locks itself on every restart, by design.</span></li>
+      <li><b>Create a burner wallet</b><span>A throwaway hot wallet the bot generates and holds the key for. Name it. Give it its own strategy: exits, limits, filters.</span></li>
+      <li><b>Fund it from your own wallet</b><span>Connect Phantom, Solflare, Backpack or Magic Eden, type an amount, approve the transfer. There is no address of ours to send to — ever.</span></li>
+      <li><b>Start it and watch</b><span>Press Start on the wallet. Dry-run is on until you deliberately turn it off, twice.</span></li>
+    </ol>
+  </div>
+</section>
+
+<!-- ============================== FAQ ============================== -->
+<section id="faq">
+  <div class="wrap">
+    <div class="eyebrow">Questions worth asking</div>
+    <h2>FAQ</h2>
+    <p class="sub"></p>
+
+    <details><summary>Does closing the browser tab stop the bot?</summary>
+      <p>No. The engine runs as a process on your machine and the browser is only a remote control over
+      a WebSocket. Measured on this build: with the dashboard closed, the scanner kept detecting
+      launches and the price feed stayed healthy. Exits do not need a tab to be open.</p></details>
+
+    <details><summary>What happens if the bot restarts while I hold a 24-hour position?</summary>
+      <p>Open positions are written to <span class="mono">data/positions.json</span>. When the bot comes
+      back and the keystore is unlocked, each one is checked against the wallet's real on-chain balance
+      and re-adopted — with its cost basis and its trailing-stop peak intact. If a balance read fails,
+      the position is kept for the next attempt rather than forgotten, because unknown is not zero.</p></details>
+
+    <details><summary>Why is the keystore locked? I never locked it.</summary>
+      <p>Because it locks itself on every restart. Your keys live in memory only while running and are
+      never written to disk unencrypted, so a fresh boot always starts locked. That is a safety feature,
+      not a fault. Unlock once and it stays unlocked until the next restart.</p></details>
+
+    <details><summary>Can the bot take my main wallet?</summary>
+      <p>No. It never asks for your seed phrase, and the only thing it ever asks your connected wallet to
+      sign is a transfer it authored, which the server verifies instruction-by-instruction before
+      broadcasting: program, source, destination, amount and payer must all match the intent you
+      approved. <span class="mono">signAllTransactions</span> and <span class="mono">signMessage</span>
+      appear nowhere in the codebase.</p></details>
+
+    <details><summary>What do I need to run it?</summary>
+      <p>Node 20 and a Solana RPC endpoint. The public one works but rate-limits hard; a free Helius or
+      QuickNode key makes a large difference. A full deployment guide for running it locally and on
+      Render is in the README.</p></details>
+
+    <details><summary>Is it audited?</summary>
+      <p>No, and anyone who says otherwise about their own bot is selling something. It ships with 99
+      tests, the money-handling paths are covered, and the source is short enough to read. Treat it as
+      a tool you are responsible for, not a product you are insured against.</p></details>
+  </div>
+</section>
+
+<!-- ============================= FINAL CTA ============================= -->
+<section>
+  <div class="wrap" style="text-align:center">
+    <h2>Take it for a spin — with no money in it</h2>
+    <p class="sub" style="margin:0 auto 30px">
+      Dry-run is the default. Positions, P&amp;L, tiers and exits all run exactly as they do live,
+      against a notional balance, so you can watch the logic decide before it costs you anything.
+    </p>
+    <div class="cta" style="justify-content:center">
+      <a class="btn btn-primary btn-lg" href="/terminal">▶ Open Terminal</a>
+    </div>
+    <p class="fine">Wallet setup, funding and strategy configuration all live behind that button.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot-in">
+    <span class="brand" style="font-size:14px"><span class="mark" style="width:22px;height:22px"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="26" height="26" role="img" aria-label="Meme Sniper"> <defs> <clipPath id="msLens"> <circle cx="23.5" cy="31.5" r="12.6"/> <circle cx="40.5" cy="31.5" r="12.6"/> </clipPath> </defs> <!-- badge --> <rect width="64" height="64" rx="14" fill="#080f0a"/> <!-- Binocular barrels: a bright filled ring with the glass laid on top, rather than a stroked circle. Strokes with fill="none" are dropped outright by some SVG renderers (ImageMagick, for one), and an app icon has to survive a favicon, a PWA install and a link preview alike. --> <circle cx="23.5" cy="31.5" r="15.6" fill="#00e05c"/> <circle cx="40.5" cy="31.5" r="15.6" fill="#00e05c"/> <circle cx="23.5" cy="31.5" r="12.6" fill="#0c4026"/> <circle cx="40.5" cy="31.5" r="12.6" fill="#0c4026"/> <!-- the meme, seen through the field of view --> <g clip-path="url(#msLens)"> <ellipse cx="24.6" cy="27.6" rx="5.4" ry="6.2" fill="#ffffff"/> <ellipse cx="39.4" cy="27.6" rx="5.4" ry="6.2" fill="#ffffff"/> <circle cx="25.8" cy="28.8" r="2.7" fill="#04140a"/> <circle cx="38.2" cy="28.8" r="2.7" fill="#04140a"/> <circle cx="26.8" cy="27.7" r="0.95" fill="#ffffff"/> <circle cx="39.2" cy="27.7" r="0.95" fill="#ffffff"/> <path d="M21.8 36.6c2.2 5.2 6 7.8 10.2 7.8s8-2.6 10.2-7.8z" fill="#ffffff"/> <path d="M28.8 42.1c0 1.9 1.5 3.4 3.2 3.4s3.2-1.5 3.2-3.4z" fill="#ff6b81"/> </g> <!-- reticle ticks, clear of the glass so they read at favicon size --> <rect x="30.7" y="5.5" width="2.6" height="5.6" rx="1.3" fill="#00ff66"/> <rect x="30.7" y="52.9" width="2.6" height="5.6" rx="1.3" fill="#00ff66"/> <rect x="5.5" y="30.2" width="5.6" height="2.6" rx="1.3" fill="#00ff66"/> <rect x="52.9" y="30.2" width="5.6" height="2.6" rx="1.3" fill="#00ff66"/> </svg></span> MEME SNIPER</span>
+    <div class="spacer"></div>
+    <a class="btn btn-ghost" href="/terminal">▶ Open Terminal</a>
+  </div>
+  <div class="wrap" style="margin-top:18px">
+    MEME SNIPER is self-hosted software for Solana. Not financial advice, not affiliated with pump.fun,
+    Phantom, Jupiter or any of the sites it was written to replace. Nothing on this page is a promise of profit.
+  </div>
+</footer>
+
+<script>
+/* The live strip reports THIS instance and nothing else. When the API is not
+   reachable it says so rather than showing a number it cannot back up. */
+(async () => {
+  const set = (id, text, cls) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'live-v' + (cls ? ' ' + cls : '');
+  };
+  set('liveLabel', 'Live from this instance · read from the running bot');
+  try {
+    const res = await fetch('/api/status', { cache: 'no-store' });
+    if (!res.ok) throw new Error('not the bot');
+    const d = await res.json();
+    if (!d || !d.engine) throw new Error('not the bot');
+    const e = d.engine;
+    set('lvEngine', e.running ? 'Running' : 'Stopped', e.running ? 'ok' : 'warnc');
+    set('lvMode', e.dryRun ? 'Dry run' : 'LIVE', e.dryRun ? 'ok' : 'livec');
+    set('lvWallets', String(e.wallets ?? '—'));
+    set('lvKeys', d.keystore?.unlocked ? 'Unlocked' : 'Locked', d.keystore?.unlocked ? 'ok' : 'warnc');
+    if (e.running && !e.dryRun) {
+      document.getElementById('liveLabel').textContent = 'Live from this instance · 🔴 REAL FUNDS ARE ACTIVE';
+    }
+  } catch {
+    document.getElementById('liveLabel').textContent =
+      'Offline preview — this is a static file, there is no bot behind it';
+    ['lvEngine', 'lvMode', 'lvWallets', 'lvKeys'].forEach((k) => set(k, '—'));
+    document.getElementById('liveDot').style.background = 'var(--amber)';
+  }
+})();
+</script>
+</body>
+</html>
