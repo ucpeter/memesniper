@@ -1,0 +1,72 @@
+# Render blueprint — deploy MEME SNIPER as a web service.
+#
+# ⚠  READ docs/DEPLOYMENT.md BEFORE USING THIS.
+#
+# Two things make this deployment different from a typical web app:
+#
+#   1. THE DISK IS NOT OPTIONAL. data/ holds your encrypted private keys.
+#      Without the disk below, every deploy and every restart destroys them and
+#      the wallets become unrecoverable. Render disks require a paid instance.
+#
+#   2. THE SERVICE MUST NOT SLEEP. A sniping bot has to be running when the
+#      token launches. Free instances spin down after ~15 minutes idle, so the
+#      bot is simply not running most of the time. Use a paid plan for live use.
+
+services:
+  - type: web
+    name: snipersol
+    runtime: node
+    plan: starter            # free instances cannot attach disks
+    region: frankfurt        # pick the region closest to you
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: false        # deploy deliberately, not on every push
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+
+      # --- secrets -------------------------------------------------------
+      # Required for any hosted deployment. Without it a random token is
+      # generated each boot and printed to the log stream, and the dashboard is
+      # reachable by anyone who reads those logs.
+      # Generate with:  openssl rand -hex 32
+      - key: SESSION_TOKEN
+        sync: false          # set in the dashboard, never committed
+        generateValue: true
+
+      # --- storage -------------------------------------------------------
+      # Point the app at the mounted disk. The default (./data inside the repo)
+      # is destroyed on every deploy.
+      - key: DATA_DIR
+        value: /var/data
+
+      # --- RPC -----------------------------------------------------------
+      # The public endpoint rate-limits almost every request under a sniping
+      # workload and will silently starve the engine. Use a paid provider.
+      - key: RPC_URL
+        sync: false
+      - key: RPC_WS_URL
+        sync: false
+
+      # --- trading -------------------------------------------------------
+      - key: SWAP_PROVIDER
+        value: pumpportal
+      # Leave unset to stay in dry run (recommended for a first deploy).
+      # Arming live headlessly takes BOTH of these — DRY_RUN=false alone is
+      # deliberately not enough, so a single typo cannot start real trading.
+      # Prefer arming from the dashboard instead; it is clearer and reversible.
+      # - key: DRY_RUN
+      #   value: "false"
+      # - key: I_UNDERSTAND_THE_RISK
+      #   value: "yes"
+
+      - key: LOG_LEVEL
+        value: info
+      - key: PRICE_POLL_MS
+        value: "1200"
+
+    disk:
+      name: snipersol-data
+      mountPath: /var/data
+      sizeGB: 1
