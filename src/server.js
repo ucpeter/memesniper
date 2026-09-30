@@ -10,6 +10,7 @@
  *   • API keys are masked in all read responses.
  */
 const express = require('express');
+const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -68,6 +69,7 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     res.json({
       engine: engine.status(),
       keystore: { initialised: keystore.isInitialised(), unlocked: keystore.isUnlocked() },
+      storage: storageStatus(),
       global: sanitiseGlobal(g),
       presets: PRESETS,
     });
@@ -78,6 +80,35 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     // in the server console; this just avoids copy-pasting it into the page.
     res.json({ token: SESSION_TOKEN });
   });
+
+  const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
+  const backupDir = () => { try { fs.mkdirSync(path.dirname(keystore.KEYSTORE_PATH), { recursive: true }); } catch { /* exists */ } };
+
+  /**
+   * Where the data actually lives, and whether this host keeps it.
+   *
+   * Render (and most container hosts) hand out an EPHEMERAL filesystem on their
+   * free tiers: the service sleeps when idle and the disk is rebuilt on wake. A
+   * bot that silently loses the user's wallets every time it idles is not usable,
+   * so the dashboard says so before it happens, and offers the backup button.
+   */
+  function storageStatus() {
+    const dir = path.dirname(keystore.KEYSTORE_PATH);
+    const onRender = Boolean(process.env.RENDER);
+    // Render sets RENDER=true for every service. A persistent disk is the answer,
+    // and the documented path for it is /var/data, which arrives as DATA_DIR.
+    const usingVolume = Boolean(process.env.DATA_DIR);
+    const ephemeral = onRender && !usingVolume;
+    return {
+      dataDir: dir,
+      ephemeral,
+      reason: ephemeral
+        ? 'This host rebuilds its disk when the service sleeps or redeploys, so the keystore and wallet list are destroyed each time. Attach a persistent disk and set DATA_DIR to its mount path, or restore from a backup after each wake.'
+        : (usingVolume
+          ? 'DATA_DIR is set, so this host is expected to keep its disk across restarts.'
+          : 'Storing data next to the app. It survives a restart only if the directory does.'),
+    };
+  }
 
   /* ------------------------------ keystore ------------------------------- */
   app.get('/api/keystore/status', (req, res) => {
@@ -110,6 +141,108 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
   app.post('/api/keystore/lock', requireToken, (req, res) => {
     keystore.lock();
     res.json({ ok: true });
+  });
+
+  /**
+   * The live scanner feed: every launch this session, what the checks found, and
+   * what each wallet decided. Newest first.
+   *
+   * Also pushed on the WebSocket as `scan:update`; this route is for a page load, a
+   * curl, or anything that wants the current state without holding a socket open.
+   */
+  app.get('/api/scan', requireToken, (req, res) => {
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 60));
+    const st = engine.status();
+    res.json({
+      rows: engine.liveFeed ? engine.liveFeed.snapshot(limit) : [],
+      stats: engine.liveFeed ? engine.liveFeed.stats : null,
+      scanner: { source: st.scanner.source, connected: st.scanner.connected },
+      hint: 'Newest first. decision is checking | bought | skipped | error; skipReason says why.',
+    });
+  });
+
+  /* ------------------------------- backup -------------------------------- */
+
+  /**
+   * One file the user can keep: the encrypted keystore plus the wallet config.
+   *
+   * The keystore is exported exactly as it sits on disk — still encrypted under
+   * the user's passphrase. This endpoint cannot leak a key even if the download
+   * is intercepted, which is what makes it safe to store a backup anywhere.
+   */
+  app.get('/api/backup', requireToken, (req, res) => {
+    const ksPath = keystore.KEYSTORE_PATH;
+    if (!fs.existsSync(ksPath)) {
+      return res.status(400).json({ error: 'nothing_to_back_up', hint: 'No keystore has been created yet.' });
+    }
+    const backup = {
+      kind: 'meme-sniper-backup',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      // Still encrypted. Useless without the passphrase, by design.
+      keystore: JSON.parse(fs.readFileSync(ksPath, 'utf8')),
+      config: getFull(),
+      note: 'The keystore inside this file is encrypted with your passphrase. Keep the passphrase safe separately: without it this backup cannot be read, by anyone.',
+    };
+    const name = `meme-sniper-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
+    res.json(backup);
+  });
+
+  /**
+   * Put a backup back.
+   *
+   * This exists because a host with an ephemeral disk (Render's free plan, most
+   * container hosts) destroys the keystore every time the service sleeps or
+   * redeploys. Without this the answer would be "your wallets are gone, again",
+   * every time it idled overnight.
+   *
+   * The restored keystore arrives locked: the passphrase was never in the backup,
+   * so it has to be typed again. That is the point.
+   */
+  app.post('/api/restore', requireToken, (req, res) => {
+    if (req.body.confirm !== 'RESTORE') {
+      return res.status(400).json({ error: 'confirmation_required', hint: "Send confirm: 'RESTORE' to replace the current keystore." });
+    }
+    const b = req.body.backup;
+    if (!b || b.kind !== 'meme-sniper-backup') {
+      return res.status(400).json({ error: 'not_a_backup', hint: 'Expected a file downloaded from the Backup button.' });
+    }
+    if (!b.keystore || !b.config || !Array.isArray(b.config.wallets)) {
+      return res.status(400).json({ error: 'backup_incomplete', hint: 'The backup is missing its keystore or wallet list.' });
+    }
+
+    // Archive whatever is there now, so a wrong restore is undoable.
+    let archived = null;
+    try {
+      backupDir();
+      if (fs.existsSync(keystore.KEYSTORE_PATH)) {
+        archived = `${keystore.KEYSTORE_PATH}.replaced-${stamp()}`;
+        fs.renameSync(keystore.KEYSTORE_PATH, archived);
+      }
+      fs.writeFileSync(keystore.KEYSTORE_PATH, JSON.stringify(b.keystore), { mode: 0o600 });
+      // Mutate the live config in place: the engine and every route hold a
+      // reference to this object, so replacing it wholesale would leave them
+      // pointing at the old one.
+      const live = getFull();
+      if (b.config.global) Object.assign(live.global, b.config.global);
+      live.wallets.length = 0;
+      live.wallets.push(...b.config.wallets);
+      saveConfig();
+    } catch (err) {
+      return res.status(500).json({ error: `restore_failed: ${err.message}` });
+    }
+
+    keystore.lock(); // the passphrase was not in the backup, so it starts locked
+    if (engine.resetTraders) engine.resetTraders();
+    const loaded = engine.hydrate ? engine.hydrate() : 0;
+    res.json({
+      ok: true,
+      archived,
+      wallets: b.config.wallets.length,
+      walletsLoaded: loaded,
+      hint: 'Open the keystore with the passphrase that was in use when this backup was taken.',
+    });
   });
 
   /**
@@ -652,6 +785,10 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
         status: engine.status(),
         wallets: [...engine.traders.values()].map((t) => t.toJSON()),
         positions: [...engine.traders.values()].flatMap((t) => [...t.positions.values()].map((p) => p.toJSON())),
+        // Every launch already scanned this session, newest first, so the live
+        // scanner table is populated when the page loads rather than only after the
+        // next launch happens to arrive.
+        scanFeed: engine.liveFeed ? engine.liveFeed.snapshot(60) : [],
         logs: log.history(120),
         prices: Object.fromEntries(engine.priceCache),
       },
@@ -678,6 +815,7 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
       ['engine:panic', 'panic'],
       ['engine:resumed', 'resumed'],
       ['scanner:status', 'scanner'],
+      ['scan:update', 'scan'],
       ['token:skipped', 'skipped'],
       ['trade:failed', 'error'],
       ['exec:filed', 'exec'],

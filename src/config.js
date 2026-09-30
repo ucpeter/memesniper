@@ -341,6 +341,29 @@ function applyEnvOverrides(global) {
       global.rpc.wsEndpoint = process.env.RPC_WS_URL;
     }
   }
+  // Jito is infrastructure: the endpoint and the tip are operator settings, and the
+  // tip is real money leaving the wallet, so it must be settable from the host's
+  // environment without editing a config file that a previous run wrote.
+  if (process.env.JITO_ENABLED) {
+    const on = /^(1|true|yes)$/i.test(process.env.JITO_ENABLED.trim());
+    if (global.jito.enabled !== on) {
+      overridden.push(`jito.enabled → ${on}`);
+      global.jito.enabled = on;
+    }
+  }
+  if (process.env.JITO_TIP_SOL) {
+    const lamports = Math.round(Number(process.env.JITO_TIP_SOL) * 1e9);
+    if (Number.isFinite(lamports) && lamports > 0 && global.jito.tipLamports !== lamports) {
+      overridden.push(`jito.tipLamports → ${lamports}`);
+      global.jito.tipLamports = lamports;
+    }
+  }
+  if (process.env.JITO_BLOCK_ENGINE_URL) {
+    if (global.jito.blockEngineUrl !== process.env.JITO_BLOCK_ENGINE_URL) {
+      overridden.push('jito.blockEngineUrl');
+      global.jito.blockEngineUrl = process.env.JITO_BLOCK_ENGINE_URL;
+    }
+  }
   if (process.env.SCANNER_CONCURRENCY) {
     const n = Math.max(1, Number(process.env.SCANNER_CONCURRENCY) || 2);
     if (global.scanner.evaluateConcurrency !== n) {
