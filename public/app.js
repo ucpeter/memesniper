@@ -165,6 +165,43 @@ function startDemo() {
     pnlSol: o.pnl, pnlPct: (o.pnl / o.spent) * 100, remainingFraction: 0, ageMs: o.age,
   });
 
+  /**
+   * A plausible live launch feed for the offline preview.
+   *
+   * The preview has no websocket and no chain, so without this the launch scanner
+   * panel is an empty rectangle — and an empty rectangle teaches nothing about what
+   * the bot does. These rows show each decision state: bought, filtered on dev
+   * holdings, below the liquidity floor, high honeypot risk, and an RPC failure that
+   * is NOT the token's fault.
+   */
+  const now = Date.now();
+  S.scanFeed = [
+    { mint: 'DEMO1notarealmintaaaaaaaaaaaaaaaaaaaaaaaaaaa', symbol: 'WIFHAT', name: 'dog wif hat',
+      devWallet: 'DEMO-dev-1-not-real', devHoldPct: 4.2, liquiditySol: 31.4, riskScore: 0, riskNotes: [],
+      decision: 'bought', skipReason: null, detectedAt: now - 8_000, decidedAt: now - 6_000,
+      wallets: [{ name: 'Alpha', action: 'bought', reason: null }, { name: 'Scalper', action: 'bought', reason: null }, { name: 'Degen', action: 'skipped', reason: 'insufficient_balance' }] },
+    { mint: 'DEMO2notarealmintaaaaaaaaaaaaaaaaaaaaaaaaaaa', symbol: 'RUGME', name: 'probably fine',
+      devWallet: 'DEMO-dev-2-not-real', devHoldPct: 47.0, liquiditySol: 2.1, riskScore: 25, riskNotes: ['mint_authority_live'],
+      decision: 'skipped', skipReason: 'dev_hold_high(47.0%>20%)', detectedAt: now - 21_000, decidedAt: now - 19_000,
+      wallets: [{ name: 'Alpha', action: 'skipped', reason: 'dev_hold_high' }, { name: 'Scalper', action: 'skipped', reason: 'dev_hold_high' }, { name: 'Degen', action: 'skipped', reason: 'dev_hold_high' }] },
+    { mint: 'DEMO3notarealmintaaaaaaaaaaaaaaaaaaaaaaaaaaa', symbol: 'TINYPOT', name: 'tiny liquidity',
+      devWallet: 'DEMO-dev-3-not-real', devHoldPct: 8.0, liquiditySol: 0.42, riskScore: 0, riskNotes: [],
+      decision: 'skipped', skipReason: 'liquidity_below_min(0.42)', detectedAt: now - 34_000, decidedAt: now - 32_000,
+      wallets: [{ name: 'Alpha', action: 'skipped', reason: 'liquidity_below_min' }] },
+    { mint: 'DEMO4notarealmintaaaaaaaaaaaaaaaaaaaaaaaaaaa', symbol: 'FROZEN', name: 'can not sell',
+      devWallet: 'DEMO-dev-4-not-real', devHoldPct: 12.5, liquiditySol: 18.9, riskScore: 60, riskNotes: ['freeze_authority_live'],
+      decision: 'skipped', skipReason: 'freeze_authority_live', detectedAt: now - 47_000, decidedAt: now - 45_000,
+      wallets: [{ name: 'Alpha', action: 'skipped', reason: 'freeze_authority_live' }] },
+    { mint: 'DEMO5notarealmintaaaaaaaaaaaaaaaaaaaaaaaaaaa', symbol: 'RPCFAIL', name: 'could not be read',
+      devWallet: 'DEMO-dev-5-not-real', devHoldPct: null, liquiditySol: null, riskScore: null, riskNotes: [],
+      decision: 'error', skipReason: 'rpc unavailable or evaluation timed out — infrastructure, not the token',
+      detectedAt: now - 58_000, decidedAt: now - 55_000,
+      wallets: [{ name: 'Alpha', action: 'rpc_error', reason: 'rpc_unavailable' }] },
+    { mint: 'DEMO6notarealmintaaaaaaaaaaaaaaaaaaaaaaaaaaa', symbol: 'FRESH', name: 'just detected',
+      devWallet: 'DEMO-dev-6-not-real', devHoldPct: null, liquiditySol: null, riskScore: null, riskNotes: [],
+      decision: 'checking', skipReason: null, detectedAt: now - 400, decidedAt: null, wallets: [] },
+  ];
+
   S.wallets = [
     { id: 'w_a', name: 'Alpha', publicKey: 'DEMO-Alpha-not-a-real-address', enabled: true,
       balanceSol: 4.82, exposureSol: 0.9, lastEntryAt: Date.now() - 45000,
@@ -333,6 +370,17 @@ function connectWs() {
   S.ws.onerror = () => { S.connected = false; renderChips(); };
 }
 
+/** Insert or update one row of the live scanner feed (newest first). */
+function upsertScanRow(row) {
+  if (!row || !row.mint) return;
+  if (!Array.isArray(S.scanFeed)) S.scanFeed = [];
+  const i = S.scanFeed.findIndex((r) => r.mint === row.mint);
+  if (i === -1) S.scanFeed.unshift(row);
+  else S.scanFeed[i] = row;
+  if (S.scanFeed.length > 200) S.scanFeed.length = 200;
+  renderScanFeed();
+}
+
 function handleWs(msg) {
   switch (msg.type) {
     case 'snapshot':
@@ -348,6 +396,12 @@ function handleWs(msg) {
       mergeWallets(msg.data.wallets);
       S.prices = msg.data.prices || {};
       renderChips(); renderStats(); renderWallets(); renderPositions();
+      break;
+    case 'scan':
+      // One launch changed state. Patch that row in place: a full re-render on every
+      // launch would fight the user's scrolling, and a launch storm would repaint the
+      // whole table hundreds of times a minute.
+      upsertScanRow(msg.data);
       break;
     case 'log':
       pushLog(msg.data);
@@ -435,7 +489,7 @@ const logLine = (r) => {
 /* ============================================================
    RENDER
    ============================================================ */
-function renderAll() { renderNotices(); renderChips(); renderStats(); renderWallets(); renderPositions(); renderHistory(); renderScanner(); renderLog(); }
+function renderAll() { renderNotices(); renderChips(); renderStats(); renderWallets(); renderPositions(); renderHistory(); renderScanFeed(); renderScanner(); renderLog(); }
 
 function renderChips() {
   const running = S.status?.running;
@@ -453,9 +507,16 @@ function renderChips() {
     ? 'Scanner running — new launches are being evaluated by every armed wallet'
     : 'Scanner stopped — nothing new is being evaluated';
 
+  // The chip used to say "dry run" and leave the user to guess what that governed.
+  // It now states, in the tooltip, exactly what is simulated and what is not — the
+  // two things people actually need to know are that no trades are broadcast, and
+  // that funding and withdrawals are real regardless.
   const dry = S.status?.dryRun !== false;
   $('modeChip').className = `mode-chip ${dry ? 'dry' : 'live'}`;
-  $('modeText').textContent = dry ? 'dry run' : 'LIVE — real funds';
+  $('modeText').textContent = dry ? 'DRY RUN — no real trades' : 'LIVE — real funds';
+  $('modeChip').title = dry
+    ? 'DRY RUN: the bot hunts, scores and tracks positions exactly as it would live, but it does NOT buy or sell anything — every trade is simulated against a paper balance.\n\nWhat is real even in dry run: funding a wallet, and withdrawing from it. Those move actual SOL from the wallet you connected.'
+    : 'LIVE: every buy and sell is a real, signed transaction spending real SOL from your wallets.';
 
   const c = $('connChip');
   c.className = `run-chip${S.connected ? ' on' : ''}`;
@@ -513,21 +574,67 @@ function discoverWallets() {
   const poke = () => window.dispatchEvent(new CustomEvent('wallet-standard:app-ready', { detail: { register } }));
   poke();
   setTimeout(poke, 900); // some extensions register a beat late
+  // After discovery settles, try to restore the last connection silently.
+  setTimeout(reconnectWallet, 1100);
 }
 
-async function connectWallet(w) {
+/** The wallet the user last connected, so a page reload does not forget it. */
+const WALLET_KEY = 'meme-sniper.wallet';
+
+async function connectWallet(w, { silent = false } = {}) {
   const feat = w.features['standard:connect'];
   if (!feat) throw new Error(`${w.name} does not support connecting`);
   const out = await feat.connect();
   const account = (out && out.accounts && out.accounts[0]) || (w.accounts && w.accounts[0]);
   if (!account) throw new Error(`${w.name} connected but exposed no account`);
   WSOL.connected = { wallet: w, account };
+  try { localStorage.setItem(WALLET_KEY, w.name); } catch { /* private mode */ }
   emitWalletsChanged();
+  if (!silent) toast(`Connected ${w.name}`, '');
   return account;
+}
+
+/**
+ * Reconnect the wallet the user chose last time, without a prompt.
+ *
+ * A page reload used to drop the connection, so the user had to reconnect before
+ * they could fund anything. standard:connect returns the accounts already
+ * authorised for THIS origin, so a silent call succeeds for a wallet that is still
+ * installed and still authorised — and quietly does nothing otherwise, leaving the
+ * Connect button exactly as it was. No prompt, no error surface.
+ */
+let reconnectTried = false;
+async function reconnectWallet() {
+  if (reconnectTried || WSOL.connected) return;
+  let name = null;
+  try { name = localStorage.getItem(WALLET_KEY); } catch { /* private mode */ }
+  if (!name) return;
+  const w = (WSOL.wallets || []).find((x) => x.name === name);
+  if (!w) return; // extension not installed here
+  reconnectTried = true;
+  try {
+    const account = await connectWallet(w, { silent: true });
+    // If the funding dialog is already open, refresh the block that names the
+    // wallet the user is funding from.
+    const mount = $('fundSource');
+    if (mount && S.fundingWalletId) {
+      try { renderFundSource(mount, S.wallets.find((x) => x.id === S.fundingWalletId)); } catch { /* dialog closed */ }
+    }
+    void account;
+  } catch {
+    // Not authorised any more, or the wallet wants a fresh user gesture. Forget it
+    // and leave the normal Connect flow to the user.
+    try { localStorage.removeItem(WALLET_KEY); } catch { /* ignore */ }
+  }
+}
+
+function forgetWallet() {
+  try { localStorage.removeItem(WALLET_KEY); } catch { /* ignore */ }
 }
 
 function disconnectWallet() {
   const c = WSOL.connected;
+  forgetWallet(); // an explicit disconnect must survive a reload too
   WSOL.connected = null;
   emitWalletsChanged();
   try { c?.wallet?.features['standard:disconnect']?.disconnect?.(); } catch { /* ignore */ }
@@ -622,7 +729,7 @@ function openOfflineNotice(what) {
   openModal(`
     <div class="modal" style="max-width:560px">
       <div class="modal-head"><span class="modal-title">🔌 Offline preview</span>
-        <button class="btn btn-ghost btn-sm" onclick="closeModal()">Close</button></div>
+        <button class="btn btn-ghost btn-sm" data-close-modal="1" title="Close this dialog (Esc also works)">Close</button></div>
       <div class="modal-body">
         <div class="notice warn"><span class="ico">⚠</span><div>
           <b>There is no bot behind this page.</b>
@@ -636,14 +743,14 @@ function openOfflineNotice(what) {
           <code class="mono">npm start</code><br/><br/>
           2 · Open the terminal it prints:<br/>
           <code class="mono">http://localhost:8787/terminal</code><br/><br/>
-          3 · Unlock the keystore in that tab, then ${esc(what)}.
+          3 · Open the keystore in that tab, then ${esc(what)}.
         </div>
         <div class="notice info" style="margin-top:14px"><span class="ico">ℹ</span><div>
           The numbers on this page are <b>sample data</b>, not your wallets. Nothing here can
           spend or hold funds.
         </div></div>
       </div>
-      <div class="modal-foot"><button class="btn btn-block" onclick="closeModal()">Close</button></div>
+      <div class="modal-foot"><button class="btn btn-block" data-close-modal="1">Close</button></div>
     </div>`);
 }
 
@@ -741,7 +848,7 @@ function renderFundSource(mount, wallet) {
          there is no address to copy.
          <br/><br/>
          Install <b>Phantom</b>, <b>Solflare</b>, <b>Backpack</b> or <b>Magic Eden</b>, then reload
-         this page. If the extension is already installed, make sure it is unlocked, then reload.
+         this page. If the extension is already installed, make sure it is set up and open, then reload.
        </div></div>`;
 
   mount.querySelectorAll('[data-wi]').forEach((btn) => {
@@ -756,9 +863,13 @@ function renderFundSource(mount, wallet) {
   });
 }
 
+/** Which wallet the funding dialog is currently open for (used to refresh it). */
+let fundingWalletId = null;
+
 function openFund(walletId) {
   const w = S.wallets.find((x) => x.id === walletId);
   if (!w) return;
+  fundingWalletId = w.id;
 
   const real = isRealAddress(w.publicKey);
   const demo = Boolean(S.demo); // no extension and no chain in the preview
@@ -812,8 +923,9 @@ function openFund(walletId) {
 
       <div class="notice info" style="margin:10px 0 0">
         <span class="ico">ℹ</span>
-        <div><b>You do not have to fund it yet.</b> Dry run uses a notional balance tagged
-        <span class="paper-tag">PAPER</span>, so you can validate the strategy for free.</div>
+        <div><b>You do not have to fund it yet.</b> Dry run trades a pretend balance, tagged
+        <span class="paper-tag">SIMULATED</span> on the wallet card, so you can validate the strategy
+          for free. Funding is only needed when you arm live trading.</div>
       </div>
     `;
 
@@ -872,7 +984,7 @@ function openFund(walletId) {
   openModal(`
     <div class="modal" style="max-width:620px">
       <div class="modal-head"><span class="modal-title">💸 Fund ${esc(w.name)}</span>
-        <button class="btn btn-ghost btn-sm" id="fundClose">Close</button></div>
+        <button class="btn btn-ghost btn-sm" data-close-modal="1" title="Close this dialog (Esc also works)">Close</button></div>
       <div class="modal-body">${body}</div>
     </div>`);
 
@@ -943,7 +1055,7 @@ function openWithdraw(walletId) {
   openModal(`
     <div class="modal" style="max-width:620px">
       <div class="modal-head"><span class="modal-title">🏧 Withdraw from ${esc(w.name)}</span>
-        <button class="btn btn-ghost btn-sm" id="wdClose">Close</button></div>
+        <button class="btn btn-ghost btn-sm" data-close-modal="1" title="Close this dialog (Esc also works)">Close</button></div>
       <div class="modal-body">
         <p class="muted">${demo
           ? 'Preview — this is a simulated withdrawal, so you can see the flow. When you run it for real, withdrawals are <b>never</b> simulated by dry run, because a settings flag must never be able to trap your money.'
@@ -1087,6 +1199,33 @@ function renderNotices() {
   if (stuck.length) {
     out.push(`<div class="notice warn"><span class="ico">⏸</span><div><b>${stuck.length} wallet(s) paused:</b> ${stuck.map((w) => `${esc(w.name)} — ${esc(w.stats.pauseReason || 'manual')}`).join(' · ')}</div></div>`);
   }
+  // A host that rebuilds its disk must say so BEFORE the wallets disappear, not
+  // after. Render's free plan does exactly this when the service sleeps.
+  const st = S.status && S.status.storage;
+  if (st && st.ephemeral) {
+    out.push(`<div class="notice danger"><span class="ico">⚠</span><div>
+      <b>This host deletes your wallets when it sleeps.</b>
+      ${esc(st.reason)}
+      <div class="row-flex" style="margin-top:10px;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-sm" data-backup="1">⬇ Download a backup now</button>
+        <button class="btn btn-sm" data-restore="1">⬆ Restore from a backup</button>
+      </div>
+    </div></div>`);
+  }
+
+  // Plain words for the thing the user could not make head or tail of: what is
+  // simulated, what is real, and which number on a wallet card is which.
+  if (S.status && S.status.dryRun !== false) {
+    out.push(`<div class="notice info"><span class="ico">i</span><div>
+      <b>Dry run is on: nothing here is buying or selling.</b> The bot hunts and scores launches,
+      and every trade it takes is <b>simulated</b>. Each wallet shows two numbers:
+      <b>Real bal.</b> is the SOL that wallet actually holds on Solana, and
+      <b>Sim. balance</b> is the pretend money the simulation trades with.
+      Funding a wallet and withdrawing from it <b>are real</b> and move actual SOL either way.
+      <div style="margin-top:6px"><a href="#" data-open-settings="1" style="color:var(--accent)">Arm live trading in ⚙ Settings</a> when you are ready to spend real money.</div>
+    </div></div>`);
+  }
+
   const lockedNow = (S.wallets || []).filter((w) => w.keyLocked && !w.keyMissing);
   if (lockedNow.length) {
     out.push(`<div class="notice warn"><span class="ico">🔒</span><div>
@@ -1104,6 +1243,12 @@ function renderNotices() {
   // action available — wire it rather than making the user hunt in the header.
   const nb = $('notices').querySelector('[data-keystore]');
   if (nb) nb.onclick = openKeystore;
+  const bb = $('notices').querySelector('[data-backup]');
+  if (bb) bb.onclick = downloadBackup;
+  const rb = $('notices').querySelector('[data-restore]');
+  if (rb) rb.onclick = openRestore;
+  const cfgLink = $('notices').querySelector('[data-open-settings]');
+  if (cfgLink) cfgLink.onclick = (e) => { e.preventDefault(); openSettings(); };
 }
 
 function renderStats() {
@@ -1250,9 +1395,25 @@ function renderWallets() {
         <span class="wallet-preset">${esc(cfg.preset || 'custom')}</span>
       </div>
 
+      <!--
+        This card used to show the PAPER balance alone, so a wallet holding
+        0 SOL on chain displayed "PAPER BAL. 10.000" and there was no way to tell
+        whether the bot was looking at real money. The real balance is now the
+        headline, always; the simulated balance is named as a simulation and is
+        visibly secondary.
+      -->
       <div class="wallet-stats">
-        <div class="wstat"><div class="wstat-k">${w.paperTrading ? 'Paper bal.' : 'Balance'}</div><div class="wstat-v">${fmtSol(w.paperTrading ? w.paperBalanceSol : w.balanceSol, 3)}${w.paperTrading ? ' <span class="paper-tag">PAPER</span>' : ''}</div></div>
-        <div class="wstat"><div class="wstat-k">Realised</div><div class="wstat-v ${cls(pnl)}">${fmtSol(pnl, 3)}</div></div>
+        <div class="wstat">
+          <div class="wstat-k">Real bal.</div>
+          <div class="wstat-v ${w.balanceSol === null || w.balanceSol === undefined ? 'mute' : ''}" title="The SOL this wallet actually holds on Solana. Funding adds to it, withdrawing takes from it. In dry run it stays untouched by trades.">${w.balanceSol === null || w.balanceSol === undefined ? (w.keyLocked ? 'locked' : '—') : fmtSol(w.balanceSol, 3)}</div>
+          <div class="wstat-sub">on chain</div>
+        </div>
+        <div class="wstat">
+          <div class="wstat-k">Sim. balance</div>
+          <div class="wstat-v mute" title="A pretend balance, used only because the bot is in dry run. Simulated trades add and subtract here and nowhere else.">${fmtSol(w.paperBalanceSol || 0, 2)}</div>
+          <div class="wstat-sub"><span class="paper-tag">SIMULATED</span></div>
+        </div>
+        <div class="wstat"><div class="wstat-k">Realised</div><div class="wstat-v ${cls(pnl)}" title="Profit and loss booked from CLOSED trades on this wallet.">${fmtSol(pnl, 3)}</div></div>
         <div class="wstat"><div class="wstat-k">Win rate</div><div class="wstat-v">${(st.wins || 0) + (st.losses || 0) ? `${winRateOf(st).toFixed(0)}%` : '—'}</div><div class="wstat-sub">${st.wins || 0}W / ${st.losses || 0}L</div></div>
         <div class="wstat"><div class="wstat-k">Open</div><div class="wstat-v">${open.length}/${cfg.buy?.maxConcurrentPositions ?? '—'}</div></div>
       </div>
@@ -1339,11 +1500,11 @@ function openWalletDetail(walletId) {
       <div class="modal-head">
         <span class="modal-title">📄 ${esc(w.name)}</span>
         <span class="wallet-preset">${esc(w.config?.preset || 'custom')}</span>
-        <button class="btn btn-ghost btn-sm" onclick="closeModal()">Close</button>
+        <button class="btn btn-ghost btn-sm" data-close-modal="1" title="Close this dialog (Esc also works)">Close</button>
       </div>
       <div class="modal-body">
         <div class="wallet-stats" style="grid-template-columns:repeat(5,1fr)">
-          ${stat('Balance', `${fmtSol(w.balanceSol, 3)}`)}
+          ${stat('Real balance', `${fmtSol(w.balanceSol, 3)} SOL`)}
           ${stat('Realised', fmtSol(st.realisedPnlSol || 0, 3), cls(st.realisedPnlSol || 0))}
           ${stat('Win rate', (st.wins || 0) + (st.losses || 0) ? `${winRateOf(st).toFixed(0)}%` : '—')}
           ${stat('Trades today', String(st.tradesToday || 0))}
@@ -1470,6 +1631,104 @@ function renderHistory() {
     </tr>`).join('')}</tbody></table>`;
 }
 
+/**
+ * The live pump.fun launch scanner.
+ *
+ * Each row is one launch: what it is, who deployed it, how much the dev holds,
+ * what liquidity it has, its honeypot risk, and what the bot decided — with the
+ * reason, so a wall of "skipped" is explainable instead of mysterious.
+ */
+function renderScanFeed() {
+  const mount = $('scanFeed');
+  if (!mount) return;
+  const rows = S.scanFeed || [];
+  const count = $('scanCount');
+  if (count) count.textContent = String(rows.length);
+
+  // The dot reports the FEED, not the engine: a connected socket with the scanner
+  // stopped is a different state from a dead socket, and they look the same if you
+  // only render a boolean.
+  const sc = (S.status && S.status.scanner) || {};
+  const dot = $('scanDot');
+  const dotText = $('scanDotText');
+  if (dot && dotText) {
+    const live = Boolean(sc.connected) && (S.status ? S.status.running !== false : true);
+    dot.classList.toggle('on', live);
+    dot.classList.toggle('off', !live);
+    dotText.textContent = sc.connected ? (S.status && S.status.running === false ? 'scanner stopped' : 'live') : 'offline';
+    dot.title = sc.connected
+      ? `Connected to ${sc.source || 'the launch feed'}. New launches appear here as they are created.`
+      : 'Not connected to the launch feed. Press ▶ Engine to start scanning.';
+  }
+
+  if (!rows.length) {
+    mount.innerHTML = `
+      <div class="scan-empty">
+        <p><b>No launches scanned yet.</b></p>
+        <p class="muted">Start the engine and pump.fun launches will stream in here, each with what the
+        checks found and what every wallet decided about it. If the scanner is running and this stays
+        empty, the feed is not connected — check the dot above, then your RPC or your network.</p>
+      </div>`;
+    return;
+  }
+
+  const decisionClass = {
+    bought: 'won', skipped: 'sim', checking: 'paper', error: 'lost',
+  };
+  const decisionLabel = {
+    bought: 'BOUGHT', skipped: 'skipped', checking: 'checking…', error: 'infra error',
+  };
+
+  mount.innerHTML = `
+    <div class="scan-scroll">
+      <table class="scan-tbl">
+        <thead>
+          <tr>
+            <th>Token</th><th>Dev</th><th class="num">Dev hold</th><th class="num">Liquidity</th>
+            <th class="num">Risk</th><th>Decision</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((r) => {
+            const risk = r.riskScore === null || r.riskScore === undefined ? null : Number(r.riskScore);
+            const riskCls = risk === null ? 'mute' : risk >= 50 ? 'neg' : risk > 0 ? 'warn' : 'pos';
+            const liq = r.liquiditySol === null || r.liquiditySol === undefined ? null : Number(r.liquiditySol);
+            return `<tr>
+              <td>
+                <div class="scan-sym">${esc(r.symbol || 'unknown')}</div>
+                <a class="scan-mint mono" href="https://pump.fun/coin/${esc(r.mint)}" target="_blank" rel="noopener noreferrer"
+                   title="Open ${esc(r.mint)} on pump.fun">${esc(short(r.mint, 4))}</a>
+                ${r.name && r.name !== r.symbol ? `<div class="scan-name">${esc(r.name)}</div>` : ''}
+              </td>
+              <td class="mono mute">${r.devWallet ? esc(short(r.devWallet, 4)) : '—'}</td>
+              <td class="num ${r.devHoldPct === null || r.devHoldPct === undefined ? 'mute' : r.devHoldPct > 20 ? 'neg' : ''}">
+                ${r.devHoldPct === null || r.devHoldPct === undefined ? '—' : `${Number(r.devHoldPct).toFixed(1)}%`}
+              </td>
+              <td class="num">${liq === null ? '<span class="mute">—</span>' : `${liq.toFixed(2)} SOL`}</td>
+              <td class="num ${riskCls}">${risk === null ? '—' : risk}
+                ${r.riskNotes && r.riskNotes.length ? `<span class="scan-risk-note" title="${esc(r.riskNotes.join(', '))}">ⓘ</span>` : ''}
+              </td>
+              <td>
+                <span class="badge ${decisionClass[r.decision] || 'sim'}" style="padding:1px 7px;font-size:9.5px">${esc(decisionLabel[r.decision] || r.decision)}</span>
+                ${r.skipReason ? `<div class="scan-reason" title="${esc(r.skipReason)}">${esc(shortReason(r.skipReason))}</div>` : ''}
+                ${r.wallets && r.wallets.length > 1 ? `<div class="scan-wallets">${esc(r.wallets.map((w) => `${w.name}: ${w.action === 'bought' ? 'bought' : (w.reason || w.action)}`).join(' · '))}</div>` : ''}
+              </td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>`;
+}
+
+/** Filter reasons are machine-shaped ("liquidity_below_min(0.42)"); make them readable. */
+function shortReason(reason) {
+  const s = String(reason || '');
+  const m = s.match(/^([a-z0-9_]+)\((.*)\)$/i);
+  if (!m) return s.replace(/_/g, ' ');
+  const words = m[1].replace(/_/g, ' ');
+  return `${words} (${m[2]})`;
+}
+
 function renderScanner() {
   const s = S.status?.scanner || {};
   const st = S.status?.stats || {};
@@ -1535,7 +1794,9 @@ function openKeystore() {
         </div>
       </div>
       <div class="modal-foot">
-        <button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn" data-close-modal="1">Cancel</button>
+        <button class="btn" id="ksBackup" title="Download one file holding your encrypted keystore and your wallet list. Useless without your passphrase — which is what makes it safe to keep.">⬇ Backup</button>
+        <button class="btn" id="ksRestore" title="Put a backup file back — for example after your host wiped its disk">⬆ Restore</button>
         ${ks.initialised ? `<button class="btn" id="ksForgot" title="The passphrase cannot be recovered from the file — this starts a new, empty keystore instead">Forgot your passphrase?</button>` : ''}
         ${ks.initialised ? `<button class="btn btn-warn" id="ksLock">Lock</button>` : ''}
         <button class="btn btn-primary" id="ksGo">${ks.initialised ? 'Continue' : 'Create keystore'}</button>
@@ -1555,6 +1816,10 @@ function openKeystore() {
         renderAll();
       } catch (err) { toast(err.message, 'err'); }
     };
+    const bk = root.querySelector('#ksBackup');
+    if (bk) bk.onclick = downloadBackup;
+    const rs = root.querySelector('#ksRestore');
+    if (rs) rs.onclick = () => { closeModal(); openRestore(); };
     const forgot = root.querySelector('#ksForgot');
     if (forgot) forgot.onclick = () => { closeModal(); openKeystoreForgot(); };
     const lock = root.querySelector('#ksLock');
@@ -1577,7 +1842,13 @@ function openWallet(walletId, opts = {}) {
   // a different function and cannot see locals declared in this one.
   const ks = keystoreState();
   const existing = (S.wallets || []).find((w) => w.id === walletId);
-  const cfg = existing?.config || defaultCfg();
+  // Merge over the defaults rather than trusting the stored config to be
+  // complete. renderEditorPanes reads cfg.buy / cfg.exits / cfg.limits /
+  // cfg.filters unconditionally, so a config missing any of them (an older
+  // snapshot, a partial record, a wallet built from an empty template) throws
+  // INSIDE the dialog's mount handler — and the user sees a Config button that
+  // does nothing at all. One merge makes that impossible.
+  const cfg = withDefaultCfg(existing?.config);
   S.editing = { id: walletId || null, cfg: JSON.parse(JSON.stringify(cfg)), isNew, name: existing?.name || '', pk: existing?.publicKey };
   S.activeTab = 'strategy';
 
@@ -1665,7 +1936,7 @@ function openWallet(walletId, opts = {}) {
         <div class="tabpane" data-pane="ai" id="paneAi"></div>
       </div>
       <div class="modal-foot">
-        <button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn" data-close-modal="1">Cancel</button>
         ${!isNew ? `<button class="btn btn-danger" id="edDelete">Delete wallet</button>` : ''}
         ${justCreated || !isNew ? `<button class="btn btn-fund" id="edFund">💸 Fund</button>` : ''}
         <button class="btn btn-primary" id="edSave">${isNew ? 'Create wallet' : 'Save changes'}</button>
@@ -1699,6 +1970,27 @@ function openWallet(walletId, opts = {}) {
       catch (err) { toast(err.message, 'err'); }
     };
   });
+}
+
+/**
+ * Deep-merge a (possibly partial) stored config over the defaults.
+ *
+ * Every renderer that touches config reads buy/exits/limits/filters directly.
+ * A partial config therefore does not degrade gracefully — it throws while the
+ * dialog is being mounted, which looks exactly like a dead button.
+ */
+function withDefaultCfg(partial) {
+  const d = defaultCfg();
+  const p = partial || {};
+  return {
+    ...d,
+    ...p,
+    buy: { ...d.buy, ...(p.buy || {}) },
+    exits: { ...d.exits, ...(p.exits || {}), trailing: { ...d.exits.trailing, ...((p.exits || {}).trailing || {}) } },
+    limits: { ...d.limits, ...(p.limits || {}) },
+    filters: { ...d.filters, ...(p.filters || {}) },
+    ai: { ...d.ai, ...(p.ai || {}) },
+  };
 }
 
 function defaultCfg() {
@@ -1736,8 +2028,8 @@ function renderEditorPanes(root) {
       The bot trades on the <b>server</b>, so <b>closing this tab does not stop it</b> — a 24h
       target keeps being watched whether the dashboard is open or not.
       What <em>does</em> stop it is a restart or redeploy: with this on, open positions are written
-      down and re-adopted (verified against the wallet's real balance) as soon as you unlock again.
-      Turn it off for a wallet you always want to start flat.
+      down and re-adopted (verified against the wallet's real balance) as soon as the keystore is
+      open again. Turn it off for a wallet you always want to start flat.
     </div>
 
     <div class="section-label">Position sizing</div>
@@ -2116,7 +2408,7 @@ function openSettings() {
         </div>
       </div>
       <div class="modal-foot">
-        <button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn" data-close-modal="1">Cancel</button>
         <button class="btn btn-primary" id="g_save">Save settings</button>
       </div>
     </div>`, (root) => {
@@ -2180,7 +2472,7 @@ function renderConnect() {
   const c = WSOL.connected;
   if (c && c.account) {
     btn.textContent = `🔗 ${short(c.account.address, 4)}`;
-    btn.title = `${c.wallet.name} · ${c.account.address}\nClick to disconnect`;
+    btn.title = `${c.wallet.name} · ${c.account.address}\nClick to disconnect. This wallet is only ever asked to sign a transfer you approved, and the app remembers it across reloads.`;
     btn.classList.add('connected');
   } else {
     btn.textContent = '🔗 Connect wallet';
@@ -2225,7 +2517,7 @@ function openConnectModal() {
              </div>
            </div>`}
       </div>
-      <div class="modal-foot"><button class="btn btn-block" onclick="closeModal()">Close</button></div>
+      <div class="modal-foot"><button class="btn btn-block" data-close-modal="1">Close</button></div>
     </div>`);
 
   document.querySelectorAll('[data-wi]').forEach((b) => {
@@ -2347,10 +2639,38 @@ async function demoApi(path, opts = {}) {
     return S.wallets;
   }
   if (seg[0] === 'positions' && seg.length === 1 && method === 'GET') return S.positions;
+  if (seg[0] === 'scan' && method === 'GET') {
+    return { rows: S.scanFeed || [], stats: null, scanner: (S.status && S.status.scanner) || null };
+  }
   if (seg[0] === 'logs' && method === 'GET') return S.logs.slice(0, Number(q.get('limit')) || 200);
   if (seg[0] === 'config' && method === 'GET') return S.config;
   if (seg[0] === 'presets' && method === 'GET') return S.presets;
   if (seg[0] === 'keystore' && seg[1] === 'status' && method === 'GET') return S.keystore;
+  // Backup and restore, mirrored so the preview's buttons do something real rather
+  // than hitting a network that is not there. There is no keystore in the preview —
+  // the addresses are placeholders — so the backup carries the wallet list alone.
+  if (seg[0] === 'backup' && method === 'GET') {
+    return {
+      kind: 'meme-sniper-backup',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      keystore: null,
+      demo: true,
+      config: { global: S.config, wallets: JSON.parse(JSON.stringify(S.wallets)) },
+      note: 'Preview backup: the wallet list only. A real backup also carries your encrypted keystore.',
+    };
+  }
+  if (seg[0] === 'restore' && method === 'POST') {
+    const b = body.backup;
+    if (!b || b.kind !== 'meme-sniper-backup') throw new Error('not a backup file');
+    const incoming = (b.config && b.config.wallets) || [];
+    if (!incoming.length) throw new Error('the backup contains no wallets');
+    S.wallets.length = 0;
+    incoming.forEach((w) => S.wallets.push(w));
+    S.positions = S.wallets.flatMap((w) => w.openPositions || []);
+    renderAll();
+    return { ok: true, wallets: incoming.length, walletsLoaded: incoming.length, hint: 'Preview restore — placeholder addresses only.' };
+  }
   if (seg[0] === 'session-token') return { token: 'demo' };
 
   /* ------------------------------ keystore ------------------------------ */
@@ -2389,7 +2709,7 @@ async function demoApi(path, opts = {}) {
     const name = String(body.name || '').trim();
     if (!name) throw new Error('name_required');
     if (!S.keystore || !S.keystore.unlocked) {
-      throw new Error('keystore_locked: unlock the keystore before adding wallets.');
+      throw new Error('keystore_locked: open the keystore before adding wallets.');
     }
     const w = demoNewWallet(name, body.preset);
     S.wallets.push(w);
@@ -2508,6 +2828,98 @@ async function demoApi(path, opts = {}) {
   }
 
   throw new Error(`Unknown endpoint: ${method} ${parts[0]}`);
+}
+
+/**
+ * Download the encrypted keystore and the wallet list as one file.
+ *
+ * The keystore is exported exactly as it sits on disk — still AES-256-GCM under the
+ * user's passphrase — so this file cannot leak a key even if it is emailed around.
+ * That is what makes it safe to keep, and it is the answer to a host that rebuilds
+ * its disk every time it sleeps.
+ */
+async function downloadBackup() {
+  try {
+    let blob;
+    if (S.demo) {
+      // The preview has no server. Build the file locally so the button still does
+      // what it says — a control that only works sometimes is a control that lies.
+      const data = await demoApi('/api/backup');
+      blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    } else {
+      const token = S.token || (await refreshSessionToken());
+      const r = await fetch('/api/backup', { headers: { 'x-session-token': token } });
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}));
+        throw new Error(e.error || `HTTP ${r.status}`);
+      }
+      blob = await r.blob();
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `meme-sniper-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    toast(
+      S.demo
+        ? 'Preview backup downloaded — the wallet list only. A real backup also carries your encrypted keystore.'
+        : 'Backup downloaded. Keep it somewhere safe — and keep the passphrase somewhere else.',
+      '',
+    );
+  } catch (err) {
+    toast(`Could not build the backup: ${err.message}`, 'err');
+  }
+}
+
+/** Put a backup back: the keystore, the wallet list, then open it. */
+function openRestore() {
+  openModal(`
+    <div class="modal" style="max-width:620px">
+      <div class="modal-head"><span class="modal-title">⬆ Restore from a backup</span>
+        <button class="btn btn-ghost btn-sm" data-close-modal="1">Close</button></div>
+      <div class="modal-body">
+        <p style="margin-top:0">Replace this bot's keystore and wallet list with a backup file. This is
+        the way back after a host wiped its disk — <b>Render's free plan does that every time the
+        service sleeps</b> — and also how you move your wallets to another machine.</p>
+
+        <div class="notice info"><span class="ico">i</span><div>
+          Whatever is here now is <b>archived, not deleted</b>, so restoring by mistake is recoverable.
+          The restored keystore arrives <b>locked</b>: your passphrase was never inside the backup, so
+          you will type it afterwards.
+        </div></div>
+
+        <div class="field">
+          <label>Backup file</label>
+          <input type="file" id="rsFile" accept="application/json,.json"/>
+        </div>
+        <div id="rsErr" class="pass-err"></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn" data-close-modal="1">Cancel</button>
+        <button class="btn btn-primary" id="rsGo">Restore</button>
+      </div>
+    </div>`, (root) => {
+    root.querySelector('#rsGo').onclick = async () => {
+      const err = root.querySelector('#rsErr');
+      const file = root.querySelector('#rsFile').files[0];
+      if (!file) { err.textContent = 'Choose the backup file first.'; return; }
+      try {
+        const backup = JSON.parse(await file.text());
+        const res = await api('/api/restore', { method: 'POST', body: JSON.stringify({ confirm: 'RESTORE', backup }) });
+        closeModal();
+        toast(`Restored ${res.wallets} wallet(s). Now open the keystore with your passphrase.`, 'warn');
+        await syncKeystoreState();
+        await refreshAll();
+        renderAll();
+        openKeystore();
+      } catch (e) {
+        err.textContent = e.message;
+      }
+    };
+  });
 }
 
 /**
@@ -2630,7 +3042,17 @@ document.addEventListener('click', async (e) => {
   }
   if (t.id === 'btnClearLog') { S.logs = []; renderLog(); }
 
+  // One close path for every dialog. Previously each modal carried its own
+  // inline handler, and two of them carried none at all — the Close buttons in
+  // the Fund and Withdraw dialogs did nothing when tapped.
+  if (t.dataset.closeModal) { closeModal(); return; }
   if (t.dataset.keystore) openKeystore();
+  // The wallet card renders these two, and for a long time nothing listened:
+  // tapping Fund or Withdraw on a wallet did NOTHING, while the same features
+  // reached from the Config or Trades modal worked. Reported from the live
+  // deployment, twice, as "the buttons don't respond".
+  if (t.dataset.fund) openFund(t.dataset.fund);
+  if (t.dataset.withdraw) openWithdraw(t.dataset.withdraw);
   if (detail) openWalletDetail(detail);
   if (edit) openWallet(edit);
 
