@@ -14,7 +14,7 @@
 
 services:
   - type: web
-    name: snipersol
+    name: meme-sniper
     runtime: node
     plan: starter            # free instances cannot attach disks
     region: frankfurt        # pick the region closest to you
@@ -67,6 +67,6 @@ services:
         value: "1200"
 
     disk:
-      name: snipersol-data
+      name: meme-sniper-data
       mountPath: /var/data
       sizeGB: 1
