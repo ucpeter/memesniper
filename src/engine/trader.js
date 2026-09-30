@@ -139,6 +139,30 @@ class Trader {
 
     /* 3 — deterministic safety filters */
     const verdict = await safety.evaluate(candidate, this.cfg, { conn: this.executor.conn(), config: g });
+    // Publish what the checks actually found, pass or fail. The live scanner view
+    // shows dev holdings, liquidity and honeypot risk per launch; without this a row
+    // could only ever say "skipped", which is the least useful half of the story.
+    {
+      const rep = verdict.report || {};
+      const curveRep = rep.curveReport || {};
+      const dist = rep.distribution || {};
+      bus.safeEmit('token:analyzed', {
+        walletId: this.cfg.id,
+        wallet: this.cfg.name,
+        candidate,
+        ok: verdict.ok,
+        hard: Boolean(verdict.hard),
+        score: verdict.score,
+        reasons: verdict.reasons || [],
+        report: {
+          liquiditySol: curveRep.liquiditySol ?? null,
+          devHoldPct: rep.devHoldPct ?? null,
+          top10Pct: dist.top10Pct ?? null,
+          holderSample: dist.holderSample ?? null,
+          honeypot: rep.honeypot || null,
+        },
+      });
+    }
     if (!verdict.ok) {
       // An unreachable RPC is our problem, not the token's — say so, count it
       // separately, and do not disguise it as a normal filter rejection.

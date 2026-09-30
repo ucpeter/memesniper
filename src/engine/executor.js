@@ -12,29 +12,56 @@
  *   4. Exits escalate. A failed sell retries with more slippage and more
  *      priority fee — being unable to exit is the single worst failure mode.
  */
-const { Connection, VersionedTransaction, LAMPORTS_PER_SOL, PublicKey, Transaction, SystemProgram } = require('@solana/web3.js');
+const {
+  ComputeBudgetProgram, Connection, LAMPORTS_PER_SOL, PublicKey, SystemProgram,
+  Transaction, TransactionMessage, VersionedTransaction,
+} = require('@solana/web3.js');
 const log = require('../util/logger');
 const bus = require('../util/events');
+const rpc = require('./rpc');
 
-const JITO_TIP_ACCOUNTS = [
-  '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
-  'HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe',
-  'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY',
-  'ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49',
-  'DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh',
-  'ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt',
-  'DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL',
-  '3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT',
-];
+/**
+ * Jito's tip accounts are FETCHED, never assumed.
+ *
+ * There is deliberately no hardcoded list. A tip is a plain SOL transfer to whatever
+ * address ends up in the transaction, and Jito has rotated this list before: one
+ * stale or mistyped address means real SOL sent somewhere nobody can recover it,
+ * on every trade. A bundle with no tip at all is simply not competitive and does
+ * not land — which is what this code used to do while calling itself MEV-protected.
+ *
+ * So: ask Jito, cache the answer briefly, and if Jito cannot be reached, send
+ * WITHOUT a tip and say so rather than guessing an address.
+ */
+const JITO_TIP_CACHE_MS = 5 * 60 * 1000;
 
 class Executor {
   constructor(config, keystore) {
     this.config = config;
     this.keystore = keystore;
-    this.connections = config.rpc.endpoints.map(
-      (url) => new Connection(url, { commitment: config.rpc.commitment || 'confirmed', disableRetryOnRateLimit: false })
-    );
+
+    // One chain for every endpoint this deployment knows about: RPC_URL from the
+    // environment first (it must win — a saved config.json quietly overriding it is
+    // what kept the bot on the rate-limited public RPC while .env looked correct),
+    // then the configured list, then an optional fallback, then the public RPC.
+    const chain = rpc.endpointChain(config.rpc.endpoints || []);
+    const fetchImpl = rpc.resilientRpcFetch(chain);
+    // The primary is the first endpoint of the chain; failover happens inside the
+    // fetch, per call, so a dead endpoint only costs one timeout rather than
+    // poisoning every request that happens to round-robin onto it.
+    this.connections = [
+      new Connection(chain[0], {
+        commitment: config.rpc.commitment || 'confirmed',
+        disableRetryOnRateLimit: false,
+        fetch: fetchImpl,
+      }),
+    ];
+    this.rpcChain = chain;
+    this.fastSend = rpc.fastSendEndpoints();
+    this._tipCache = null;       // { accounts, at } — Jito's current tip accounts
+    this._lastTipAccount = null; // the one this transaction actually paid
     this.rr = 0;
+    if (chain.length > 1) log.info(`RPC chain: ${chain.length} endpoint(s) — failing over per call on timeout or 429`);
+    if (this.fastSend.length) log.info(`Fast-send lanes enabled: ${this.fastSend.length} extra submission endpoint(s)`);
   }
 
   conn() {
@@ -142,7 +169,99 @@ class Executor {
     return { ok: false, error: 'confirmation_timeout', signature };
   }
 
-  /** Submit through a Jito bundle (atomic, MEV-protected, ordered). */
+  /**
+   * One Jito tip account, from Jito itself.
+   *
+   * Returns null (never throws) if Jito cannot be reached. The caller must treat
+   * null as "no tip" and NOT substitute a guess: a wrong tip address is lost SOL.
+   */
+  async jitoTipAccount() {
+    const now = Date.now();
+    if (this._tipCache && now - this._tipCache.at < JITO_TIP_CACHE_MS && this._tipCache.accounts.length) {
+      return this._tipCache.accounts[Math.floor(Math.random() * this._tipCache.accounts.length)];
+    }
+    try {
+      const res = await fetch(`${this.config.jito.blockEngineUrl}/api/v1/bundles`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getTipAccounts', params: [] }),
+        signal: AbortSignal.timeout(3000),
+      });
+      const j = await res.json();
+      if (!Array.isArray(j.result) || !j.result.length) throw new Error('no tip accounts returned');
+      this._tipCache = { accounts: j.result, at: now };
+      return j.result[Math.floor(Math.random() * j.result.length)];
+    } catch (err) {
+      log.warn(`Could not fetch Jito tip accounts (${err.message}) — sending without a tip rather than guessing an address`);
+      return null;
+    }
+  }
+
+  /** Does this transaction already set a priority fee? Two such instructions are rejected. */
+  _hasPriorityFee(tx) {
+    const CB = ComputeBudgetProgram.programId.toBase58();
+    const SET_PRICE = 3; // ComputeBudgetInstruction discriminant
+    const check = (ix) => ix.programId.toBase58() === CB && ix.data[0] === SET_PRICE;
+    if (tx instanceof Transaction) return tx.instructions.some(check);
+    try {
+      const msg = TransactionMessage.decompile(tx.message);
+      return msg.instructions.some(check);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Add the priority fee and the Jito tip to an UNSIGNED transaction.
+   *
+   * Must run before signing: adding an instruction afterwards invalidates the
+   * signature. Handles both shapes — a legacy Transaction from our own builder, and
+   * the versioned transaction PumpPortal returns — since the tip is worthless in a
+   * transaction we cannot put it into.
+   */
+  async prepareForFastLane(tx, payer) {
+    const extra = [];
+    if (!this._hasPriorityFee(tx)) {
+      extra.push(ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: Number(process.env.PRIORITY_FEE_MICROLAMPORTS || 5_000_000),
+      }));
+    }
+
+    let tipAccount = null;
+    if (this.config.jito.enabled) {
+      tipAccount = await this.jitoTipAccount();
+      if (tipAccount) {
+        extra.push(SystemProgram.transfer({
+          fromPubkey: payer,
+          toPubkey: new PublicKey(tipAccount),
+          lamports: Number(this.config.jito.tipLamports || 1_000_000),
+        }));
+      } else {
+        // No tip means no bundle worth sending: fall back to a plain broadcast,
+        // which is what the caller does when tipAccount is null.
+        log.warn('Jito is enabled but no tip account is known — this trade will be broadcast without Jito');
+      }
+    }
+    this._lastTipAccount = tipAccount;
+
+    if (!extra.length) return tx;
+    if (tx instanceof Transaction) {
+      tx.add(...extra);
+      return tx;
+    }
+
+    // Versioned: decompile (resolving any lookup tables), add, recompile.
+    const tables = [];
+    for (const lookup of tx.message.addressTableLookups) {
+      const res = await this.conn().getAddressLookupTable(lookup.accountKey);
+      if (res.value) tables.push(res.value);
+    }
+    const msg = TransactionMessage.decompile(tx.message, { addressLookupTableAccounts: tables });
+    msg.instructions.push(...extra);
+    return new VersionedTransaction(msg.compileToV0Message(tables));
+  }
+
+  /** Submit a signed transaction through one Jito bundle. Returns the bundle id. */
   async sendJito(signedTx) {
     const b64 = Buffer.from(signedTx.serialize()).toString('base64');
     const res = await fetch(`${this.config.jito.blockEngineUrl}/api/v1/bundles`, {
@@ -159,6 +278,59 @@ class Executor {
     const j = await res.json();
     if (j.error) throw new Error(`jito_${JSON.stringify(j.error).slice(0, 120)}`);
     return j.result; // bundle id — bundles need separate status polling
+  }
+
+  /**
+   * Broadcast a SIGNED transaction through every available channel at once.
+   *
+   * They race. A sniped entry competes for the same slot as everyone else's, so
+   * whichever lands first wins and the rest are simply wasted effort — trying them
+   * one after another would add the latency of the failures to every trade. The RPC
+   * is always one of the channels; a Jito bundle and any FAST_SEND_URLS lanes are
+   * added when configured.
+   */
+  async broadcast(signedTx, walletId) {
+    const raw = signedTx.serialize();
+    const b64 = Buffer.from(raw).toString('base64');
+    const channels = [['rpc', () => this.conn().sendRawTransaction(raw, {
+      skipPreflight: true,
+      maxRetries: this.config.execution.maxRetries,
+    })]];
+
+    if (this.config.jito.enabled && this._lastTipAccount) {
+      channels.push(['jito', () => this.sendJito(signedTx)]);
+    }
+    rpc.fastSendEndpoints().forEach((url, i) => {
+      channels.push([`lane${i + 1}`, () => rpc.sendViaJsonRpc(url, b64, `lane ${i + 1}`)]);
+    });
+
+    const results = await Promise.allSettled(channels.map(([, run]) => run()));
+    const failures = [];
+    let winner = null;
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled' && !winner) winner = { channel: channels[i][0], value: r.value };
+      else if (r.status === 'rejected') failures.push(`${channels[i][0]}: ${r.reason && r.reason.message}`);
+    });
+
+    if (!winner) throw new Error(`every submission channel failed — ${failures.join(' | ')}`);
+
+    // A Jito bundle id is not a transaction signature, so if Jito won the race we
+    // still need the RPC's signature to confirm the fill. The RPC channel therefore
+    // has to be reported when it succeeded, whatever else came back first.
+    if (winner.channel !== 'rpc') {
+      const rpcIdx = channels.findIndex(([n]) => n === 'rpc');
+      const rpcResult = results[rpcIdx];
+      if (rpcResult.status === 'fulfilled') {
+        log.info(`${winner.channel} accepted first (${String(winner.value).slice(0, 12)}…) — confirming via the RPC signature`, { wallet: walletId });
+        return rpcResult.value;
+      }
+      // Only Jito answered: its bundle id goes back and confirmation will fall
+      // through to the normal timeout path, which reports honestly rather than
+      // pretending the fill is confirmed.
+      log.warn(`Only ${winner.channel} accepted the transaction; no RPC signature to confirm against`, { wallet: walletId });
+      return winner.value;
+    }
+    return winner.value;
   }
 
   /* ------------------------------------------------------------------ *
@@ -213,7 +385,11 @@ class Executor {
       if (kp.publicKey.equals(toPk)) return { ok: false, error: 'destination_is_source' };
 
       const { tx } = await this.buildTransfer({ from: kp.publicKey, to: toPk, lamports: amount });
-      tx.sign([kp]);
+      // web3.js declares sign(...signers). Passing an Array makes signers[0] an
+      // Array, and it reads .publicKey off it — hence "Cannot read properties of
+      // undefined (reading 'toString')" on EVERY signed transfer, withdrawals
+      // included. The keypair goes in directly.
+      tx.sign(kp);
 
       const signature = await this.conn().sendRawTransaction(tx.serialize(), {
         skipPreflight: false,
@@ -246,25 +422,94 @@ class Executor {
    * Checks: one instruction only, system program, transfer opcode, and that
    * source, destination, amount and fee payer all match the intent.
    */
+  /**
+   * Verify that a wallet-signed funding transaction does exactly what we asked.
+   *
+   * The rule is NOT "exactly one instruction" — real wallets append ComputeBudget
+   * instructions, and demanding an exact byte-for-byte echo of what we built
+   * rejects honest transfers. The rule that actually matters is "no instruction
+   * can move the user's funds anywhere except the destination we named", so:
+   *
+   *   · exactly one System transfer, with from, to and lamports matching exactly
+   *   · the fee payer is the funding wallet
+   *   · ComputeBudget and Memo are tolerated — neither can move funds
+   *   · every other program is refused BY NAME, so the failure is diagnosable
+   *
+   * Accepts legacy and versioned transactions.
+   */
   assertTransferMatches(txBase64, intent) {
-    const SYSTEM_PROGRAM = '11111111111111111111111111111111';
-    const tx = Transaction.from(Buffer.from(String(txBase64 || ''), 'base64'));
-    const ix = tx.instructions;
+    const SYSTEM = '11111111111111111111111111111111';
+    const COMPUTE_BUDGET = 'ComputeBudget111111111111111111111111111111';
+    const MEMO_V1 = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
+    const MEMO_V2 = 'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo';
+    const TOLERATED = new Set([COMPUTE_BUDGET, MEMO_V1, MEMO_V2]);
 
-    if (ix.length !== 1) throw new Error('expected exactly one instruction');
-    if (ix[0].programId.toBase58() !== SYSTEM_PROGRAM) throw new Error('not a system program transfer');
+    const bytes = Buffer.from(String(txBase64 || ''), 'base64');
+    if (!bytes.length) throw new Error('no transaction bytes');
 
-    const data = ix[0].data;
-    if (data.length !== 12 || data.readUInt32LE(0) !== 2) throw new Error('not a transfer instruction');
+    // Normalise legacy and versioned transactions to one shape, so the checks
+    // below read the same either way. A wallet is free to return whichever it
+    // prefers; both are legitimate.
+    let feePayer = null;
+    let instructions = [];
+    try {
+      const tx = Transaction.from(bytes);
+      feePayer = tx.feePayer ? tx.feePayer.toBase58() : null;
+      instructions = tx.instructions.map((ix) => ({
+        programId: ix.programId.toBase58(),
+        keys: ix.keys.map((k) => k.pubkey.toBase58()),
+        data: Buffer.from(ix.data),
+      }));
+    } catch (legacyErr) {
+      let vtx;
+      try {
+        vtx = VersionedTransaction.deserialize(bytes);
+      } catch {
+        throw new Error(`unreadable transaction bytes (${legacyErr.message})`);
+      }
+      const msg = vtx.message;
+      if (msg.addressTableLookups && msg.addressTableLookups.length) {
+        throw new Error('transaction uses address lookup tables, which this endpoint will not relay');
+      }
+      const keys = msg.staticAccountKeys.map((k) => k.toBase58());
+      feePayer = keys[0] || null;
+      instructions = msg.compiledInstructions.map((ci) => ({
+        programId: keys[ci.programIdIndex],
+        keys: ci.accountKeyIndexes.map((idx) => keys[idx]),
+        data: Buffer.from(ci.data),
+      }));
+    }
 
-    const lamports = data.readBigUInt64LE(4);
-    const src = ix[0].keys[0].pubkey.toBase58();
-    const dst = ix[0].keys[1].pubkey.toBase58();
+    if (!instructions.length) throw new Error('the signed transaction has no instructions');
+    if (feePayer !== intent.from) throw new Error(`fee payer mismatch (${feePayer || 'none'})`);
 
-    if (src !== intent.from) throw new Error('source mismatch');
-    if (dst !== intent.to) throw new Error('destination mismatch');
-    if (lamports !== BigInt(intent.lamports)) throw new Error('amount mismatch');
-    if (!tx.feePayer || tx.feePayer.toBase58() !== intent.from) throw new Error('fee payer mismatch');
+    const transfers = [];
+    const foreign = [];
+    for (const ix of instructions) {
+      if (ix.programId === SYSTEM) {
+        // System instruction 2 is Transfer: u32 tag + u64 lamports.
+        if (ix.data.length === 12 && ix.data.readUInt32LE(0) === 2) transfers.push(ix);
+        else throw new Error(`system instruction ${ix.data.length ? ix.data.readUInt32LE(0) : '?'} is not a plain transfer`);
+        continue;
+      }
+      if (!TOLERATED.has(ix.programId)) foreign.push(ix.programId);
+    }
+
+    if (foreign.length) {
+      const named = [...new Set(foreign)].join(', ');
+      throw new Error(`unexpected program(s) in the transaction: ${named}`);
+    }
+    if (transfers.length !== 1) {
+      throw new Error(`expected exactly one transfer, found ${transfers.length}`);
+    }
+
+    const t = transfers[0];
+    const lamports = t.data.readBigUInt64LE(4);
+    if (t.keys[0] !== intent.from) throw new Error('source mismatch');
+    if (t.keys[1] !== intent.to) throw new Error('destination mismatch');
+    if (lamports !== BigInt(intent.lamports)) {
+      throw new Error(`amount mismatch (asked ${intent.lamports} lamports, signed ${lamports})`);
+    }
     return true;
   }
 
@@ -301,34 +546,24 @@ class Executor {
 
     /* ----------------------------- LIVE ------------------------------ */
     try {
-      const kp = this.keystore.getKeypair(walletId);
-      tx.sign([kp]);
+        const kp = this.keystore.getKeypair(walletId);
 
-      let signature;
-      if (this.config.jito.enabled) {
-        try {
-          const bundleId = await this.sendJito(tx);
-          signature = tx.signatures[0] && Buffer.from(tx.signatures[0]).toString('hex');
-          log.info(`Submitted Jito bundle ${bundleId}`, { wallet: walletId });
-          // Jito bundles don't expose a tx signature directly; we re-send via RPC
-          // as a safety net so the transaction cannot be dropped silently.
-          signature = await this.conn().sendRawTransaction(tx.serialize(), {
-            skipPreflight: true,
-            maxRetries: this.config.execution.maxRetries,
-          });
-        } catch (err) {
-          log.warn(`Jito submission failed (${err.message}) — falling back to RPC`, { wallet: walletId });
-          signature = await this.conn().sendRawTransaction(tx.serialize(), {
-            skipPreflight: true,
-            maxRetries: this.config.execution.maxRetries,
-          });
-        }
-      } else {
-        signature = await this.conn().sendRawTransaction(tx.serialize(), {
-          skipPreflight: true,
-          maxRetries: this.config.execution.maxRetries,
-        });
-      }
+        // The priority fee and (if Jito is on) the tip go in BEFORE signing — an
+        // instruction added afterwards would invalidate the signature. This is also
+        // what made "Jito enabled" a lie before: the bundle carried no tip, so it
+        // was never competitive enough to land.
+        const prepared = await this.prepareForFastLane(tx, kp.publicKey);
+
+        // web3.js declares sign(...signers). Passing an Array makes signers[0] an
+        // Array, and it reads .publicKey off it — hence "Cannot read properties of
+        // undefined (reading 'toString')" on EVERY signed transfer, withdrawals
+        // included. The keypair goes in directly.
+        if (prepared instanceof Transaction) prepared.sign(kp);
+        else prepared.sign([kp]);
+
+        // Race every submission channel and take the first signature back. A dead
+        // RPC then costs one failed attempt in parallel rather than the whole trade.
+        const signature = await this.broadcast(prepared, walletId);
 
       bus.safeEmit('exec:filed', { walletId, label, signature, simulated: false, ts: Date.now() });
 
@@ -385,7 +620,6 @@ class Executor {
     return { ok: false, error: lastError, exhausted: true };
   }
 
-  static JITO_TIP_ACCOUNTS = JITO_TIP_ACCOUNTS;
 }
 
 module.exports = Executor;

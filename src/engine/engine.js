@@ -147,6 +147,14 @@ class Engine {
         this.stats.evaluated += 1;
         this.stats.bought += bought;
         this.stats.skipped += outcomes.filter((o) => o.startsWith('skip:')).length;
+        // Close the live-feed row for this launch. This is the only place that
+        // knows the verdict of EVERY wallet, which is what separates "every wallet
+        // declined" from "one of them took it".
+        bus.safeEmit('scan:final', {
+          mint: candidate.mint,
+          outcomes,
+          walletNames: [...this.traders.values()].map((t) => t.cfg.name),
+        });
         if (bought) bus.safeEmit('engine:stats', this.stats);
       })
       .catch((err) => log.error(`Evaluation pipeline error: ${err.message}`));
@@ -488,6 +496,17 @@ class Engine {
         recentPositions: [],
         lastEntryAt: null,
       }));
+  }
+
+  /**
+   * Forget every loaded trader, so the next hydrate() rebuilds from config.
+   *
+   * Used when the wallet list is replaced wholesale (restoring a backup). The
+   * traders hold keypairs resolved from the keystore, so they must not outlive the
+   * keystore they came from.
+   */
+  resetTraders() {
+    this.traders.clear();
   }
 
   addWallet(cfg) {
