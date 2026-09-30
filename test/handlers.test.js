@@ -112,6 +112,34 @@ function build(expression, injected) {
   return new Function('scope', `with (scope) { return (${expression}); }`)(makeScope(injected));
 }
 
+/**
+ * Build a function together with the REAL helpers it closes over.
+ *
+ * openWallet now merges the stored wallet config over defaultCfg() through
+ * withDefaultCfg(), because a partial config threw while the dialog was being
+ * mounted — which looks exactly like a Config button that does nothing. Both
+ * helpers are lifted from app.js rather than stubbed, so this exercises the merge
+ * that ships rather than a stand-in for it.
+ *
+ * Stubbing a dependency here would hide the class of bug this suite exists to
+ * catch: a closed-over name that does not exist. "init is not defined" shipped
+ * twice, and both times only executing the function in its real scope found it.
+ */
+function buildWith(expression, injected, helpers = []) {
+  // The scope proxy claims EVERY name (has: () => true), so a helper declared
+  // inside the built expression would be resolved against the scope and throw
+  // before it is ever reached. Compile the real helpers separately, in one unit so
+  // they can call each other, and hand them to the scope as genuine functions.
+  // extractFunction returns a PARENTHESISED FUNCTION EXPRESSION, not a declaration.
+  // Joined bare, two of them parse as a call of the first (`(...)(...)`), the names
+  // never become bindings, and the scope then throws "X is not defined". Bind each
+  // one explicitly.
+  const prelude = helpers.map((name) => `const ${name} = ${extractFunction(src, name)};`).join('\n');
+  // eslint-disable-next-line no-new-func
+  const compiled = new Function(`${prelude}\n return { ${helpers.join(', ')} };`)();
+  return build(expression, { ...injected, ...compiled });
+}
+
 /** Every name in a scope must be a real function in app.js, or an allowed global. */
 const ALLOWED_GLOBALS = new Set(['S', 'q', '$', 'toast', 'confirm', 'api', 'esc', 'fmtSol', 'cls', 'renderAll', 'refreshAll']);
 function assertScopeIsHonest(injected, label) {
@@ -208,6 +236,7 @@ async function test(name, fn) {
   } catch (err) {
     console.log(`  \u001b[31m✗\u001b[0m ${name}`);
     console.log(`      ${err.message}`);
+      if (process.env.SNIPER_TEST_TRACE) console.log(String(err.stack).split('\n').slice(0,5).join('\n'));
     failed += 1;
   }
 }
@@ -496,16 +525,15 @@ async function test(name, fn) {
       wallets: [], editing: null, keystore: { initialised: true, unlocked: false },
       config: {}, positions: [],
     };
-    const openWallet = build(extractFunction(src, 'openWallet'), {
+    const openWallet = buildWith(extractFunction(src, 'openWallet'), {
       S: state,
       keystoreState: () => keystoreStateOf(state),
       openModal: (html) => captured.push(html),
       esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '',
-      defaultCfg: () => ({ preset: 'balanced', buy: {}, exits: {}, limits: {}, filters: {}, ai: {} }),
       renderEditorPanes: () => {}, wireEditor: () => {}, toast: () => {}, q: makeQ({}),
       isKeystoreUnlocked: () => false,
       DEMO_PRESETS: { balanced: { label: 'Balanced', description: 'steady' } },
-    });
+    }, ['defaultCfg', 'withDefaultCfg']);
 
     openWallet(null);
 
@@ -526,16 +554,15 @@ async function test(name, fn) {
   await test('the form asks a first-time user to CHOOSE a passphrase', () => {
     const captured = [];
     const state = { wallets: [], editing: null, keystore: undefined, config: {}, positions: [] };
-    const openWallet = build(extractFunction(src, 'openWallet'), {
+    const openWallet = buildWith(extractFunction(src, 'openWallet'), {
       S: state,
       keystoreState: () => keystoreStateOf(state),
       openModal: (html) => captured.push(html),
       esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '',
-      defaultCfg: () => ({ preset: 'balanced', buy: {}, exits: {}, limits: {}, filters: {}, ai: {} }),
       renderEditorPanes: () => {}, wireEditor: () => {}, toast: () => {}, q: makeQ({}),
       isKeystoreUnlocked: () => false,
       DEMO_PRESETS: { balanced: { label: 'Balanced', description: 'steady' } },
-    });
+    }, ['defaultCfg', 'withDefaultCfg']);
 
     openWallet(null);
 
@@ -548,16 +575,15 @@ async function test(name, fn) {
   await test('an unlocked session needs no passphrase in the form at all', () => {
     const captured = [];
     const state = { wallets: [], editing: null, keystore: { initialised: true, unlocked: true }, config: {}, positions: [] };
-    const openWallet = build(extractFunction(src, 'openWallet'), {
+    const openWallet = buildWith(extractFunction(src, 'openWallet'), {
       S: state,
       keystoreState: () => keystoreStateOf(state),
       openModal: (html) => captured.push(html),
       esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '',
-      defaultCfg: () => ({ preset: 'balanced', buy: {}, exits: {}, limits: {}, filters: {}, ai: {} }),
       renderEditorPanes: () => {}, wireEditor: () => {}, toast: () => {}, q: makeQ({}),
       isKeystoreUnlocked: () => true,
       DEMO_PRESETS: { balanced: { label: 'Balanced', description: 'steady' } },
-    });
+    }, ['defaultCfg', 'withDefaultCfg']);
 
     openWallet(null);
 

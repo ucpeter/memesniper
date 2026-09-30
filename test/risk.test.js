@@ -665,7 +665,7 @@ const Executor = require('../src/engine/executor');
 
 const SYS = '11111111111111111111111111111111';
 
-function transferB64({ from, to, lamports, extraTo, extraLamports }) {
+function transferB64({ from, to, lamports, extraTo, extraLamports, extra = [] }) {
   const { Transaction, PublicKey, SystemProgram } = require('@solana/web3.js');
   const tx = new Transaction().add(
     SystemProgram.transfer({ fromPubkey: new PublicKey(from), toPubkey: new PublicKey(to), lamports }),
@@ -673,6 +673,7 @@ function transferB64({ from, to, lamports, extraTo, extraLamports }) {
   if (extraTo) {
     tx.add(SystemProgram.transfer({ fromPubkey: new PublicKey(from), toPubkey: new PublicKey(extraTo), lamports: extraLamports }));
   }
+  extra.forEach((ix) => tx.add(ix));
   tx.feePayer = new PublicKey(from);
   tx.recentBlockhash = '11111111111111111111111111111111';
   return Buffer.from(tx.serialize({ requireAllSignatures: false, verifySignatures: false })).toString('base64');
@@ -707,9 +708,22 @@ test('FUND: a redirected destination is rejected', () => {
   assert.throws(() => ex.assertTransferMatches(b64, INTENT), /destination mismatch/);
 });
 
-test('FUND: a smuggled second instruction is rejected', () => {
+test('FUND: a smuggled second transfer is rejected', () => {
+  // The message changed when the check stopped demanding a byte-exact single
+  // instruction: wallets append compute-budget instructions, and refusing those
+  // rejected honest funding. The security property is unchanged — exactly one
+  // System transfer, to the address and for the amount we asked for.
   const b64 = transferB64({ from: USER, to: TRADER, lamports: 250000000, extraTo: ATTACKER, extraLamports: 999000000 });
-  assert.throws(() => ex.assertTransferMatches(b64, INTENT), /exactly one instruction/);
+  assert.throws(() => ex.assertTransferMatches(b64, INTENT), /exactly one transfer/);
+});
+
+test('FUND: a compute-budget instruction is tolerated, a foreign program is not', () => {
+  // Phantom adds ComputeBudget instructions to every transaction it sends. The
+  // old check refused them with "expected exactly one instruction", which is the
+  // error the user saw when funding a wallet from their own wallet.
+  const { ComputeBudgetProgram } = require('@solana/web3.js');
+  const b64 = transferB64({ from: USER, to: TRADER, lamports: 250000000, extra: [ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 })] });
+  assert.strictEqual(ex.assertTransferMatches(b64, INTENT), true, 'fee instructions cannot move funds');
 });
 
 test('FUND: a mismatched source is rejected', () => {
