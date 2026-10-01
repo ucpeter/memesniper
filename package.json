@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node test/risk.test.js && node test/integration.test.js && node test/session.test.js && node test/keystore.test.js && node test/wallets.test.js && node test/handlers.test.js && node test/preview.test.js && node test/executor.test.js && node test/livefeed.test.js && node test/dom.test.js && node test/api.test.js",
+    "test": "node test/risk.test.js && node test/integration.test.js && node test/session.test.js && node test/keystore.test.js && node test/wallets.test.js && node test/handlers.test.js && node test/preview.test.js && node test/executor.test.js && node test/livefeed.test.js && node test/scannerfacts.test.js && node test/dom.test.js && node test/api.test.js",
     "test:risk": "node test/risk.test.js",
     "test:integration": "node test/integration.test.js",
     "keygen": "node scripts/keygen.js",
@@ -20,6 +20,7 @@
     "test:wallets": "node test/wallets.test.js",
     "e2e:backup": "bash scripts/e2e-backup.sh",
     "test:livefeed": "node test/livefeed.test.js",
+    "test:scanner": "node test/scannerfacts.test.js",
     "test:api": "node test/api.test.js"
   },
   "engines": {
