@@ -150,6 +150,22 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
    * Also pushed on the WebSocket as `scan:update`; this route is for a page load, a
    * curl, or anything that wants the current state without holding a socket open.
    */
+  // Public landing-page stream: facts only, with a FIXED informational risk
+  // baseline. No wallet names, addresses, verdicts, private config, or keys.
+  // It does not evaluate, filter, or trigger any trades.
+  app.get('/api/launches', (req, res) => {
+    const { deriveRisk } = require('./engine/livefeed');
+    const rows = engine.liveFeed ? engine.liveFeed.snapshot(50) : [];
+    res.json({ connected: Boolean(engine.scanner.ws && engine.scanner.ws.readyState === 1),
+      rows: rows.map((r) => ({
+        mint: r.mint, symbol: r.symbol, devWallet: r.devWallet,
+        devHoldPct: r.devHoldPct, liquidityUsd: r.liquidityUsd,
+        liquidityApprox: r.solUsdSource === 'fallback' || Boolean(r.solUsdStale),
+        riskScore: deriveRisk(r, { maxDevHoldPct: 15, minLiquidityUsd: 2000 }).score,
+        detectedAt: r.detectedAt,
+      })) });
+  });
+
   app.get('/api/scan', requireToken, (req, res) => {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 60));
     const st = engine.status();
@@ -604,7 +620,7 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     res.json({ ok: true, added, total: engine.traders.size });
   });
 
-  app.get('/api/wallets', (req, res) => {
+  function walletRows() {
     /* `persistent` travels with every wallet: it is how a card knows the BOT holds
      * the key (so it survives a restart) rather than this session alone. The key
      * itself is in the vault, never here. */
@@ -621,8 +637,10 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     // it, flagged, instead of an empty list — the name and the on-chain address
     // are in config.json and were never secret.
     const locked = engine.lockedWallets ? engine.lockedWallets() : [];
-    res.json([...live, ...locked]);
-  });
+    return [...live, ...locked];
+  }
+
+  app.get('/api/wallets', (req, res) => res.json(walletRows()));
 
   app.post('/api/wallets', requireToken, (req, res) => {
     const g = getFull();
@@ -1286,7 +1304,7 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
       type: 'snapshot',
       data: {
         status: engine.status(),
-        wallets: [...engine.traders.values()].map((t) => t.toJSON()),
+        wallets: walletRows(),
         positions: [...engine.traders.values()].flatMap((t) => [...t.positions.values()].map((p) => p.toJSON())),
         // Every launch already scanned this session, newest first, so the live
         // scanner table is populated when the page loads rather than only after the
@@ -1340,7 +1358,7 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
         type: 'tick',
         data: {
           status: engine.status(),
-          wallets: [...engine.traders.values()].map((t) => t.toJSON()),
+          wallets: walletRows(),
           prices: Object.fromEntries(engine.priceCache),
         },
       }));

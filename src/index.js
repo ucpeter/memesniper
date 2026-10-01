@@ -7,8 +7,8 @@
  *   2. build engine (dry-run unless explicitly disabled in config)
  *   3. serve API + UI
  *
- * The bot does NOT auto-start trading. You start it from the UI (or POST
- * /api/engine/start). Nothing spends money until you say so, twice.
+ * The read-only launch feed starts on boot. Trading does NOT start: each
+ * wallet must be armed and started by its owner (live still needs confirmation).
  */
 require('dotenv').config();
 
@@ -71,7 +71,8 @@ server.listen(PORT, HOST, () => {
     log.warn('════════════════════════════════════════════════════════════');
   }
 
-  log.info('Ready. Start the engine from the dashboard when you are.');
+  engine.startScanner(); // read-only launch stream; no wallet is armed or started
+  log.info('Launch scanner running; wallet trading requires a per-wallet Start.');
   engine.startMaintenance();
 });
 
@@ -81,7 +82,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   log.warn(`${signal} received — shutting down. Open positions are NOT auto-closed.`);
-  try { engine.stop(); } catch { /* best effort */ }
+  try { engine.stop(); engine.scanner.stop(); } catch { /* best effort */ }
   try { keystore.lock(); } catch { /* best effort */ }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();
