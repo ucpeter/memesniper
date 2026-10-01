@@ -125,6 +125,72 @@ function unlock(pass) {
 
 const isUnlocked = () => vault !== null;
 
+/* ==================================================================
+ * SESSION KEYS — wallets armed from the browser
+ * ==================================================================
+ *
+ * The wallets themselves live in the BROWSER now (see public/wallets.js): the key
+ * is generated there, sealed there under its own passphrase, and stored in
+ * localStorage. That is what makes a wallet survive a server redeploy — the one
+ * thing the old server-side keystore.enc could not do, and the reason the user
+ * watched a wallet "abruptly delete itself" on a hosted instance whose disk is
+ * thrown away on every deploy.
+ *
+ * The bot still has to sign transactions while the tab is closed, so arming a
+ * wallet hands its decrypted key to this process ONCE. It is held here, in
+ * memory, for the life of the process:
+ *
+ *   · never written to disk — there is no file, no backup, nothing to leak;
+ *   · dropped the moment the wallet is locked, and on shutdown;
+ *   · matched against the wallet's address before it is accepted, so a key that
+ *     does not belong to that address is refused rather than silently used.
+ */
+const session = new Map(); // walletId -> { keypair, address, armedAt }
+
+/**
+ * Take a wallet's decrypted key for this session.
+ *
+ * @param {string} id        wallet id, as recorded in config.json
+ * @param {string} address   the address the dashboard holds for that wallet
+ * @param {string} secret    base58 secret key (64 bytes), straight from the browser
+ */
+function arm(id, address, secret) {
+  if (!id || !secret) throw new Error('A wallet id and a key are both required.');
+  let bytes;
+  try {
+    bytes = bs58.default ? bs58.default.decode(String(secret).trim()) : bs58.decode(String(secret).trim());
+  } catch {
+    throw new Error('That key is not valid base58.');
+  }
+  if (bytes.length !== 64) throw new Error(`A Solana key is 64 bytes — that one is ${bytes.length}.`);
+
+  const kp = Keypair.fromSecretKey(bytes);
+  const real = kp.publicKey.toBase58();
+  if (address && real !== address) {
+    throw new Error('That key belongs to a different address than this wallet.');
+  }
+  session.set(id, { keypair: kp, address: real, armedAt: Date.now() });
+  return real;
+}
+
+/** Is this wallet's key loaded for the session? */
+const armed = (id) => session.has(id);
+const armedIds = () => [...session.keys()];
+
+/** Forget ONE wallet's key. The browser still has the sealed copy. */
+function lockOne(id) {
+  const entry = session.get(id);
+  if (entry && entry.keypair && entry.keypair.secretKey) entry.keypair.secretKey.fill(0);
+  return session.delete(id);
+}
+
+function lockAllSession() {
+  for (const entry of session.values()) {
+    if (entry.keypair && entry.keypair.secretKey) entry.keypair.secretKey.fill(0);
+  }
+  session.clear();
+}
+
 /** Import an existing key. Accepts base58 or a JSON byte array (Phantom export). */
 function importKey(id, secret) {
   if (!isUnlocked()) throw new Error('Keystore is locked.');
@@ -154,13 +220,19 @@ function generateKey(id) {
 }
 
 function getKeypair(id) {
+  // A wallet armed from the browser is a first-class wallet: the engine, the
+  // executor and the withdrawal path all ask for a keypair by wallet id and must
+  // not care which of the two stores answered.
+  const s = session.get(id);
+  if (s) return s.keypair;
   if (!isUnlocked()) throw new Error('Keystore is locked.');
   const entry = vault.wallets[id];
   if (!entry) throw new Error(`No key stored for wallet ${id}`);
   return Keypair.fromSecretKey(Uint8Array.from(entry.secretKey));
 }
 
-const has = (id) => Boolean(vault && vault.wallets[id]);
+/** True when this wallet can sign — from an armed session key or the old vault. */
+const has = (id) => session.has(id) || Boolean(vault && vault.wallets[id]);
 
 function remove(id) {
   if (!isUnlocked()) throw new Error('Keystore is locked.');
@@ -179,6 +251,7 @@ function lock() {
   }
   vault = null;
   passphrase = null;
+  lockAllSession(); // nothing stays in memory either
 }
 
 /**
@@ -210,4 +283,9 @@ function reset(newPass) {
   return { archived };
 }
 
-module.exports = { init, unlock, lock, reset, isInitialised, isUnlocked, importKey, generateKey, getKeypair, has, remove, KEYSTORE_PATH };
+module.exports = {
+  init, unlock, lock, reset, isInitialised, isUnlocked,
+  importKey, generateKey, getKeypair, has, remove,
+  arm, armed, armedIds, lockOne, lockAllSession,
+  KEYSTORE_PATH,
+};
