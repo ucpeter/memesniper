@@ -524,9 +524,18 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
       return res.status(400).json({ error: err.message });
     }
 
+    /* A brand-new wallet is STOPPED. Creating one is not a decision to trade —
+     * it is a decision to have somewhere to trade FROM. The config default is
+     * already enabled:false, and it is restated here so no preset, no client
+     * echo and no future edit can make "create" mean "start trading".
+     */
+    wallet.enabled = false;
+    wallet.stats = { ...(wallet.stats || {}), paused: false, pauseReason: null, day: null };
+
     g.wallets.push(wallet);
     saveConfig();
     engine.addWallet(wallet);
+    log.info(`Wallet created: ${wallet.name} — STOPPED. Press ▶ Start on its card when you want it to trade.`, { wallet: wallet.name });
     res.status(201).json({ ok: true, wallet: wallet.id, publicKey: wallet.publicKey });
   });
 
@@ -631,19 +640,60 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
   app.post('/api/wallets/:id/start', requireToken, async (req, res) => {
     const t = engine.traders.get(req.params.id);
     if (!t) return res.status(404).json({ error: 'wallet_not_found' });
+
     if (!engine.running) engine.start();
+
+    /* Arming a wallet means TWO things, and only doing the first was the bug the
+     * user hit: `resume()` cleared the pause flag, but the entry gate reads
+     * cfg.enabled, which is false on every wallet you create. So Start un-paused
+     * a wallet that was still disabled — nothing could ever trade, and no amount
+     * of pressing it produced a single (paper) trade. Arm both, persist, and say
+     * which mode you are arming into.
+     */
+    t.cfg.enabled = true;
     t.resume();
+    const g = getFull();
+    const stored = g.wallets.find((x) => x.id === t.cfg.id);
+    if (stored) stored.enabled = true;
+    saveConfig();
+
+    log.info(
+      `▶ ${t.cfg.name} armed — ${engine.executor.dryRun ? '🧪 DRY RUN: trades are simulated (no funds spent)' : '🔴 LIVE: real funds'}`,
+      { wallet: t.cfg.name },
+    );
     bus.safeEmit('wallet:stats', t.toJSON());
-    res.json({ ok: true, running: true, paused: false, engineRunning: engine.running, wallet: t.toJSON() });
+    bus.safeEmit('wallet:updated', t.cfg.id);
+    res.json({
+      ok: true,
+      running: true,
+      enabled: true,
+      paused: false,
+      armed: true,
+      dryRun: engine.executor.dryRun,
+      engineRunning: engine.running,
+      note: engine.executor.dryRun
+        ? 'Armed in DRY RUN: this wallet will take simulated (paper) trades — nothing is broadcast.'
+        : 'Armed LIVE: this wallet will spend real SOL.',
+      wallet: t.toJSON(),
+    });
   });
 
   app.post('/api/wallets/:id/stop', requireToken, async (req, res) => {
     const t = engine.traders.get(req.params.id);
     if (!t) return res.status(404).json({ error: 'wallet_not_found' });
+
+    t.cfg.enabled = false;
     t.pause('stopped from the dashboard');
+    const g = getFull();
+    const stored = g.wallets.find((x) => x.id === t.cfg.id);
+    if (stored) stored.enabled = false;
+    saveConfig();
+
+    log.warn(`⏸ ${t.cfg.name} stopped — no new entries. Open positions are still managed.`, { wallet: t.cfg.name });
     bus.safeEmit('wallet:stats', t.toJSON());
+    bus.safeEmit('wallet:updated', t.cfg.id);
     res.json({
-      ok: true, running: false, paused: true, wallet: t.toJSON(),
+      ok: true, running: false, enabled: false, paused: true, armed: false, wallet: t.toJSON(),
       note: 'Stopped. No new entries; open positions are still managed so your stops keep working.',
     });
   });
@@ -789,6 +839,7 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
         // scanner table is populated when the page loads rather than only after the
         // next launch happens to arrive.
         scanFeed: engine.liveFeed ? engine.liveFeed.snapshot(60) : [],
+        scan: engine.liveFeed ? { ...engine.liveFeed.stats, rows: engine.liveFeed.size } : null,
         logs: log.history(120),
         prices: Object.fromEntries(engine.priceCache),
       },
