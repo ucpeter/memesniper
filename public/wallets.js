@@ -243,6 +243,54 @@
   }
 
   /**
+   * Sign a Solana transaction IN THE BROWSER.
+   *
+   * This is how the reference bot withdraws: the key is unsealed here, the
+   * transfer is signed here, and the server is handed nothing but the signed
+   * bytes to broadcast. The private key is therefore never required by the server
+   * for a withdrawal at all — which is the whole point of holding it in the
+   * browser.
+   *
+   * A serialized LEGACY transaction is:
+   *
+   *     [shortvec: number of signatures][64 bytes per signature][message…]
+   *
+   * For an unsigned transaction built by the server there is exactly one
+   * signature slot (the fee payer's) and it is 64 zero bytes, so the message
+   * starts right after it and the signature goes back into that first slot.
+   * Ed25519 signs the message bytes directly — no hashing layer, no library.
+   *
+   * Anything unexpected about the shape throws rather than guessing: signing the
+   * wrong bytes would produce a transaction that either fails on chain or, worse,
+   * one that does something other than what the dialog said.
+   */
+  async function signTransaction(unsigned, secretKey) {
+    const c = webcrypto();
+    const bytes = unsigned instanceof Uint8Array ? unsigned : new Uint8Array(unsigned);
+    if (bytes.length < 3) throw new Error('That transaction is too short to be one');
+
+    // shortvec: 1 byte while the count is under 128, which is the only case we build.
+    const sigCount = bytes[0];
+    if (sigCount === 0) throw new Error('That transaction has no signature slot');
+    if (sigCount >= 128) throw new Error('That transaction has an unusual signature count');
+    const sigEnd = 1 + 64 * sigCount;
+    if (bytes.length <= sigEnd) throw new Error('That transaction has no message to sign');
+    const message = bytes.slice(sigEnd);
+
+    const seed = secretKey.slice(0, 32);
+    const pkcs8 = new Uint8Array(48);
+    pkcs8.set([0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20], 0);
+    pkcs8.set(seed, 16);
+    const priv = await c.subtle.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, false, ['sign']);
+    const signature = new Uint8Array(await c.subtle.sign({ name: 'Ed25519' }, priv, message));
+    if (signature.length !== 64) throw new Error('This browser produced a signature of the wrong size');
+
+    const out = bytes.slice();
+    out.set(signature, 1); // slot 0 — the fee payer, which is this wallet
+    return out;
+  }
+
+  /**
    * Check that a 64-byte secret key really does contain the public key it claims.
    *
    * Without this, a mistyped import would produce a wallet whose address is not
@@ -374,6 +422,7 @@
     generate,
     parseSecret,
     verifyPair,
+    signTransaction,
     create,
     seal,
     unlock,

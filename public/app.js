@@ -31,6 +31,27 @@ const short = (a, n = 4) => (a ? `${a.slice(0, n)}…${a.slice(-n)}` : '—');
 /** A real Solana address is base58 and 32-44 chars. Demo placeholders are not. */
 const isRealAddress = (a) => typeof a === 'string' && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(a);
 const fmtSol = (n, dp = 4) => (n === null || n === undefined || Number.isNaN(n) ? '—' : `${Number(n) >= 0 ? '' : '-'}${Math.abs(Number(n)).toFixed(dp)}`);
+/**
+ * The dollar value of an amount of SOL, at the rate the bot is using.
+ *
+ * Every card that holds SOL shows this underneath, because "2.41 SOL" is not a
+ * number anyone can judge on its own — the same reason the launch table's
+ * liquidity is in dollars. Returns '' when there is no rate at all, so a figure is
+ * never invented; the rows that do have one are marked with `≈` when it was
+ * converted at a fallback rate rather than a live quote.
+ */
+function usdOf(sol, dp = 2) {
+  const rate = S.status && Number(S.status.solUsd);
+  if (!Number.isFinite(rate) || rate <= 0) return '';
+  const n = Number(sol);
+  if (!Number.isFinite(n)) return '';
+  // Sources that are NOT a live provider price get the marker: a fallback constant,
+  // a stale quote, or the preview's fixed demo rate.
+  const src = S.status.solUsdSource;
+  const approx = src === 'fallback' || src === 'demo' || src === 'none' || S.status.solUsdStale;
+  return `${approx ? '≈' : ''}$${(Math.abs(n) * rate).toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })}`;
+}
+
 const fmtPct = (n, dp = 1) => (n === null || n === undefined || Number.isNaN(n) ? '—' : `${Number(n) >= 0 ? '+' : ''}${Number(n).toFixed(dp)}%`);
 const cls = (n) => (n > 0 ? 'pos' : n < 0 ? 'neg' : 'dim');
 const fmtAge = (ms) => {
@@ -254,6 +275,17 @@ function startDemo() {
     running: true, dryRun: true, wallets: 3,
     scanner: { source: 'pumpportal', connected: true, detected: 1_284 },
     stats: { detected: 1284, evaluated: 902, bought: 78, skipped: 824, startedAt: Date.now() - 3600000 },
+    // The preview's fixed rate, so every SOL card in the demo can show a dollar
+    // value too — and it says where it came from, because it is not a live quote.
+    solUsd: DEMO_SOL_USD, solUsdSource: 'demo',
+    overall: {
+      bought: 5, trades: 11, closed: 11, wins: 5, losses: 6, winRatePct: 45.5,
+      open: 2, exposureSol: 0.9, realisedPnlSol: -0.19,
+      wallets: [
+        { id: 'w_b', name: 'Scalper', bought: 2, trades: 4, wins: 3, losses: 1, realisedPnlSol: 0.92, open: 0, keyArmed: true },
+        { id: 'w_c', name: 'Degen', bought: 1, trades: 3, wins: 0, losses: 3, realisedPnlSol: -0.6, open: 0, keyArmed: true },
+      ],
+    },
     priceFeedSize: 2, evalQueue: 0,
   };
   S.config = { dryRun: true, ai: { enabled: false, provider: 'openai', model: 'gpt-4o-mini', apiKey: '' }, rpc: { endpoints: ['https://api.mainnet-beta.solana.com'] }, jito: { enabled: false } };
@@ -401,7 +433,7 @@ function handleWs(msg) {
       S.status = msg.data.status;
       mergeWallets(msg.data.wallets);
       S.prices = msg.data.prices || {};
-      renderChips(); renderStats(); renderWallets(); renderPositions();
+      renderChips(); renderStats(); renderOverall(); renderWallets(); renderPositions();
       break;
     case 'scan':
       // One launch changed state. Patch that row in place: a full re-render on every
@@ -462,6 +494,208 @@ function keyHere(address) {
   const s = walletStore();
   if (!s || !address) return false;
   try { return Boolean(s.record(address)); } catch { return false; }
+}
+
+/**
+ * Wallets this browser holds that the server does NOT know about.
+ *
+ * These are rendered as cards no matter what the server says. The reported bug was
+ * exactly this: two wallets were created, the hosted server's disk was thrown away,
+ * the re-registration did not land, and the wallets section rendered the SERVER's
+ * empty list — "No wallets yet" — while the browser was holding both sealed keys.
+ * A screen that says you have no wallets while your browser holds two of them is
+ * the worst possible answer, and it must be impossible by construction rather than
+ * by hoping the POST succeeded.
+ */
+function browserHeldWallets() {
+  const s = walletStore();
+  if (!s || !s.supported()) return [];
+  let stored = [];
+  try { stored = s.list(); } catch { return []; }
+  const known = new Set((S.wallets || []).map((w) => w.publicKey).filter(Boolean));
+  return stored
+    .filter((rec) => rec.address && !known.has(rec.address))
+    .map((rec) => ({
+      id: `browser:${rec.address}`,
+      name: rec.label || 'Wallet',
+      publicKey: rec.address,
+      localOnly: true,      // in this browser, not on the server
+      enabled: false,
+      armed: false,
+      keyArmed: false,
+      keyLocked: true,
+      keyHolder: 'browser',
+      persistent: false,
+      balanceSol: null,     // nothing can read it until the server knows the address
+      paperBalanceSol: 0,
+      paperTrading: false,
+      exposureSol: 0,
+      stats: { wins: 0, losses: 0, bought: 0, realisedPnlSol: 0, tradesToday: 0, paused: false },
+      openPositions: [],
+    }));
+}
+
+/**
+ * Delete a wallet that only exists in this browser.
+ *
+ * The money warning is the same one the full delete carries, because it is the same
+ * fact: the key is only a way to spend what is on the address, and removing the key
+ * does not remove the SOL. Without the address and the passphrase, funds on it are
+ * unreachable — so the confirmation says so before it does anything.
+ */
+async function forgetBrowserWallet(address) {
+  const s = walletStore();
+  if (!s) return;
+  const rec = (() => { try { return s.record(address); } catch { return null; } })();
+  const name = (rec && rec.label) || 'this wallet';
+  if (!confirm(
+    `Delete ${name} from this browser?\n\n` +
+    `Its sealed key is deleted here. Anything on the address ${address} stays on chain — but ` +
+    'without that key or the passphrase, nothing can ever spend it again. If it holds anything, ' +
+    'write the passphrase down first.\n\nThis cannot be undone.'
+  )) return;
+  try {
+    s.remove(address);
+    renderWallets();
+    toast(`${name} deleted from this browser`, 'warn');
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+/**
+ * SEND THIS WALLET TO THE BOT — the reference repo's `persistent-bot/start`.
+ *
+ * The user's question was exact: "in the repo the wallet is in browser — didn't you
+ * see a function to move it to the server?" There is one, and this is it. The repo's
+ * `useBurnerWallet.start()` posts `{ walletAddress, secretKeyBase64 }` once over
+ * HTTPS so the bot can keep trading with the tab closed; this does the same, with
+ * two differences that only help: the key is checked against the wallet's address
+ * before it is stored, and it is sealed with AES-256-GCM in the server's keystore so
+ * a restart brings the bot back instead of losing every wallet with it.
+ *
+ * The two passphrases are explained in the dialog rather than assumed: the wallet's
+ * own passphrase unseals the key HERE, and the keystore passphrase is what the bot
+ * encrypts it with AT REST (asked once, when there is no keystore yet).
+ */
+async function persistWallet(id) {
+  const s = walletStore();
+  const w = (S.wallets || []).find((x) => x.id === id);
+  if (!w) { toast('That wallet is not loaded', 'err'); return; }
+  if (!s || !s.supported()) { toast('This browser cannot hold keys — the store did not load', 'err'); return; }
+
+  const needsKeystore = !(S.keystore && S.keystore.unlocked);
+  openModal(`
+    <div class="modal-head"><span class="modal-title">🖥 Send ${esc(w.name)} to the bot</span></div>
+    <div class="modal-body">
+      <div class="notice info"><span class="ico">ℹ</span><div>
+        The bot will hold this wallet's key — <b>encrypted</b> — so it keeps trading when this tab is
+        closed and comes back after a restart. Until now the key only existed in this browser, which
+        is why the bot could not touch this wallet while you were away.
+        <br/><br/>You can take it back at any time with <b>Remove from bot</b>; the sealed copy in this
+        browser is never touched either way.
+      </div></div>
+      <div class="field">
+        <label>${esc(w.name)}'s passphrase</label>
+        <input type="password" id="pwPass" autocomplete="current-password" placeholder="Unseals the key in this browser — it is never sent"/>
+        <div class="field-hint">Used here, in the tab, only to open the sealed key.</div>
+      </div>
+      ${needsKeystore ? `
+      <div class="field">
+        <label>Keystore passphrase</label>
+        <input type="password" id="pwKsPass" autocomplete="new-password" placeholder="At least 8 characters"/>
+        <div class="field-hint">What the bot encrypts stored keys with. You will be asked for it once
+          after a restart — choose something you will still have then.</div>
+      </div>` : ''}
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close-modal="1">Cancel</button>
+      <button class="btn btn-primary" id="pwGo">🖥 Send to bot</button>
+    </div>`, (root) => {
+    root.querySelector('#pwGo').onclick = async () => {
+      const pass = root.querySelector('#pwPass').value;
+      const ksPass = root.querySelector('#pwKsPass') ? root.querySelector('#pwKsPass').value : '';
+      if (!pass) { toast("Type this wallet's passphrase", 'warn'); return; }
+      if (needsKeystore && ksPass.length < 8) { toast('The keystore passphrase needs at least 8 characters', 'warn'); return; }
+      try {
+        const secret = await s.unlock(w.publicKey, pass);
+        const body = { secretKey: s.secretToBase58(secret) };
+        if (ksPass) body.keystorePassphrase = ksPass;
+        await api(`/api/wallets/${id}/persist`, { method: 'POST', body: JSON.stringify(body) });
+        secret.fill(0); // the sealed copy in this browser is untouched
+        closeModal();
+        await refreshAll(); renderAll();
+        toast(`🖥 ${w.name} is on the bot — it trades with the tab closed now`, '');
+      } catch (err) { toast(err.message, 'err'); }
+    };
+  });
+}
+
+/** Take a wallet's key back out of the bot. The browser keeps its sealed copy. */
+async function unpersistWallet(id) {
+  const w = (S.wallets || []).find((x) => x.id === id);
+  if (!confirm(
+    `Remove ${w ? w.name : 'this wallet'} from the bot?\n\n` +
+    'The server will delete its copy of the key, so the bot can no longer trade this wallet while ' +
+    'this tab is closed. The sealed copy in this browser stays exactly where it is.'
+  )) return;
+
+  // Deleting the key from the encrypted file needs the keystore open. Ask for the
+  // passphrase when it is not — a button that silently leaves the key behind is
+  // worse than one more field.
+  const needsKeystore = !(S.keystore && S.keystore.unlocked) && !(S.keystore && S.keystore.initialised === false);
+  const go = async (ksPass) => {
+    try {
+      await api(`/api/wallets/${id}/unpersist`, { method: 'POST', body: JSON.stringify(ksPass ? { keystorePassphrase: ksPass } : {}) });
+      await refreshAll(); renderAll();
+      toast(`${w ? w.name : 'Wallet'} removed from the bot — key deleted from the server`, 'warn');
+    } catch (err) {
+      if (/keystore_passphrase_required/.test(err.message) && !ksPass) return askPass();
+      toast(err.message, 'err');
+    }
+  };
+  const askPass = () => openModal(`
+    <div class="modal-head"><span class="modal-title">🔐 Open the keystore to remove this key</span></div>
+    <div class="modal-body">
+      <div class="notice info"><span class="ico">ℹ</span><div>
+        ${esc(w ? w.name : 'This wallet')}'s key is inside your encrypted keystore file. Deleting it has to
+        rewrite that file, which takes the keystore passphrase — the same one you gave when the bot
+        first stored a key.
+      </div></div>
+      <div class="field">
+        <label>Keystore passphrase</label>
+        <input type="password" id="upPass" autocomplete="current-password"/>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close-modal="1">Cancel</button>
+      <button class="btn btn-primary" id="upGo">Remove from bot</button>
+    </div>`, (root) => {
+    root.querySelector('#upGo').onclick = () => {
+      const pass = root.querySelector('#upPass').value;
+      if (pass.length < 8) { toast('The keystore passphrase is at least 8 characters', 'warn'); return; }
+      closeModal();
+      go(pass);
+    };
+  });
+
+  if (needsKeystore) askPass();
+  else go('');
+}
+
+/** Put one browser-held wallet back on the server, then re-render it properly. */
+async function registerBrowserWallet(address) {
+  const s = walletStore();
+  const rec = s && (() => { try { return s.record(address); } catch { return null; } })();
+  try {
+    await api('/api/wallets', {
+      method: 'POST',
+      body: JSON.stringify({ name: (rec && rec.label) || 'Wallet', address, imported: false }),
+    });
+    await refreshAll();
+    renderAll();
+    toast('Wallet registered — its key stays sealed in this browser', '');
+  } catch (err) {
+    toast(`Could not register it: ${err.message}`, 'err');
+  }
 }
 
 /**
@@ -588,7 +822,7 @@ const logLine = (r) => {
 /* ============================================================
    RENDER
    ============================================================ */
-function renderAll() { renderNotices(); renderChips(); renderStats(); renderWallets(); renderPositions(); renderHistory(); renderScanFeed(); renderScanner(); renderLog(); }
+function renderAll() { renderNotices(); renderChips(); renderStats(); renderOverall(); renderWallets(); renderPositions(); renderHistory(); renderScanFeed(); renderScanner(); renderLog(); }
 
 function renderChips() {
   const running = S.status?.running;
@@ -1127,7 +1361,7 @@ function openFund(walletId) {
       </div>
 
       <div class="fund-grid">
-        <div><div class="fg-k">Current balance</div><div class="fg-v">${fmtSol(w.balanceSol, 4)} SOL</div></div>
+        <div><div class="fg-k">Current balance</div><div class="fg-v">${fmtSol(w.balanceSol, 4)} SOL</div><div class="fg-k">${usdOf(w.balanceSol)}</div></div>
         <div><div class="fg-k">Max position</div><div class="fg-v">${maxSize} SOL</div></div>
         <div><div class="fg-k">Max concurrent</div><div class="fg-v">${maxOpen}</div></div>
       </div>
@@ -1185,7 +1419,7 @@ function openFund(walletId) {
       </div>
 
       <div class="fund-grid">
-        <div><div class="fg-k">Current balance</div><div class="fg-v">${fmtSol(w.balanceSol, 4)} SOL</div></div>
+        <div><div class="fg-k">Current balance</div><div class="fg-v">${fmtSol(w.balanceSol, 4)} SOL</div><div class="fg-k">${usdOf(w.balanceSol)}</div></div>
         <div><div class="fg-k">Max position</div><div class="fg-v">${maxSize} SOL</div></div>
         <div><div class="fg-k">Max concurrent</div><div class="fg-v">${maxOpen}</div></div>
       </div>
@@ -1274,6 +1508,15 @@ function openWithdraw(walletId) {
   const demo = Boolean(S.demo);
   const conn = WSOL.connected;
   const destDefault = conn ? conn.account.address : (demo ? 'DEMO-YourWallet-not-a-real-address' : '');
+  /* Can THIS tab sign? When it holds the sealed key for this address — the same
+   * test the wallet card uses to decide between "Unlock" and "Import".
+   *
+   * Deliberately not gated on demo mode: the preview is where this flow gets
+   * looked at, and a dialog that behaves differently there from the real one is
+   * how "the preview lied to me" stories start. In demo the passphrase is still
+   * asked for and still checked against the sealed key; only the broadcast is
+   * simulated, and the dialog says so. */
+  const browserCanSign = keyHere(w.publicKey);
 
   openModal(`
     <div class="modal" style="max-width:620px">
@@ -1299,6 +1542,29 @@ function openWithdraw(walletId) {
         </div>
 
         <div id="wdQuote" class="wd-quote"></div>
+
+        <!--
+          Who signs this transfer. The reference bot signs withdrawals with the
+          keypair it holds in the tab; this does the same whenever this browser is
+          holding the wallet's sealed key, which is the normal case. The key is
+          unsealed HERE, used HERE, and never sent anywhere — only the signed bytes
+          travel. When the browser cannot sign (a wallet made under the old build,
+          or a fresh device), the bot's session key does it instead, and the dialog
+          says so rather than leaving the user guessing which one happened.
+        -->
+        ${browserCanSign ? `
+          <label class="fl-label" style="margin-top:10px">Passphrase for ${esc(w.name)}</label>
+          <input type="password" id="wdPass" class="inp" placeholder="Opens this wallet's key in your browser, to sign the transfer"
+                 autocomplete="current-password" />
+          <div class="hint" id="wdSignNote">
+            🔐 Signed <b>in this browser</b>. Your passphrase and your key never leave this device —
+            only the signed transfer is sent to the bot to broadcast.
+          </div>`
+          : `<div class="hint" id="wdSignNote">
+              ${w.keyArmed === false
+                ? "🔐 This wallet's key is not in this browser, so the bot needs it unlocked to sign: unlock the wallet first, or import its key."
+                : "🔏 Signed by the bot's session key — this wallet's key is loaded in the bot, not in this browser."}
+            </div>`}
 
         <button class="btn btn-danger" id="wdGo" style="margin-top:12px;width:100%">Withdraw</button>
       </div>
@@ -1352,21 +1618,67 @@ function openWithdraw(walletId) {
     btn.disabled = true;
     btn.textContent = 'Sending…';
     try {
-      const res = await api(`/api/wallets/${w.id}/withdraw`, {
-        method: 'POST',
-        body: JSON.stringify({
-          destination: dest,
-          mode,
-          amountSol: Number($('wdAmt').value || 0),
-          confirm: 'WITHDRAW',
-        }),
-      });
-      toast(`Withdrew ${res.amountSol} SOL`, '');
+      let res;
+      const passEl = $('wdPass');
+      const store = walletStore();
+      if (passEl && store) {
+        // ── signed HERE, in the browser — the reference bot's path ──
+        const pass = passEl.value;
+        if (!pass) throw new Error('Type the passphrase for this wallet to sign the transfer');
+
+        let secretKey;
+        try {
+          secretKey = await store.unlock(w.publicKey, pass);
+        } catch (err) {
+          throw new Error(/wrong passphrase/i.test(err.message)
+            ? 'That passphrase does not open this wallet'
+            : err.message);
+        }
+        if (!secretKey) throw new Error('This browser has no sealed key for this wallet');
+
+        if (demo) {
+          // The preview cannot broadcast, but the passphrase is still checked
+          // against the sealed key, so the flow behaves as it does for real.
+          secretKey.fill(0);
+          res = await api(`/api/wallets/${w.id}/withdraw`, {
+            method: 'POST',
+            body: JSON.stringify({ destination: dest, mode, amountSol: Number($('wdAmt').value || 0), confirm: 'WITHDRAW' }),
+          });
+          toast(`Withdrew ${res.amountSol} SOL — preview, nothing was broadcast`, 'warn');
+        } else {
+          const intent = await api(`/api/wallets/${w.id}/withdraw/intent`, {
+            method: 'POST',
+            body: JSON.stringify({ destination: dest, mode, amountSol: Number($('wdAmt').value || 0) }),
+          });
+          const signed = await store.signTransaction(b64ToBytes(intent.txBase64), secretKey);
+          secretKey.fill(0); // done with it; the sealed copy is untouched
+
+          res = await api(`/api/wallets/${w.id}/withdraw/submit`, {
+            method: 'POST',
+            body: JSON.stringify({ intentId: intent.intentId, txBase64: bytesToB64(signed) }),
+          });
+          toast(`Withdrew ${res.amountSol} SOL — signed in your browser`, '');
+        }
+      } else {
+        // ── signed by the bot, with the session key it holds ──
+        res = await api(`/api/wallets/${w.id}/withdraw`, {
+          method: 'POST',
+          body: JSON.stringify({
+            destination: dest,
+            mode,
+            amountSol: Number($('wdAmt').value || 0),
+            confirm: 'WITHDRAW',
+          }),
+        });
+        toast(`Withdrew ${res.amountSol} SOL`, '');
+      }
       showTx(res.signature, 'Withdrawal');
       closeModal();
       await refreshAll(); renderAll();
     } catch (err) {
       toast(err.message, 'err');
+      const note = $('wdSignNote');
+      if (note && /passphrase/i.test(err.message)) note.innerHTML = `⚠ ${esc(err.message)}`;
     } finally {
       btn.disabled = false;
       btn.textContent = 'Withdraw';
@@ -1462,6 +1774,99 @@ function renderNotices() {
   if (cfgLink) cfgLink.onclick = (e) => { e.preventDefault(); openSettings(); };
 }
 
+/**
+ * Per-wallet and overall trade counts, in one card.
+ *
+ * "How many trades were done, how many were wins, how many were losses" was
+ * answerable only by opening each wallet in turn, and the combined strip at the
+ * top showed a win rate with no counts behind it. This is that answer, for every
+ * wallet at once, with the totals underneath — the same shape as the reference
+ * bot's stats bar, extended to break the numbers down by wallet because this bot
+ * trades several.
+ */
+function renderOverall() {
+  const mount = $('overall');
+  if (!mount) return;
+
+  const ws = (S.wallets || []).slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  const row = (name, bought, wins, losses, realised, open, closed, muted) => {
+    const total = closed !== null ? closed : wins + losses;
+    const rate = wins + losses > 0 ? `${((wins / (wins + losses)) * 100).toFixed(0)}%` : '—';
+    return `<tr class="${muted ? 'mute' : ''}">
+      <td class="sym">${esc(name)}</td>
+      <td class="num">${bought === null ? '—' : bought}</td>
+      <td class="num">${total === null ? '—' : total}</td>
+      <td class="num pos">${wins || '—'}</td>
+      <td class="num neg">${losses || '—'}</td>
+      <td class="num">${rate}</td>
+      <td class="num ${cls(realised)}">${fmtSol(realised || 0, 3)}<div class="mute" style="font-size:10px">${usdOf(realised || 0)}</div></td>
+      <td class="num">${open === null ? '—' : open}</td>
+    </tr>`;
+  };
+
+  const totals = ws.reduce((a, w) => {
+    const st = w.stats || {};
+    a.bought += st.bought || 0;
+    a.wins += st.wins || 0;
+    a.losses += st.losses || 0;
+    a.realised += st.realisedPnlSol || 0;
+    a.open += (w.openPositions || []).length;
+    a.locked = a.locked || Boolean(w.keyLocked);
+    return a;
+  }, { bought: 0, wins: 0, losses: 0, realised: 0, open: 0, locked: false });
+  // The server's own figures win when they are present: a locked wallet keeps its
+  // counts in config.json, and those are the numbers this card is asked to show.
+  const regAll = (S.status && S.status.overall) || null;
+  if (regAll && Number.isFinite(regAll.bought)) totals.bought = regAll.bought;
+
+  const registered = (S.status && S.status.overall) || null;
+  const closedTotal = registered && Number.isFinite(registered.closed) ? registered.closed : totals.wins + totals.losses;
+  const rate = totals.wins + totals.losses > 0 ? `${((totals.wins / (totals.wins + totals.losses)) * 100).toFixed(1)}%` : '—';
+  const dry = S.status ? S.status.dryRun !== false : true;
+
+  mount.innerHTML = `
+    <div class="panel-head">
+      <span class="panel-title">Trades per wallet <span class="count" id="overallCount">${ws.length}</span></span>
+      <span class="panel-sub">${dry ? 'simulated trades (DRY RUN)' : 'real trades'} · ${closedTotal} closed in total${totals.locked ? ' · locked wallets show their last saved figures' : ''}</span>
+    </div>
+    <div class="panel-body">
+      <div class="tbl-wrap">
+        <table class="overall-tbl">
+          <thead><tr>
+            <th>Wallet</th>
+            <th class="num" title="Tokens this wallet BOUGHT and took a position in.">Bought</th>
+            <th class="num" title="Positions that have CLOSED — won or lost. Open ones are counted in the last column, not here.">Closed</th>
+            <th class="num">Won</th><th class="num">Lost</th>
+            <th class="num" title="Wins as a share of closed trades — every wallet combined in the totals row.">Win rate</th>
+            <th class="num">Realised</th><th class="num">Open</th>
+          </tr></thead>
+          <tbody>
+            ${ws.map((w) => {
+              const st = w.stats || {};
+              const open = (w.openPositions || []).length;
+              return row(w.name + (w.keyLocked ? ' 🔒' : '') + (w.persistent ? ' 🖥' : ''), st.bought || 0, st.wins || 0, st.losses || 0, st.realisedPnlSol || 0, open, null, Boolean(w.keyLocked));
+            }).join('')}
+            <tr class="overall-total">
+              <td class="sym"><b>All wallets</b></td>
+              <td class="num"><b>${totals.bought}</b></td>
+              <td class="num"><b>${closedTotal}</b></td>
+              <td class="num pos"><b>${totals.wins}</b></td>
+              <td class="num neg"><b>${totals.losses}</b></td>
+              <td class="num"><b>${rate}</b></td>
+              <td class="num ${cls(totals.realised)}"><b>${fmtSol(totals.realised, 3)}</b></td>
+              <td class="num"><b>${totals.open}</b></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="notice info" style="margin-top:10px"><span class="ico">ℹ</span><div>
+        A token is BOUGHT when the wallet opens a position in it, and a TRADE when that position
+        CLOSES — a winning exit or a losing one. The board above adds up every wallet; each wallet's
+        own card and 📄 Trades dialog show only its own.
+      </div></div>
+    </div>`;
+}
+
 function renderStats() {
   const ws = S.wallets || [];
   const open = S.positions || [];
@@ -1485,10 +1890,13 @@ function renderStats() {
 
   const cards = [
     [dry ? 'Realised P&L (day) · paper' : 'Realised P&L (day)', `${fmtSol(totalPnl)} SOL`,
-      `${armedCount} wallet${armedCount === 1 ? '' : 's'} armed${dry ? ' · simulated' : ''}`, cls(totalPnl), cls(totalPnl) === 'pos' ? 'accent' : cls(totalPnl) === 'neg' ? 'red' : ''],
-    [dry ? 'Unrealised · paper' : 'Unrealised', `${fmtSol(unrealised)} SOL`, `${open.length} open${dry ? ' · simulated' : ''}`, cls(unrealised), 'blue'],
+      [usdOf(totalPnl), `${armedCount} wallet${armedCount === 1 ? '' : 's'} armed${dry ? ' · simulated' : ''}`].filter(Boolean).join(' · '),
+      cls(totalPnl), cls(totalPnl) === 'pos' ? 'accent' : cls(totalPnl) === 'neg' ? 'red' : ''],
+    [dry ? 'Unrealised · paper' : 'Unrealised', `${fmtSol(unrealised)} SOL`,
+      [usdOf(unrealised), `${open.length} open${dry ? ' · simulated' : ''}`].filter(Boolean).join(' · '), cls(unrealised), 'blue'],
     ['Win rate', wins + losses ? `${winRate.toFixed(1)}%` : '—', `${wins}W / ${losses}L${dry ? ' · paper' : ''}`, winRate >= 50 ? 'pos' : 'dim', ''],
-    ['Exposure', `${fmtSol(exposure, 2)} SOL`, `${dry ? 'of ' + fmtSol(balance, 2) + ' paper balance' : 'of ' + fmtSol(balance, 2) + ' balance'}`, 'dim', 'amber'],
+    ['Exposure', `${fmtSol(exposure, 2)} SOL`,
+      [usdOf(exposure), dry ? 'of ' + fmtSol(balance, 2) + ' paper balance' : 'of ' + fmtSol(balance, 2) + ' balance'].filter(Boolean).join(' · '), 'dim', 'amber'],
     ['Tokens scanned', detected.toLocaleString(),
       `${bought} bought · ${detected ? ((bought / detected) * 100).toFixed(1) : '0'}% hit · ${feedRows} in the feed below`, 'dim', ''],
   ];
@@ -1502,8 +1910,13 @@ function renderStats() {
 }
 
 function renderWallets() {
-  const ws = S.wallets || [];
+  /* The SERVER's list, plus whatever this browser is holding that the server does
+   * not have. See browserHeldWallets() — this is the line that makes "No wallets
+   * yet" impossible while a sealed key is sitting in localStorage. */
+  const held = browserHeldWallets();
+  const ws = [...(S.wallets || []), ...held];
   $('walletCount').textContent = ws.length;
+  if (held.length) S.heldWallets = held.map((w) => w.publicKey);
 
   if (!ws.length) {
     // One empty state now, because there is one truth: a wallet is created in
@@ -1540,6 +1953,26 @@ function renderWallets() {
     //     "unlock" would be a lie.
     // This card is where that used to be a dead end: it told you the wallet was
     // locked and offered no way to unlock it.
+    if (w.localOnly) {
+      // Held in this browser, unknown to the server. It cannot trade yet — but it
+      // exists, it has an address, and the two things the user can do about it are
+      // both one tap.
+      return `<div class="wallet-card" data-wallet="${esc(w.id)}">
+        <div class="wallet-head">
+          <div>
+            <div class="wallet-name">${esc(w.name)}</div>
+            <div class="wallet-addr mono dim">${esc(w.publicKey)}</div>
+          </div>
+          <span class="chip warn" title="This key is sealed in this browser and the server has no record of the wallet — for example after a redeploy threw its disk away. Registering it again takes one tap and does not touch the key.">⚠ not on the server</span>
+        </div>
+        <div class="wallet-note">This wallet is safe in this browser, but the bot cannot see it: the server has no record of it, so nothing can trade it or read its balance. Registering it again brings its card back — the key stays sealed here.</div>
+        <div class="wallet-actions">
+          <button class="btn btn-primary btn-sm" data-register="${esc(w.publicKey)}">♻ Register again</button>
+          <button class="btn btn-sm btn-danger" data-forget="${esc(w.publicKey)}" title="Remove this wallet from THIS browser. Any funds on its address stay on chain — keep the passphrase and the address if it holds SOL.">Delete here</button>
+        </div>
+      </div>`;
+    }
+
     if (w.keyLocked) {
       const here = keyHere(w.publicKey);
       /* THREE ways to be without a key, and they are not the same situation.
@@ -1577,11 +2010,15 @@ function renderWallets() {
           <div class="arm-row">
             <input type="password" id="armpass-${esc(w.id)}" placeholder="Passphrase for ${esc(w.name)}" autocomplete="current-password"/>
             <button class="btn btn-primary btn-sm" data-arm="${esc(w.id)}" title="Unseal this wallet's key in the browser and load it into the bot for this session">🔓 Unlock</button>
+          </div>
+          <div class="arm-row" style="margin-top:6px">
+            <button class="btn btn-sm" data-persist="${esc(w.id)}" title="Send this wallet's key to the bot once, encrypted, so it can trade while this tab is closed and after a restart. You can take it back at any time.">🖥 Send to bot (trades with the tab closed)</button>
           </div>` : ''}
 
         <div class="wallet-actions">
-          <span class="badge sim" style="align-self:center">${here ? '🔒 locked' : inKeystore ? '🔐 keystore' : 'no key'}</span>
+          <span class="badge sim" style="align-self:center">${w.persistent ? '🖥 on bot' : here ? '🔒 locked' : inKeystore ? '🔐 keystore' : 'no key'}</span>
           <div style="flex:1"></div>
+          ${w.persistent ? `<button class="btn btn-sm" data-unpersist="${esc(w.id)}" title="Remove this wallet's key from the server. The sealed copy in this browser is untouched.">⏏ Remove from bot</button>` : ''}
           ${here
             ? `<button class="btn btn-sm" data-edit="${esc(w.id)}" title="Strategy, limits, exits and filters for this wallet">⚙ Config</button>
                <button class="btn btn-sm btn-danger" data-delrecord="${esc(w.id)}" title="Remove this wallet from the bot and this browser. Its funds stay on chain.">🗑 Delete</button>`
@@ -1641,16 +2078,18 @@ function renderWallets() {
       <div class="wallet-stats">
         <div class="wstat">
           <div class="wstat-k">Real bal.</div>
-          <div class="wstat-v ${w.balanceSol === null || w.balanceSol === undefined ? 'mute' : ''}" title="The SOL this wallet actually holds on Solana. Funding adds to it, withdrawing takes from it. In dry run it stays untouched by trades.">${w.balanceSol === null || w.balanceSol === undefined ? (w.keyLocked ? 'locked' : '—') : fmtSol(w.balanceSol, 3)}</div>
-          <div class="wstat-sub">on chain</div>
+          <div class="wstat-v ${w.balanceSol === null || w.balanceSol === undefined ? 'mute' : ''}" title="The SOL this wallet actually holds on Solana. Funding adds to it, withdrawing takes from it. In dry run it stays untouched by trades. Read from the address, so it is shown even while the wallet is locked.">${w.balanceSol === null || w.balanceSol === undefined ? (w.keyLocked ? 'unknown' : '—') : fmtSol(w.balanceSol, 3)}</div>
+          <div class="wstat-sub">${w.balanceSol === null || w.balanceSol === undefined ? 'on chain' : `${usdOf(w.balanceSol)} on chain`}</div>
         </div>
         <div class="wstat">
           <div class="wstat-k">Sim. balance</div>
           <div class="wstat-v mute" title="A pretend balance, used only because the bot is in dry run. Simulated trades add and subtract here and nowhere else.">${fmtSol(w.paperBalanceSol || 0, 2)}</div>
+          <div class="wstat-sub">${usdOf(w.paperBalanceSol || 0)}</div>
           <div class="wstat-sub"><span class="paper-tag">SIMULATED</span></div>
         </div>
-        <div class="wstat"><div class="wstat-k">Realised</div><div class="wstat-v ${cls(pnl)}" title="Profit and loss booked from CLOSED trades on this wallet.">${fmtSol(pnl, 3)}</div></div>
-        <div class="wstat"><div class="wstat-k">Win rate</div><div class="wstat-v">${(st.wins || 0) + (st.losses || 0) ? `${winRateOf(st).toFixed(0)}%` : '—'}</div><div class="wstat-sub">${st.wins || 0}W / ${st.losses || 0}L</div></div>
+        <div class="wstat"><div class="wstat-k" title="Tokens this wallet BOUGHT. Won and lost are the ones that have CLOSED — a position still open counts as bought and nothing else yet.">Bought</div><div class="wstat-v">${st.bought || 0}</div><div class="wstat-sub">${(st.wins || 0)}W / ${(st.losses || 0)}L</div></div>
+        <div class="wstat"><div class="wstat-k">Realised</div><div class="wstat-v ${cls(pnl)}" title="Profit and loss booked from CLOSED trades on this wallet.">${fmtSol(pnl, 3)}</div><div class="wstat-sub">${usdOf(pnl)} · ${(st.wins || 0)}W / ${(st.losses || 0)}L</div></div>
+        <div class="wstat"><div class="wstat-k">Win rate</div><div class="wstat-v">${(st.wins || 0) + (st.losses || 0) ? `${winRateOf(st).toFixed(0)}%` : '—'}</div><div class="wstat-sub">closed trades</div></div>
         <div class="wstat"><div class="wstat-k">Open</div><div class="wstat-v">${open.length}/${cfg.buy?.maxConcurrentPositions ?? '—'}</div></div>
       </div>
 
@@ -1665,18 +2104,114 @@ function renderWallets() {
 
       <div class="wallet-actions">
         <span class="badge ${armed ? 'won' : st.paused ? 'lost' : 'sim'}" style="align-self:center">${stateLabel}</span>
+        ${w.persistent ? '<span class="badge sim" style="align-self:center" title="The bot holds this wallet\'s key, encrypted, so it trades while this tab is closed.">🖥 on bot</span>' : ''}
         <div style="flex:1"></div>
         ${armed
           ? `<button class="btn btn-sm btn-warn" data-stop="${esc(w.id)}" title="Stop new entries for this wallet. Open positions are still managed, so your stops keep working.">⏸ Stop</button>`
           : `<button class="btn btn-sm btn-primary" data-start="${esc(w.id)}" title="Start this wallet${paperMode ? ' — it is in DRY RUN, so its trades will be simulated (paper trades on a paper balance)' : ''}. This also starts the engine if it is stopped.">▶ Start</button>`}
-        <button class="btn btn-sm" data-detail="${esc(w.id)}" title="This wallet's open positions and its own trade history">📄 Trades</button>
+        <button class="btn btn-sm" data-detail="${esc(w.id)}" title="This wallet's open positions, its own trade history, and the launches it saw">📄 Trades</button>
+        <button class="btn btn-sm" data-feed="${esc(w.id)}" title="The launches THIS wallet has seen, and what it did about each one — bought, filtered, or skipped and why">📡 Feed</button>
         <button class="btn btn-sm" data-edit="${esc(w.id)}" title="Strategy, limits, exits and filters for this wallet">⚙ Config</button>
         <button class="btn btn-sm" data-withdraw="${esc(w.id)}" title="Move SOL out of this wallet">Withdraw</button>
+        ${w.persistent ? `<button class="btn btn-sm" data-unpersist="${esc(w.id)}" title="Remove this wallet's key from the server. The sealed copy in this browser is untouched.">⏏ Remove from bot</button>` : ''}
         <button class="btn btn-sm btn-danger" data-close="${esc(w.id)}" title="Sell everything in this wallet and stop it trading">⛔ Kill all</button>
             ${w.keyArmed === false ? '' : `<button class="btn btn-sm" data-lock="${esc(w.id)}" title="Forget this wallet's key for now. The sealed copy in your browser is untouched.">🔒 Lock</button>`}
       </div>
     </div>`;
   }).join('');
+}
+
+/**
+ * The launches ONE wallet has seen, in the order the table shows them.
+ *
+ * The terminal-wide list is the engine's view: every launch, and what every
+ * wallet did with it. This is the same rows narrowed to a single wallet, so
+ * "which token did THIS wallet buy" has a plain answer without reading a
+ * comma-separated list of three wallets' verdicts.
+ *
+ * A row belongs to a wallet when the wallet has a verdict on it — every
+ * evaluation writes one, including the `filtered` and `skipped` cases — or when
+ * that wallet is the one that bought it.
+ */
+function walletFeed(w) {
+  if (!w) return [];
+  return (S.scanFeed || []).filter((r) => {
+    if (r.boughtBy && r.boughtBy === w.name) return true;
+    return Array.isArray(r.wallets) && r.wallets.some((x) => x.name === w.name);
+  });
+}
+
+/** What this wallet did about one launch, in its own words. */
+function walletVerdict(row, w) {
+  const mine = Array.isArray(row.wallets) ? row.wallets.find((x) => x.name === w.name) : null;
+  const bought = row.boughtBy === w.name;
+  if (bought || (mine && mine.action === 'bought')) return { label: 'BOUGHT', cls: 'won', reason: null };
+  if (!mine) return { label: 'not evaluated', cls: 'sim', reason: 'the engine had not reached this launch for this wallet' };
+  if (mine.action === 'filtered') return { label: 'filtered', cls: 'sim', reason: mine.reason || 'its filters ruled the token out' };
+  if (mine.action === 'rpc_error') return { label: 'rpc error', cls: 'lost', reason: mine.reason || 'the RPC did not answer — infrastructure, not the token' };
+  if (mine.action === 'checking') return { label: 'evaluating…', cls: 'paper', reason: null };
+  return { label: 'skipped', cls: 'sim', reason: mine.reason || row.skipReason || 'declined' };
+}
+
+/** The per-wallet launch table, shared by the 📄 Trades dialog and 📡 Feed. */
+function walletFeedTable(w) {
+  const rows = walletFeed(w).slice(0, 40);
+  if (!rows.length) {
+    return `<div class="empty" style="padding:18px"><div class="empty-sub">No launch has reached ${esc(w.name)} yet. Press ▶ Start on its card and they will appear here as they are scanned.</div></div>`;
+  }
+  return `<table class="scan-tbl">
+    <thead><tr>
+      <th>Token</th><th class="num">Dev hold</th><th class="num">Liquidity</th><th class="num">Risk</th>
+      <th>What ${esc(w.name)} did</th>
+    </tr></thead>
+    <tbody>${rows.map((r) => {
+      const v = walletVerdict(r, w);
+      const liqUsd = r.liquidityUsd === null || r.liquidityUsd === undefined ? null : Number(r.liquidityUsd);
+      const risk = r.riskScore === null || r.riskScore === undefined ? null : Number(r.riskScore);
+      return `<tr>
+        <td>
+          <div class="scan-sym">${esc(r.symbol || 'unknown')}</div>
+          <a class="scan-mint mono" href="https://pump.fun/coin/${esc(r.mint)}" target="_blank" rel="noopener noreferrer">${esc(short(r.mint, 4))}</a>
+        </td>
+        <td class="num ${r.devHoldPct === null || r.devHoldPct === undefined ? 'mute' : ''}">
+          ${r.devHoldPct === null || r.devHoldPct === undefined ? 'unread' : `${Number(r.devHoldPct).toFixed(1)}%`}
+        </td>
+        <td class="num ${liqUsd === null ? 'mute' : ''}">
+          ${liqUsd === null ? 'unread' : `$${liqUsd.toLocaleString('en-US')}`}
+        </td>
+        <td class="num ${risk === null ? 'mute' : risk >= 50 ? 'neg' : risk > 0 ? 'warn' : 'pos'}">
+          ${risk === null ? 'unread' : risk}
+        </td>
+        <td>
+          <span class="badge ${v.cls}" style="padding:1px 7px;font-size:9.5px">${esc(v.label)}</span>
+          ${v.reason ? `<div class="scan-reason" title="${esc(v.reason)}">${esc(shortReason(v.reason))}</div>` : ''}
+        </td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table>`;
+}
+
+/** One wallet's launches on their own, from the card. */
+function openWalletFeed(walletId) {
+  const w = (S.wallets || []).find((x) => x.id === walletId);
+  if (!w) return;
+  const rows = walletFeed(w);
+  const bought = rows.filter((r) => r.boughtBy === w.name || (r.wallets || []).some((x) => x.name === w.name && x.action === 'bought')).length;
+  openModal(`
+    <div class="modal" style="max-width:900px">
+      <div class="modal-head">
+        <span class="modal-title">📡 ${esc(w.name)} — launches</span>
+        <span class="wallet-preset">${rows.length} seen · ${bought} bought</span>
+        <button class="btn btn-ghost btn-sm" data-close-modal="1" title="Close this dialog (Esc also works)">Close</button>
+      </div>
+      <div class="modal-body">
+        <div class="notice info"><span class="ico">ℹ</span><div>
+          Every launch this wallet evaluated, and what it did about it. A launch it never reached
+          (the engine was stopped, or the queue was full) is not in this list.
+        </div></div>
+        <div class="tbl-wrap" style="margin-top:12px">${walletFeedTable(w)}</div>
+      </div>
+    </div>`);
 }
 
 /** Win rate for one wallet, as a percentage. 0 when it has not traded yet. */
@@ -1740,13 +2275,17 @@ function openWalletDetail(walletId) {
         <button class="btn btn-ghost btn-sm" data-close-modal="1" title="Close this dialog (Esc also works)">Close</button>
       </div>
       <div class="modal-body">
-        <div class="wallet-stats" style="grid-template-columns:repeat(5,1fr)">
-          ${stat('Real balance', `${fmtSol(w.balanceSol, 3)} SOL`)}
-          ${stat('Realised', fmtSol(st.realisedPnlSol || 0, 3), cls(st.realisedPnlSol || 0))}
+        <div class="wallet-stats" style="grid-template-columns:repeat(6,1fr)">
+          ${stat('Trades', String((st.wins || 0) + (st.losses || 0)))}
+          ${stat('Won', String(st.wins || 0), 'pos')}
+          ${stat('Lost', String(st.losses || 0), 'neg')}
           ${stat('Win rate', (st.wins || 0) + (st.losses || 0) ? `${winRateOf(st).toFixed(0)}%` : '—')}
-          ${stat('Trades today', String(st.tradesToday || 0))}
-          ${stat('Exposure', `${fmtSol(w.exposureSol || 0, 2)}`)}
+          ${stat('Realised', `${fmtSol(st.realisedPnlSol || 0, 3)}${usdOf(st.realisedPnlSol || 0) ? ` · ${usdOf(st.realisedPnlSol || 0)}` : ''}`, cls(st.realisedPnlSol || 0))}
+          ${stat('Real balance', `${fmtSol(w.balanceSol, 3)} SOL${usdOf(w.balanceSol) ? ` · ${usdOf(w.balanceSol)}` : ''}`)}
         </div>
+
+        <div class="section-label">What ${esc(w.name)} did with the launches it saw (${walletFeed(w).length})</div>
+        <div class="tbl-wrap">${walletFeedTable(w)}</div>
 
         <div class="section-label">Open positions (${open.length})</div>
         <div class="tbl-wrap">${openRows}</div>
@@ -1952,15 +2491,32 @@ function renderScanFeed() {
       <table class="scan-tbl">
         <thead>
           <tr>
-            <th>Token</th><th>Dev</th><th class="num">Dev hold</th><th class="num">Liquidity</th>
-            <th class="num">Risk</th><th>Decision</th>
+            <th>Token</th><th>Dev</th>
+            <th class="num" title="The dev's own opening buy as a share of the 1,000,000,000 supply. Comes from the launch itself, so it is filled on every row; an on-chain holder read refines it when one succeeds.">Dev hold</th>
+            <th class="num" title="SOL in the bonding curve, priced in dollars. A figure marked ≈ was converted at a fallback rate because no price provider answered.">Liquidity</th>
+            <th class="num" title="0–100, higher is more dangerous. Scored from the dev hold and the liquidity above; a row marked * has not been checked on chain yet.">Risk</th>
+            <th>Decision</th>
           </tr>
         </thead>
         <tbody>
           ${rows.map((r) => {
             const risk = r.riskScore === null || r.riskScore === undefined ? null : Number(r.riskScore);
             const riskCls = risk === null ? 'mute' : risk >= 50 ? 'neg' : risk > 0 ? 'warn' : 'pos';
-            const liq = r.liquiditySol === null || r.liquiditySol === undefined ? null : Number(r.liquiditySol);
+            const liqSol = r.liquiditySol === null || r.liquiditySol === undefined ? null : Number(r.liquiditySol);
+            const liqUsd = r.liquidityUsd === null || r.liquidityUsd === undefined ? null : Number(r.liquidityUsd);
+            /* LIQUIDITY is shown in dollars, because a SOL figure cannot be judged:
+             * "0.98 SOL" means nothing to a person deciding whether to buy. The
+             * reference bot shows USD here for the same reason.
+             *
+             * When the dollar figure had to be converted at a last-resort price
+             * (every price API unreachable), it is marked — a guessed number
+             * presented as a quote is exactly the kind of dishonesty this project
+             * exists to not do. */
+            const liqApprox = liqUsd !== null && (r.solUsdSource === 'fallback' || r.solUsdStale);
+            const liqTitle = liqSol === null ? 'No curve reading for this launch.' :
+              `${liqSol.toFixed(3)} SOL in the curve` +
+              (liqUsd === null ? '' : ` · $${liqUsd.toLocaleString('en-US')} at ${r.solUsd ? `$${r.solUsd.toFixed(0)}/SOL` : 'the last known SOL price'}`) +
+              (liqApprox ? ' · SOL price unavailable, converted at a fallback rate' : '');
             return `<tr>
               <td>
                 <div class="scan-sym">${esc(r.symbol || 'unknown')}</div>
@@ -1969,17 +2525,29 @@ function renderScanFeed() {
                 ${r.name && r.name !== r.symbol ? `<div class="scan-name">${esc(r.name)}</div>` : ''}
               </td>
               <td class="mono mute">${r.devWallet ? esc(short(r.devWallet, 4)) : '—'}</td>
-              <td class="num ${r.devHoldPct === null || r.devHoldPct === undefined ? 'mute' : r.devHoldPct > 20 ? 'neg' : ''}">
-                ${r.devHoldPct === null || r.devHoldPct === undefined ? '—' : `${Number(r.devHoldPct).toFixed(1)}%`}
+              <td class="num ${r.devHoldPct === null || r.devHoldPct === undefined ? 'mute' : r.devHoldPct > 20 ? 'neg' : ''}"
+                  title="${esc(r.devHoldPct === null || r.devHoldPct === undefined
+                    ? 'The launch event carried no opening buy for this token, and the on-chain holder read did not finish.'
+                    : `Dev's opening buy: ${Number(r.devHoldPct).toFixed(2)}% of the 1,000,000,000 supply (${(r.facts || {}).devHold === 'event' ? 'from the launch event' : 'read on chain'})`)}">
+                ${r.devHoldPct === null || r.devHoldPct === undefined ? 'unread' : `${Number(r.devHoldPct).toFixed(1)}%`}
               </td>
-              <td class="num">${liq === null ? '<span class="mute">—</span>' : `${liq.toFixed(2)} SOL`}</td>
-              <td class="num ${riskCls}">${risk === null ? '—' : risk}
-                ${r.riskNotes && r.riskNotes.length ? `<span class="scan-risk-note" title="${esc(r.riskNotes.join(', '))}">ⓘ</span>` : ''}
+              <td class="num" title="${esc(liqTitle)}">
+                ${liqUsd === null
+                  ? (liqSol === null ? '<span class="mute">unread</span>' : `<span class="mute">${liqSol.toFixed(2)} SOL</span>`)
+                  : `$${liqUsd.toLocaleString('en-US')}${liqApprox ? '<span class="approx" title="SOL price unavailable — converted at a fallback rate">≈</span>' : ''}
+                     <div class="mute" style="font-size:10px">${liqSol.toFixed(2)} SOL</div>`}
+              </td>
+              <td class="num ${riskCls}">
+                ${risk === null
+                  ? '<span class="mute" title="Neither the launch event nor the on-chain read produced anything to score this token on.">unread</span>'
+                  : `${risk}${(r.facts || {}).risk === 'derived' ? '<span class="approx" title="Scored from the dev hold and liquidity in the launch event; no on-chain read yet.">*</span>' : ''}`}
+                ${r.riskNotes && r.riskNotes.length ? `<span class="scan-risk-note" title="${esc(r.riskNotes.join(' · '))}">ⓘ</span>` : ''}
               </td>
               <td>
                 <span class="badge ${decisionClass[r.decision] || 'sim'}" style="padding:1px 7px;font-size:9.5px">${esc(decisionLabel[r.decision] || r.decision)}</span>
                 ${r.skipReason ? `<div class="scan-reason" title="${esc(r.skipReason)}">${esc(shortReason(r.skipReason))}</div>` : ''}
-                ${r.wallets && r.wallets.length > 1 ? `<div class="scan-wallets">${esc(r.wallets.map((w) => `${w.name}: ${w.action === 'bought' ? 'bought' : (w.reason || w.action)}`).join(' · '))}</div>` : ''}
+                ${r.boughtBy ? `<div class="scan-buyer">🔥 bought by <b>${esc(r.boughtBy)}</b></div>` : ''}
+                ${r.wallets && r.wallets.length ? `<div class="scan-wallets">${esc(r.wallets.map((w) => `${w.name}: ${w.action === 'bought' ? 'bought' : (w.reason || w.action)}`).join(' · '))}</div>` : ''}
               </td>
             </tr>`;
           }).join('')}
@@ -2889,6 +3457,10 @@ function demoSellPosition(w, p, reason) {
 
 /* ══════════════ dry-run paper trading, in the offline preview ══════════════ */
 
+/* The preview cannot fetch a SOL price (no network in the sandboxed frame), so it
+ * converts at a fixed, clearly-labelled rate instead of pretending to quote one. */
+const DEMO_SOL_USD = 200;
+
 const DEMO_TICKER = ['WOJAK2', 'MOONCAT', 'BANANA', 'TURBO', 'CHAD', 'PONZI', 'DOGWIF', 'SNIPE', 'GIGA', 'PEPE3'];
 const DEMO_SKIP_REASONS = [
   'dev_hold_high(34.0%>20%)', 'liquidity_below_min(0.42)', 'freeze_authority_live',
@@ -2922,8 +3494,15 @@ function demoTickLaunches() {
     for (const w of armedWallets) verdicts.push({ name: w.name, action: 'skipped', reason });
     upsertScanRow({
       mint, symbol, name: symbol.toLowerCase(), devWallet: `DEMO-dev-${demoLaunchSeq}-not-real`,
-      devHoldPct: skipped ? 34.0 : 3.4, liquiditySol: skipped ? 0.42 : 12.5,
-      riskScore: skipped ? 25 : 0, riskNotes: skipped ? ['mint_authority_live'] : [],
+      devHoldPct: skipped ? 34.0 : 3.4,
+      liquiditySol: skipped ? 0.42 : 12.5,
+      // Priced in dollars, like the real table. The preview uses a fixed rate and
+      // says so, rather than implying a live quote it cannot fetch offline.
+      liquidityUsd: Math.round((skipped ? 0.42 : 12.5) * DEMO_SOL_USD),
+      solUsd: DEMO_SOL_USD, solUsdSource: 'demo',
+      riskScore: skipped ? 61 : 12,
+      riskNotes: skipped ? ['dev holds 34.0% (limit 15%)', 'liquidity $68 below floor $2,000'] : ['dev holds 3.4%'],
+      facts: { devHold: 'event', liquidity: 'event', risk: 'derived' },
       decision: skipped ? 'skipped' : 'checking', skipReason: skipped ? reason : null,
       detectedAt: now, decidedAt: skipped ? now : null, wallets: verdicts,
     });
@@ -2974,9 +3553,15 @@ function demoTickLaunches() {
 
   upsertScanRow({
     mint, symbol, name: symbol.toLowerCase(), devWallet: `DEMO-dev-${demoLaunchSeq}-not-real`,
-    devHoldPct: 3.4, liquiditySol: 12.5, riskScore: 0, riskNotes: [],
+    devHoldPct: 3.4, liquiditySol: 12.5,
+    liquidityUsd: Math.round(12.5 * DEMO_SOL_USD),
+    solUsd: DEMO_SOL_USD, solUsdSource: 'demo',
+    riskScore: 12, riskNotes: ['dev holds 3.4%'],
+    facts: { devHold: 'event', liquidity: 'event', risk: 'derived' },
     decision: opened ? 'bought' : 'skipped',
     skipReason: opened ? null : 'no wallet had room for another position',
+    // Which wallet took it — the question the per-wallet view is built around.
+    boughtBy: opened ? (verdicts.find((v) => v.action === 'bought') || {}).name || null : null,
     detectedAt: now, decidedAt: now, wallets: verdicts,
   });
   void opened;
@@ -3027,7 +3612,42 @@ async function demoApi(path, opts = {}) {
 
   /* ------------------------------- reads ------------------------------- */
   if (seg[0] === 'status' && method === 'GET') {
-    return { engine: S.status, keystore: S.keystore, global: S.config, presets: S.presets };
+    // `overall` mirrors src/engine/engine.js's overallStats(): the same totals,
+    // computed the same way, so the card in the preview is the card in production.
+    const overall = (S.wallets || []).reduce((a, w) => {
+      const st = w.stats || {};
+      a.bought += st.bought || 0;
+      a.wins += st.wins || 0;
+      a.losses += st.losses || 0;
+      a.realisedPnlSol += st.realisedPnlSol || 0;
+      a.open += (w.openPositions || []).length;
+      return a;
+    }, { bought: 0, wins: 0, losses: 0, realisedPnlSol: 0, open: 0 });
+    const closed = overall.wins + overall.losses;
+    return {
+      engine: {
+        ...S.status,
+        // The preview's own rate and the wallets it is pricing — so the demo's
+        // cards show dollars the same way the real ones do, with the source named.
+        solUsd: DEMO_SOL_USD, solUsdSource: 'demo', solUsdStale: false,
+        overall: {
+          trades: closed, closed, bought: overall.bought, wins: overall.wins, losses: overall.losses,
+          winRatePct: closed ? (overall.wins / closed) * 100 : null,
+          open: overall.open,
+          realisedPnlSol: overall.realisedPnlSol,
+          wallets: (S.wallets || []).map((w) => {
+            const st = w.stats || {};
+            return {
+              id: w.id, name: w.name, wins: st.wins || 0, losses: st.losses || 0,
+              bought: st.bought || 0, persistent: Boolean(w.persistent),
+              trades: (st.wins || 0) + (st.losses || 0), realisedPnlSol: st.realisedPnlSol || 0,
+              open: (w.openPositions || []).length, keyArmed: w.keyArmed !== false,
+            };
+          }),
+        },
+      },
+      keystore: S.keystore, global: S.config, presets: S.presets,
+    };
   }
   if (seg[0] === 'wallets' && seg.length === 1 && method === 'GET') {
     // Mirror the server: a wallet whose key this session does not hold is still
@@ -3182,6 +3802,33 @@ async function demoApi(path, opts = {}) {
       return { ok: true, armed: false, walletId: w.id };
     }
 
+    /* The preview mirrors the repo's `persistent-bot/start`: the key goes to the
+     * bot, encrypted there, so it can trade with the tab closed. Nothing leaves the
+     * page here, and the wording says so — a preview must never imply that a real
+     * key left the browser. */
+    if (action === 'persist' && method === 'POST') {
+      if (!body.secretKey) throw new Error('secret_key_required');
+      const needsKeystore = !S.keystore || !S.keystore.unlocked;
+      if (needsKeystore && String(body.keystorePassphrase || '').length < 8) {
+        throw new Error('keystore_passphrase_required');
+      }
+      if (needsKeystore) S.keystore = { initialised: true, unlocked: true };
+      w.persistent = true;
+      w.keyHolder = 'server';
+      w.keyArmed = true;
+      demoPushLog(`🖥 ${w.name} sent to the bot — preview only, nothing left this page`, 'info', w.name);
+      return { ok: true, persistent: true, keyHolder: 'server', walletId: w.id, publicKey: w.publicKey, wallet: w };
+    }
+
+    if (action === 'unpersist' && method === 'POST') {
+      w.persistent = false;
+      w.keyHolder = 'browser';
+      w.keyArmed = false;
+      w.enabled = false; w.armed = false;
+      demoPushLog(`🖥 ${w.name} removed from the bot — key deleted from the (preview) server`, 'warn', w.name);
+      return { ok: true, persistent: false, keyHolder: 'browser', walletId: w.id };
+    }
+
     if (action === 'start' || action === 'resume') {
       w.enabled = true; w.armed = true;
       w.stats.paused = false; w.stats.pauseReason = null;
@@ -3208,6 +3855,27 @@ async function demoApi(path, opts = {}) {
       return { ok: true, attempted: open.length, sold: open.length, failed: 0, stopped: true, wallet: w };
     }
 
+    if (action === 'withdraw' && seg[3] === 'intent' && method === 'POST') {
+      // Preview mirror of the two-step, browser-signed withdrawal. It cannot sign
+      // anything offline, but the SHAPE must match the server's or the button would
+      // behave differently in the preview than in the real app.
+      return {
+        ok: true,
+        intentId: `demo_wi_${Date.now()}`,
+        wallet: w.id,
+        from: w.publicKey || 'DEMO',
+        to: body.destination,
+        amountSol: Number(body.amountSol || 0.5),
+        txBase64: '',
+        note: 'preview — nothing is signed or sent',
+      };
+    }
+    if (action === 'withdraw' && seg[3] === 'submit' && method === 'POST') {
+      const amount = Number(w.balanceSol || 0) > 0 ? Math.min(Number(w.balanceSol), 0.5) : 0;
+      w.balanceSol = Math.max(0, Number(((w.balanceSol || 0) - amount).toFixed(6)));
+      demoPushLog(`Withdrew ${amount} SOL from ${w.name} — signed in the browser (preview)`, 'warn', w.name);
+      return { ok: true, signature: `DEMOS${Date.now().toString(36).toUpperCase()}`, amountSol: amount, destination: 'preview destination', signedBy: 'browser' };
+    }
     if (action === 'withdraw' && seg[3] === 'quote') {
       const mode = q.get('mode') || 'all';
       const bal = Number(w.balanceSol || 0);
@@ -3540,6 +4208,11 @@ document.addEventListener('click', async (e) => {
   if (t.dataset.fund) openFund(t.dataset.fund);
   if (t.dataset.withdraw) openWithdraw(t.dataset.withdraw);
   if (detail) openWalletDetail(detail);
+  if (t.dataset.persist) persistWallet(t.dataset.persist);
+  if (t.dataset.unpersist) unpersistWallet(t.dataset.unpersist);
+  if (t.dataset.register) registerBrowserWallet(t.dataset.register);
+  if (t.dataset.forget) forgetBrowserWallet(t.dataset.forget);
+  if (t.dataset.feed) openWalletFeed(t.dataset.feed);
   if (edit) openWallet(edit);
 
   if (t.dataset.delrecord) {
