@@ -295,7 +295,12 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     const g = getFull();
     const w = g.wallets.find((x) => x.id === req.params.id);
     if (!w) return res.status(404).json({ error: 'wallet_not_found' });
-    if (!keystore.isUnlocked()) return res.status(400).json({ error: 'keystore_locked' });
+    if (!keystore.has(w.id)) {
+      return res.status(400).json({
+        error: 'wallet_not_armed',
+        hint: `${w.name} is locked. Unlock it with its passphrase to withdraw from it.`,
+      });
+    }
 
     const trader = engine.traders.get(w.id);
     const mode = req.query.mode === 'all' ? 'all' : 'custom';
@@ -360,7 +365,12 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     const g = getFull();
     const w = g.wallets.find((x) => x.id === req.params.id);
     if (!w) return res.status(404).json({ error: 'wallet_not_found' });
-    if (!keystore.isUnlocked()) return res.status(400).json({ error: 'keystore_locked' });
+    if (!keystore.has(w.id)) {
+      return res.status(400).json({
+        error: 'wallet_not_armed',
+        hint: `${w.name} is locked. Unlock it with its passphrase to withdraw from it.`,
+      });
+    }
     if (req.body.confirm !== 'WITHDRAW') {
       return res.status(400).json({ error: 'confirmation_required', hint: "Send { confirm: 'WITHDRAW' } to proceed." });
     }
@@ -492,7 +502,13 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
   });
 
   app.get('/api/wallets', (req, res) => {
-    const live = [...engine.traders.values()].map((t) => t.toJSON());
+    const live = [...engine.traders.values()].map((t) => ({
+      ...t.toJSON(),
+      // Armed = this process holds the key for the session. Distinct from
+      // `armed`, which the engine uses for "enabled and not paused".
+      keyArmed: keystore.armed(t.cfg.id),
+      keyHolder: 'session',
+    }));
     // A wallet whose key is not loaded is still a wallet the user created. Show
     // it, flagged, instead of an empty list — the name and the on-chain address
     // are in config.json and were never secret.
@@ -508,6 +524,71 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     const wallet = req.body.preset ? applyPreset(base, req.body.preset) : normaliseWallet(base);
     wallet.id = id;
 
+    /* ── The normal path: the key was generated IN THE BROWSER ──────────────
+     * The dashboard generates the keypair, seals it in localStorage under its own
+     * passphrase, and tells this server the name and the ADDRESS — nothing else.
+     * The private key is never transmitted here to create a wallet, which is why
+     * a wallet survives this server being redeployed, restarted or wiped.
+     *
+     * Idempotent on the address: re-registering a wallet the server has forgotten
+     * (a fresh container with an empty disk) must give it back its card, not
+     * create a duplicate.
+     */
+    if (req.body.address) {
+      const address = String(req.body.address).trim();
+      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
+        return res.status(400).json({ error: 'bad_address', hint: 'That is not a Solana address.' });
+      }
+      const existing = g.wallets.find((w) => w.publicKey === address);
+      if (existing) {
+        return res.json({ ok: true, existing: true, wallet: existing.id, publicKey: address });
+      }
+      wallet.publicKey = address;
+      wallet.imported = Boolean(req.body.imported);
+      wallet.keyHolder = 'browser'; // sealed in the browser, not in a file here
+      delete wallet.config;
+      g.wallets.push(wallet);
+      saveConfig();
+      // Deliberately NOT engine.addWallet(): a trader needs a keypair, and this
+      // wallet has none here yet. It shows up through engine.lockedWallets() as a
+      // locked card until it is armed — which is the truth, and what the card says.
+      bus.safeEmit('wallet:updated', wallet.id);
+      log.info(`Wallet registered: ${wallet.name} (${address}) — key is sealed in the browser; STOPPED until you arm it.`, { wallet: wallet.name });
+      return res.status(201).json({ ok: true, wallet: wallet.id, publicKey: wallet.publicKey, keyHolder: 'browser' });
+    }
+
+    /* ── Legacy path: generated or imported INTO the server keystore ───────── */
+    /* ── The normal path: the key was generated IN THE BROWSER ──────────────
+     * The dashboard generates the keypair, seals it in localStorage under its own
+     * passphrase, and tells this server the name and the ADDRESS — nothing else.
+     * The private key is never transmitted here to create a wallet, which is why
+     * a wallet survives this server being redeployed, restarted or wiped.
+     *
+     * Idempotent on the address: re-registering a wallet the server has forgotten
+     * (a fresh container with an empty disk) must give it back its card, not
+     * create a duplicate.
+     */
+    if (req.body.address) {
+      const address = String(req.body.address).trim();
+      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
+        return res.status(400).json({ error: 'bad_address', hint: 'That is not a Solana address.' });
+      }
+      const existing = g.wallets.find((w) => w.publicKey === address);
+      if (existing) {
+        return res.json({ ok: true, existing: true, wallet: existing.id, publicKey: address });
+      }
+      wallet.publicKey = address;
+      wallet.imported = Boolean(req.body.imported);
+      wallet.keyHolder = 'browser'; // sealed in the browser, not in a file here
+      delete wallet.config;
+      g.wallets.push(wallet);
+      saveConfig();
+      engine.addWallet(wallet);
+      log.info(`Wallet registered: ${wallet.name} (${address}) — key is sealed in the browser; STOPPED until you arm it.`, { wallet: wallet.name });
+      return res.status(201).json({ ok: true, wallet: wallet.id, publicKey: wallet.publicKey, keyHolder: 'browser' });
+    }
+
+    /* ── Legacy path: generated or imported INTO the server keystore ───────── */
     if (!keystore.isUnlocked()) return res.status(400).json({ error: 'keystore_locked', hint: 'Unlock the keystore before adding wallets.' });
 
     try {
@@ -571,6 +652,7 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     g.wallets = g.wallets.filter((w) => w.id !== req.params.id);
     saveConfig();
     engine.removeWallet(req.params.id);
+    keystore.lockOne(req.params.id); // forget the session key, if any
     try { keystore.remove(req.params.id); } catch { /* locked; config already dropped */ }
     res.json({ ok: true });
   });
@@ -637,9 +719,138 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
    * loss. It also starts the shared engine if it is not running, because
    * "start this wallet" is the only thing the user asked for.
    */
+  /**
+   * Arm one wallet: take its decrypted key for this session so the bot can sign.
+   *
+   * The browser unsealed it locally; this is the only moment the key crosses the
+   * wire, it is checked against the wallet's own address, and it is held in
+   * memory only (see the session keyring in wallets/keystore.js). Arming loads a
+   * KEY — it does not start trading. ▶ Start still governs entries.
+   */
+  app.post('/api/wallets/:id/arm', requireToken, async (req, res) => {
+    const g = getFull();
+    const stored = g.wallets.find((w) => w.id === req.params.id);
+    if (!stored) return res.status(404).json({ error: 'wallet_not_found' });
+    if (!req.body.secretKey) return res.status(400).json({ error: 'secret_key_required' });
+
+    let address;
+    try {
+      address = keystore.arm(stored.id, stored.publicKey, req.body.secretKey);
+    } catch (err) {
+      // Anything the keyring refuses is the user's to fix, in their words.
+      return res.status(400).json({ error: 'cannot_arm', hint: err.message });
+    }
+    if (!stored.publicKey) stored.publicKey = address;
+    if (!stored.keyHolder) stored.keyHolder = 'browser';
+
+    // The key is available now, so this wallet can have a trader again without a
+    // restart — including re-adopting any position it was holding.
+    engine.hydrate();
+    try { await engine.resume(); } catch { /* non-fatal: a wallet with no history */ }
+    try { engine.refreshBalances ? engine.refreshBalances() : null; } catch { /* best effort */ }
+    saveConfig();
+
+    const t = engine.traders.get(stored.id);
+    if (t) bus.safeEmit('wallet:stats', t.toJSON());
+    bus.safeEmit('wallet:updated', stored.id);
+    log.info(`🔓 ${stored.name} armed for this session — key kept in memory only, never written to disk.`, { wallet: stored.name });
+    res.json({
+      ok: true, armed: true, keyArmed: true, walletId: stored.id, publicKey: address,
+      note: 'Key loaded for this session. It is held in memory only and is gone when the bot restarts — the sealed copy in your browser is untouched.',
+      wallet: t ? t.toJSON() : null,
+    });
+  });
+
+  /** Lock one wallet: forget its key now. The browser's sealed copy is untouched. */
+  app.post('/api/wallets/:id/lock', requireToken, (req, res) => {
+    const g = getFull();
+    const stored = g.wallets.find((w) => w.id === req.params.id);
+    if (!stored) return res.status(404).json({ error: 'wallet_not_found' });
+
+    keystore.lockOne(stored.id);
+    engine.removeWallet(stored.id); // no trader without a key
+    stored.enabled = false;
+    if (stored.stats) stored.stats.paused = false;
+    saveConfig();
+    bus.safeEmit('wallet:updated', stored.id);
+    log.warn(`🔒 ${stored.name} locked — its key is out of this process's memory.`, { wallet: stored.name });
+    res.json({ ok: true, armed: false, keyArmed: false, walletId: stored.id, note: 'Locked. The sealed copy in your browser is untouched — unlock it again with its passphrase.' });
+  });
+
+  /**
+   * Arm one wallet: take its decrypted key for this session so the bot can sign.
+   *
+   * The browser unsealed it locally; this is the only moment the key crosses the
+   * wire, it is checked against the wallet's own address, and it is held in
+   * memory only (see the session keyring in wallets/keystore.js). Arming loads a
+   * KEY — it does not start trading. ▶ Start still governs entries.
+   */
+  app.post('/api/wallets/:id/arm', requireToken, async (req, res) => {
+    const g = getFull();
+    const stored = g.wallets.find((w) => w.id === req.params.id);
+    if (!stored) return res.status(404).json({ error: 'wallet_not_found' });
+    if (!req.body.secretKey) return res.status(400).json({ error: 'secret_key_required' });
+
+    let address;
+    try {
+      address = keystore.arm(stored.id, stored.publicKey, req.body.secretKey);
+    } catch (err) {
+      // Anything the keyring refuses is the user's to fix, in their words.
+      return res.status(400).json({ error: 'cannot_arm', hint: err.message });
+    }
+    if (!stored.publicKey) stored.publicKey = address;
+    if (!stored.keyHolder) stored.keyHolder = 'browser';
+
+    // The key is available now, so this wallet can have a trader again without a
+    // restart — including re-adopting any position it was holding.
+    engine.hydrate();
+    try { await engine.resume(); } catch { /* non-fatal: a wallet with no history */ }
+    try { engine.refreshBalances ? engine.refreshBalances() : null; } catch { /* best effort */ }
+    saveConfig();
+
+    const t = engine.traders.get(stored.id);
+    if (t) bus.safeEmit('wallet:stats', t.toJSON());
+    bus.safeEmit('wallet:updated', stored.id);
+    log.info(`🔓 ${stored.name} armed for this session — key kept in memory only, never written to disk.`, { wallet: stored.name });
+    res.json({
+      ok: true, armed: true, keyArmed: true, walletId: stored.id, publicKey: address,
+      note: 'Key loaded for this session. It is held in memory only and is gone when the bot restarts — the sealed copy in your browser is untouched.',
+      wallet: t ? t.toJSON() : null,
+    });
+  });
+
+  /** Lock one wallet: forget its key now. The browser's sealed copy is untouched. */
+  app.post('/api/wallets/:id/lock', requireToken, (req, res) => {
+    const g = getFull();
+    const stored = g.wallets.find((w) => w.id === req.params.id);
+    if (!stored) return res.status(404).json({ error: 'wallet_not_found' });
+
+    keystore.lockOne(stored.id);
+    engine.removeWallet(stored.id); // no trader without a key
+    stored.enabled = false;
+    if (stored.stats) stored.stats.paused = false;
+    saveConfig();
+    bus.safeEmit('wallet:updated', stored.id);
+    log.warn(`🔒 ${stored.name} locked — its key is out of this process's memory.`, { wallet: stored.name });
+    res.json({ ok: true, armed: false, keyArmed: false, walletId: stored.id, note: 'Locked. The sealed copy in your browser is untouched — unlock it again with its passphrase.' });
+  });
+
   app.post('/api/wallets/:id/start', requireToken, async (req, res) => {
     const t = engine.traders.get(req.params.id);
-    if (!t) return res.status(404).json({ error: 'wallet_not_found' });
+    if (!t) {
+      /* A wallet with no key loaded is not missing — it is not armed yet. Say
+       * which one it is instead of a bare 404, so the dashboard can offer the
+       * unlock button rather than making the user guess. */
+      const g0 = getFull();
+      const known = g0.wallets.find((w) => w.id === req.params.id);
+      if (known) {
+        return res.status(400).json({
+          error: 'wallet_not_armed',
+          hint: `${known.name} is locked. Unlock it with its passphrase to trade it.`,
+        });
+      }
+      return res.status(404).json({ error: 'wallet_not_found' });
+    }
 
     if (!engine.running) engine.start();
 

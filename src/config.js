@@ -139,6 +139,12 @@ function defaultGlobalConfig() {
        * price feed — and a dead price feed means open positions stop exiting.
        * Override with SCANNER_CONCURRENCY. */
       evaluateConcurrency: Number(process.env.SCANNER_CONCURRENCY || 2),
+      /* How many launches may be fact-read at once for the scanner TABLE
+       * (liquidity, dev hold, honeypot risk). Separate from the entry queue
+       * above: those numbers must appear for every launch even when no wallet is
+       * armed, and they share the per-mint cache so an armed wallet's own
+       * evaluation does not pay for them twice. */
+      reconConcurrency: Number(process.env.SCANNER_RECON_CONCURRENCY || 2),
     },
     execution: {
       priorityFeeMicroLamports: 200000,
