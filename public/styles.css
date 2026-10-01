@@ -219,6 +219,21 @@ body {
 .stat-sub { font-size: 11px; color: var(--text-mute); margin-top: 3px; font-family: var(--mono); }
 
 /* ----------------------------- wallet cards ----------------------------- */
+/* The unlock row on a locked wallet card.
+ *
+ * This is the control that was missing: the card said "locked" and offered
+ * nothing, so a wallet that needed one passphrase to come back looked like a
+ * dead end. Inline on the card, like the reference implementation, because that
+ * is where the user is looking when they wonder why it is not trading. */
+.arm-row { display: flex; gap: 8px; align-items: center; margin: 10px 0 4px; }
+.arm-row input {
+  flex: 1; min-width: 0;
+  background: #0b1120; border: 1px solid #26324a; border-radius: 9px;
+  color: #e6edf7; font-size: 13px; padding: 8px 10px;
+}
+.arm-row input:focus { outline: none; border-color: var(--accent); }
+.arm-row .btn { flex-shrink: 0; }
+
 .wallets { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
 
 .wallet {

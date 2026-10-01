@@ -302,6 +302,14 @@ async function boot() {
     S.presets = st.presets;
     S.keystore = st.keystore;
     await refreshAll();
+    /* Wallets this browser holds but the server does not know about.
+     *
+     * A hosted deploy hands back an empty disk, so the server can forget every
+     * wallet between one visit and the next. The browser cannot: the sealed keys
+     * are in ITS storage. Re-registering them here is what turns "the app looks
+     * like I never created any wallet" back into its cards — with their names and
+     * addresses — ready to be unlocked one passphrase at a time. */
+    if (await syncBrowserWallets()) await refreshAll();
     /* The launch-scanner list, once, on load.
      *
      * The WebSocket snapshot carries it too, but a page that opens while the
@@ -435,6 +443,99 @@ function mergeWallets(list) {
   if (!Array.isArray(list)) return;
   S.wallets = list;
   S.positions = list.flatMap((w) => w.openPositions || []);
+}
+
+/**
+ * The wallet store in this browser: where the trading wallets actually live.
+ *
+ * Its keys are generated here and sealed here under each wallet's own passphrase
+ * (see public/wallets.js), which is what makes a wallet survive the SERVER being
+ * redeployed, restarted or wiped. The server holds a wallet's name, address and
+ * strategy; the key it needs to sign with is handed over for one session only.
+ */
+function walletStore() {
+  return (typeof WalletStore !== 'undefined' && WalletStore) ? WalletStore : null;
+}
+
+/** Is this wallet's key sealed in THIS browser? */
+function keyHere(address) {
+  const s = walletStore();
+  if (!s || !address) return false;
+  try { return Boolean(s.record(address)); } catch { return false; }
+}
+
+/**
+ * Re-register wallets this browser holds that the server has never heard of.
+ *
+ * This is the fix for the reported bug — "the wallet just abruptly deleted itself
+ * and the app appeared like I never created any wallet". The wallets were only
+ * ever on the server's disk, which a hosted deploy throws away. Now the browser
+ * is the source of truth: whatever it holds is re-registered here, with its name
+ * and address, so a card comes back even on a brand-new container. The key stays
+ * sealed; it is only read when the user unlocks that wallet.
+ */
+async function syncBrowserWallets() {
+  const s = walletStore();
+  if (!s || !s.supported()) return 0;
+  let stored = [];
+  try { stored = s.list(); } catch { stored = []; }
+  if (!stored.length) return 0;
+
+  const known = new Set((S.wallets || []).map((w) => w.publicKey).filter(Boolean));
+  let added = 0;
+  for (const rec of stored) {
+    if (!rec.address || known.has(rec.address)) continue;
+    try {
+      await api('/api/wallets', {
+        method: 'POST',
+        body: JSON.stringify({ name: rec.label || 'Wallet', address: rec.address, imported: false }),
+      });
+      added += 1;
+    } catch { /* the server will be re-tried on the next load */ }
+  }
+  if (added) {
+    toast(`♻ Restored ${added} wallet${added === 1 ? '' : 's'} from this browser — the server had lost them`, 'warn');
+  }
+  return added;
+}
+
+/** Lock one wallet: the server forgets the key; the sealed copy here is untouched. */
+async function lockWallet(id) {
+  const w = (S.wallets || []).find((x) => x.id === id);
+  try {
+    await api(`/api/wallets/${id}/lock`, { method: 'POST', body: '{}' });
+    await refreshAll(); renderAll();
+    toast(`🔒 ${w ? w.name : 'Wallet'} locked — its key is out of the bot's memory`, 'warn');
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+/**
+ * Unlock one wallet: unseal its key HERE, with its own passphrase, and hand it to
+ * the bot for this session. The passphrase is never sent anywhere — only the
+ * decrypted key, over the session-token-authenticated channel, and the server
+ * keeps it in memory.
+ */
+async function unlockWallet(id, passphrase) {
+  const s = walletStore();
+  const w = (S.wallets || []).find((x) => x.id === id);
+  if (!w) { toast('That wallet is not loaded', 'err'); return; }
+  if (!s) { toast('The wallet store did not load — reload the page', 'err'); return; }
+  if (!keyHere(w.publicKey)) {
+    toast('That wallet\'s key is not in this browser — import it to arm it', 'warn');
+    return;
+  }
+  try {
+    const secret = await s.unlock(w.publicKey, passphrase);
+    await api(`/api/wallets/${id}/arm`, {
+      method: 'POST',
+      body: JSON.stringify({ secretKey: s.secretToBase58(secret) }),
+    });
+    await refreshAll(); renderAll();
+    toast(`🔓 ${w.name} unlocked — the bot can trade it this session`, '');
+  } catch (err) {
+    toast(err.message, 'err');
+    throw err;
+  }
 }
 
 function mergeWallet(w) {
@@ -987,7 +1088,11 @@ let fundingWalletId = null;
 function openFund(walletId) {
   const w = S.wallets.find((x) => x.id === walletId);
   if (!w) return;
+  // The reconnect handler refreshes the dialog by reading S.fundingWalletId, so
+  // this has to be set here as well — it was a module-level copy that nothing
+  // ever read, and the "funded from" block silently stopped updating.
   fundingWalletId = w.id;
+  S.fundingWalletId = w.id;
 
   const real = isRealAddress(w.publicKey);
   const demo = Boolean(S.demo); // no extension and no chain in the preview
@@ -1315,8 +1420,10 @@ function renderNotices() {
   // after. Render's free plan does exactly this when the service sleeps.
   const st = S.status && S.status.storage;
   if (st && st.ephemeral) {
-    out.push(`<div class="notice danger"><span class="ico">⚠</span><div>
-      <b>This host deletes your wallets when it sleeps.</b> ${esc(st.reason)}
+    out.push(`<div class="notice warn"><span class="ico">⚠</span><div>
+      <b>This host rebuilds its disk when it sleeps.</b> Your <b>wallets are safe</b> — their keys are
+      sealed in this browser. What it forgets is each wallet's strategy and position history, and every
+      wallet has to be unlocked again after it wakes.
       <div class="row-flex" style="margin-top:10px;gap:8px;flex-wrap:wrap">
         <button class="btn btn-sm" data-backup="1">⬇ Download a backup now</button>
         <button class="btn btn-sm" data-restore="1">⬆ Restore from a backup</button>
@@ -1333,12 +1440,12 @@ function renderNotices() {
     </div></div>`);
   }
 
-  const lockedNow = (S.wallets || []).filter((w) => w.keyLocked && !w.keyMissing);
+  const lockedNow = (S.wallets || []).filter((w) => w.keyLocked);
   if (lockedNow.length) {
+    const here = lockedNow.filter((w) => keyHere(w.publicKey)).length;
     out.push(`<div class="notice warn"><span class="ico">🔒</span><div>
       <b>${lockedNow.length} wallet${lockedNow.length === 1 ? ' is' : 's are'} locked.</b>
-      The keystore locks on every restart. Open it to trade them again.
-      <br/><br/><button class="btn btn-sm btn-primary" data-keystore="1">🔐 Open keystore</button>
+      ${here ? 'Open one from its card below — its passphrase is the only thing it needs.' : 'Import their keys to trade them again.'}
     </div></div>`);
   }
 
@@ -1399,28 +1506,15 @@ function renderWallets() {
   $('walletCount').textContent = ws.length;
 
   if (!ws.length) {
-    const ks = keystoreState();
-    // Three empty states, three different truths, and each one gets the button
-    // that actually helps. Do not collapse these into one boolean: the previous
-    // version asked "locked?" only, which is false on a first run, so the
-    // first-run copy sat in a branch that could never render.
-    const empty = !ks.exists
-      ? {
-          icon: '◈',
-          title: 'No wallets yet',
-          sub: `Nothing here yet — no wallets, and no passphrase set. A wallet is a keypair the bot trades with; its key goes in one encrypted file on this machine, the keystore, and you choose the passphrase for it here.`,
-        }
-      : ks.locked
-        ? {
-            icon: '🔒',
-            title: 'No wallet is missing',
-            sub: `The keystore locks on every restart. Your wallets' keys are kept in it, so creating one asks for your passphrase once.`,
-          }
-        : {
-            icon: '◈',
-            title: 'No wallets yet',
-            sub: `Add a wallet to give it its own strategy, limits and exit rules. Each wallet trades with its own config.`,
-          };
+    // One empty state now, because there is one truth: a wallet is created in
+    // this browser. (The old version branched on the server keystore's state —
+    // a file that no longer holds the wallets, so its branches had stopped
+    // meaning anything.)
+    const empty = {
+      icon: '◈',
+      title: 'No wallets yet',
+      sub: `A wallet is a keypair this bot trades with. It is created in this browser and sealed here under its own passphrase — so it cannot be lost when the server restarts.`,
+    };
     $('wallets').innerHTML = `<div class="empty" style="grid-column:1/-1">
         <div class="empty-icon">${empty.icon}</div>
         <div class="empty-title">${empty.title}</div>
@@ -1437,19 +1531,34 @@ function renderWallets() {
   }
 
   $('wallets').innerHTML = ws.map((w) => {
-    // A wallet whose key is not loaded. Two different situations, and the
-    // difference matters: if the keystore is closed, the key is inside it and
-    // opening the keystore brings the wallet back; if the keystore is OPEN and
-    // the key is still absent, it is gone (archived by a reset) and no amount of
-    // unlocking will restore it.
+    // A wallet the bot cannot sign for yet. Its key is not in this process.
+    //
+    // Two situations, worded differently because the fix is different:
+    //   · the key is SEALED IN THIS BROWSER (the normal case) — type that wallet's
+    //     passphrase and it is armed for this session;
+    //   · the key is nowhere on this device — it must be imported, and saying
+    //     "unlock" would be a lie.
+    // This card is where that used to be a dead end: it told you the wallet was
+    // locked and offered no way to unlock it.
     if (w.keyLocked) {
-      const missing = Boolean(w.keyMissing);
+      const here = keyHere(w.publicKey);
+      /* THREE ways to be without a key, and they are not the same situation.
+       *   · sealed in THIS browser      → type that wallet's passphrase;
+       *   · in the SERVER's keystore    → open the keystore and it loads;
+       *   · nowhere this app can see    → it has to be imported.
+       * The middle one is every wallet made before the browser keystore existed,
+       * and it is where this card used to lie: it said "no key here, import it"
+       * about a key sitting one 🔐 away — and for a wallet holding funds, that is
+       * advice to type a private key that the user may not have. */
+      // …but only if a keystore file actually exists; without one, "open the
+      // keystore" would be the same dead end this card exists to remove.
+      const inKeystore = !here && w.keyMissing === false && !(S.keystore && S.keystore.initialised === false);
       return `<div class="wallet locked">
         <div class="wallet-top">
           <div style="flex:1;min-width:0">
             <div class="wallet-name">
               ${esc(w.name)}
-              <span class="locked-badge" title="${missing ? 'This key is not in your keystore. The bot cannot trade or withdraw this wallet.' : "This wallet's private key is inside your keystore file, which is closed."}">${missing ? '⚠ key not in keystore' : '🔒 key locked'}</span>
+              <span class="locked-badge" title="${here ? 'The key is sealed in this browser. Type its passphrase to arm it for this session.' : inKeystore ? 'The key is encrypted in the keystore file on the server. Opening the keystore arms it.' : 'No key for this wallet is stored in this browser.'}">${here ? '🔒 locked' : inKeystore ? '🔐 keystore' : '⚠ no key here'}</span>
             </div>
             <div class="wallet-addr mono" title="${esc(w.publicKey || '')}">${esc((w.publicKey || '').slice(0, 14))}…${esc((w.publicKey || '').slice(-6))}</div>
           </div>
@@ -1457,19 +1566,30 @@ function renderWallets() {
         </div>
 
         <div class="wallet-locked-note">
-          ${missing
-            ? `<b>This key is not in the keystore</b> — a keystore reset archived it. The bot cannot trade or
-               withdraw this wallet. <b>Anything at the address above stays on chain.</b>`
-            : `<b>This wallet is not lost.</b> Its key is in the keystore, which locks on every restart.
-               Open it once this session and this wallet trades again.`}
+          ${here
+            ? `Its key is sealed in this browser under its own passphrase. Unlock it to trade or withdraw.`
+            : inKeystore
+              ? `Its key is in your server keystore. Open the keystore to arm this wallet — if the keystore cannot open it, import the key instead.`
+              : `No key for this wallet is stored here. Import it to trade this wallet again — <b>anything at the address above stays on chain.</b>`}
         </div>
 
+        ${here ? `
+          <div class="arm-row">
+            <input type="password" id="armpass-${esc(w.id)}" placeholder="Passphrase for ${esc(w.name)}" autocomplete="current-password"/>
+            <button class="btn btn-primary btn-sm" data-arm="${esc(w.id)}" title="Unseal this wallet's key in the browser and load it into the bot for this session">🔓 Unlock</button>
+          </div>` : ''}
+
         <div class="wallet-actions">
-          <span class="badge sim" style="align-self:center">${missing ? 'no key' : '🔒 closed'}</span>
+          <span class="badge sim" style="align-self:center">${here ? '🔒 locked' : inKeystore ? '🔐 keystore' : 'no key'}</span>
           <div style="flex:1"></div>
-          ${missing
-            ? `<button class="btn btn-sm btn-danger" data-delrecord="${esc(w.id)}" title="Remove this wallet record. Its funds stay on chain.">🗑 Delete record</button>`
-            : `<button class="btn btn-sm btn-primary" data-keystore="1" title="Open the encrypted file that holds this wallet's key">🔐 Open keystore</button>`}
+          ${here
+            ? `<button class="btn btn-sm" data-edit="${esc(w.id)}" title="Strategy, limits, exits and filters for this wallet">⚙ Config</button>
+               <button class="btn btn-sm btn-danger" data-delrecord="${esc(w.id)}" title="Remove this wallet from the bot and this browser. Its funds stay on chain.">🗑 Delete</button>`
+            : inKeystore
+              ? `<button class="btn btn-sm btn-primary" data-keystore="1" title="Open your keystore — the key for this wallet is encrypted in it">🔐 Open keystore</button>
+                 <button class="btn btn-sm btn-danger" data-delrecord="${esc(w.id)}" title="Remove this wallet record. Its funds stay on chain.">🗑 Delete record</button>`
+              : `<button class="btn btn-sm btn-primary" data-importhere="${esc(w.id)}" title="Paste this wallet's private key and seal it in this browser">📥 Import its key</button>
+                 <button class="btn btn-sm btn-danger" data-delrecord="${esc(w.id)}" title="Remove this wallet record. Its funds stay on chain.">🗑 Delete record</button>`}
         </div>
       </div>`;
     }
@@ -1553,6 +1673,7 @@ function renderWallets() {
         <button class="btn btn-sm" data-edit="${esc(w.id)}" title="Strategy, limits, exits and filters for this wallet">⚙ Config</button>
         <button class="btn btn-sm" data-withdraw="${esc(w.id)}" title="Move SOL out of this wallet">Withdraw</button>
         <button class="btn btn-sm btn-danger" data-close="${esc(w.id)}" title="Sell everything in this wallet and stop it trading">⛔ Kill all</button>
+            ${w.keyArmed === false ? '' : `<button class="btn btn-sm" data-lock="${esc(w.id)}" title="Forget this wallet's key for now. The sealed copy in your browser is untouched.">🔒 Lock</button>`}
       </div>
     </div>`;
   }).join('');
@@ -1983,9 +2104,6 @@ function openWallet(walletId, opts = {}) {
   // Quoting the real number is what turns "unlock god knows what" into
   // "oh — these three".
   const lockedCount = (S.wallets || []).filter((w) => w.keyLocked).length;
-  // Ask the shared accessor. Never re-derive this here: the save handler lives in
-  // a different function and cannot see locals declared in this one.
-  const ks = keystoreState();
   const existing = (S.wallets || []).find((w) => w.id === walletId);
   // Merge over the defaults rather than trusting the stored config to be
   // complete. renderEditorPanes reads cfg.buy / cfg.exits / cfg.limits /
@@ -2015,30 +2133,23 @@ function openWallet(walletId, opts = {}) {
             <div>
               <div class="burner-title">This creates a burner wallet</div>
               <div class="burner-sub">
-                A throwaway hot wallet this bot holds the key for. You never put your real wallet's key
-                in here: you <b>fund this burner from your own wallet</b> and withdraw back to it.
+                A throwaway hot wallet. You never put your real wallet's key in here: you
+                <b>fund this burner from your own wallet</b> and withdraw back to it.
               </div>
             </div>
           </div>
 
-          <div class="section-label">Passphrase for your wallet keys</div>
-          ${!ks.open ? `
-            <div class="field">
-              <label>${ks.exists ? 'The passphrase you chose when you created your first wallet' : 'Choose a passphrase'}</label>
-              <input type="password" id="edPass" placeholder="${ks.exists ? 'Your keystore passphrase' : 'At least 8 characters'}" autocomplete="current-password"/>
-              <div class="hint">
-                ${ks.exists
-                  ? `One passphrase, one <b>keystore</b> file, for every wallet — not a password for this new wallet. The keystore locks on every restart, so your passphrase opens it again.`
-                  : `Your wallets' keys go in one encrypted file on this machine, the <b>keystore</b>, protected by this passphrase. The same one for every wallet you ever create.`}
-                <br/><b>There is no recovery</b> — keep it in a password manager.
-              </div>
-              <div id="edPassErr" class="pass-err"></div>
-              ${ks.exists ? `<button class="btn btn-sm" type="button" id="edPassForgot">Forgot your passphrase?</button>` : ''}
-            </div>` : `
-            <div class="notice info" style="margin-bottom:4px"><span class="ico">🔓</span><div>
-              <b>Your wallet keys are already readable this session.</b> Nothing to type here — the
-              passphrase is asked for once per session, after a restart.
-            </div></div>`}
+          <div class="section-label">Passphrase for this wallet</div>
+          <div class="field">
+            <label>Choose a passphrase for <b>this wallet</b></label>
+            <input type="password" id="edPass" placeholder="At least 8 characters" autocomplete="new-password"/>
+            <div class="hint">
+              The key is created <b>in this browser</b> and sealed here with this passphrase — not a
+              password for an account, and not sent anywhere. Each wallet has its own.
+              <br/><b>There is no recovery</b> — keep it in a password manager.
+            </div>
+            <div id="edPassErr" class="pass-err"></div>
+          </div>
 
           <div class="section-label">The wallet</div>
           <div class="field">
@@ -2062,6 +2173,7 @@ function openWallet(walletId, opts = {}) {
             </div>
             <label class="fl-label">Private key — base58 or Phantom JSON array</label>
             <textarea id="edKey" rows="2" placeholder="Leave empty to generate a fresh burner"></textarea>
+            <div class="hint" style="margin-top:6px">The key is sealed in this browser with the passphrase above.</div>
           </details>
         ` : ''}
 
@@ -2084,10 +2196,6 @@ function openWallet(walletId, opts = {}) {
     </div>`, (root) => {
     const fundBtn = root.querySelector('#edFund');
     if (fundBtn) fundBtn.onclick = () => openFund(S.editing.id);
-    // The way out of a forgotten passphrase lives next to the field that asks for
-    // it, not hidden in a menu.
-    const forgotBtn = root.querySelector('#edPassForgot');
-    if (forgotBtn) forgotBtn.onclick = openKeystoreForgot;
     root.querySelectorAll('.tab').forEach((b) => b.onclick = () => {
       root.querySelectorAll('.tab').forEach((x) => x.classList.remove('active'));
       root.querySelectorAll('.tabpane').forEach((x) => x.classList.remove('active'));
@@ -2102,11 +2210,17 @@ function openWallet(walletId, opts = {}) {
     if (del) del.onclick = async () => {
       if (!confirm(
         `Delete "${existing.name}"?\n\n` +
-        'Its key is removed from the keystore, so the bot can no longer trade or recover it. ' +
-        'Any SOL or tokens still in it stay on chain — withdraw them first if you want them.\n\n' +
+        'Its sealed key is deleted from this browser and the bot forgets it, so nobody can trade or ' +
+        'recover this wallet here again. Any SOL or tokens still in it stay on chain — withdraw them ' +
+        'first if you want them, and keep the private key somewhere else if it holds anything.\n\n' +
         'This cannot be undone.'
       )) return;
-      try { await api(`/api/wallets/${walletId}`, { method: 'DELETE' }); await refreshAll(); renderAll(); closeModal(); toast('Wallet deleted', 'warn'); }
+      try {
+        await api(`/api/wallets/${walletId}`, { method: 'DELETE' });
+        const store = walletStore();
+        if (store && existing.publicKey) store.remove(existing.publicKey);
+        await refreshAll(); renderAll(); closeModal(); toast('Wallet deleted from the bot and this browser', 'warn');
+      }
       catch (err) { toast(err.message, 'err'); }
     };
   });
@@ -2426,55 +2540,79 @@ function wireEditor(root) {
         const name = q('#edName').value.trim();
         if (!name) { toast('Give this wallet a name so you can tell them apart', 'warn'); q('#edName').focus(); return; }
 
-        // The passphrase in this form protects the keystore — the encrypted file
-        // that holds the keys to every wallet. Creating a wallet needs it
-    // open, so open it (or create it) here, in the same step.
-        if (!isKeystoreUnlocked()) {
-          // Asked fresh, through the shared accessor: this handler is in a
-          // different function from the form and can only trust this call.
-          const ksIsNew = keystoreState().isNew;
-          const passEl = q('#edPass');
-          const pass = passEl ? passEl.value : '';
-          if (!pass) {
-            toast(ksIsNew ? 'Choose a passphrase to protect your wallet keys' : 'Enter your keystore passphrase', 'warn');
-            if (passEl) passEl.focus();
-            return;
-          }
-          const btn = q('#edSave');
-          const label = btn.textContent;
-          btn.disabled = true;
-          btn.textContent = ksIsNew ? 'Creating wallet…' : 'Checking passphrase…';
-          try {
-            await api(ksIsNew ? '/api/keystore/init' : '/api/keystore/unlock', {
-              method: 'POST', body: JSON.stringify({ passphrase: pass }),
-            });
-            const st = await api('/api/status');
-            S.keystore = st.keystore;
-            } catch (err) {
-              btn.disabled = false;
-              btn.textContent = label;
-            // Show it next to the field that has to change, not only in a toast
-            // that disappears. A wrong passphrase is the one error here the user
-            // can act on, so it gets to say what the passphrase actually is.
-            const pe = q('#edPassErr');
-            if (pe) {
-              pe.innerHTML = `<b>${esc(err.message)}</b><br/>` + (ksIsNew
-                ? 'That is the passphrase this keystore was created with.'
-                : 'That is the passphrase you chose for this keystore. Forgotten it? Use <b>Forgot your passphrase?</b> below.');
-            }
-            throw err;
-            }
-          btn.disabled = false;
-          btn.textContent = label;
+        const store = walletStore();
+        if (!store) { toast('The wallet store did not load — reload the page', 'err'); return; }
+        if (!store.supported()) {
+          toast('This browser cannot create wallet keys (it needs WebCrypto). Use a current Chrome, Safari or Firefox.', 'err');
+          return;
+        }
+
+        /* THIS wallet's passphrase. It seals the key in this browser — there is no
+         * shared file to open, and no server passphrase any more, because the
+         * server never holds the key except while the wallet is unlocked. */
+        const passEl = q('#edPass');
+        const pass = passEl ? passEl.value : '';
+        if (pass.length < store.PASS_MIN) {
+          const pe = q('#edPassErr');
+          if (pe) pe.innerHTML = `<b>At least ${store.PASS_MIN} characters.</b><br/>This passphrase is the only way back into this wallet.`;
+          toast(`Choose a passphrase of at least ${store.PASS_MIN} characters`, 'warn');
+          if (passEl) passEl.focus();
+          return;
         }
 
         const keyEl = q('#edKey');
-        const secretKey = keyEl ? keyEl.value.trim() : '';
-        const body = { name, preset: q('#edPresetSel').value, ...(secretKey ? { secretKey } : {}) };
-        const verb = secretKey ? 'Import this key as' : 'Generate a fresh burner wallet named';
-        if (!confirm(`${verb} "${name}"?\n\nThe key is encrypted and stored on this machine only.`)) return;
-        const created = await api('/api/wallets', { method: 'POST', body: JSON.stringify(body) });
-        toast(`Burner "${name}" created`, '');
+        const pasted = keyEl ? keyEl.value.trim() : '';
+        const btn = q('#edSave');
+        const label2 = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = pasted ? 'Sealing your key…' : 'Creating this wallet…';
+
+        let address = null;
+        let secretB58 = null;
+        try {
+          if (pasted) {
+            // Import: prove the key really owns the address it claims, seal it
+            // here, and never let a wrong key become a wallet you fund.
+            const parsed = await store.parseSecret(pasted);
+            await store.seal({ secretKey: parsed.secretKey, address: parsed.address, passphrase: pass, label: name });
+            address = parsed.address;
+            secretB58 = store.secretToBase58(parsed.secretKey);
+          } else {
+            const made = await store.create({ passphrase: pass, label: name });
+            address = made.address;
+            secretB58 = store.secretToBase58(await store.unlock(address, pass));
+          }
+        } catch (err) {
+          btn.disabled = false;
+          btn.textContent = label2;
+          const pe = q('#edPassErr');
+          if (pe) pe.innerHTML = `<b>${esc(err.message)}</b>`;
+          toast(err.message, 'err');
+          return;
+        }
+
+        if (!confirm(`${pasted ? 'Import this key as' : 'Create a fresh burner wallet named'} "${name}"?\n\nThe key is sealed in this browser under the passphrase you just chose.`)) {
+          btn.disabled = false; btn.textContent = label2; return;
+        }
+
+        // Register the name and the ADDRESS with the server (it never sees the
+        // key), then hand it the key for this session so it can trade.
+        const created = await api('/api/wallets', {
+          method: 'POST',
+          body: JSON.stringify({ name, preset: q('#edPresetSel').value, address, imported: Boolean(pasted) }),
+        });
+        try {
+          await api(`/api/wallets/${created.wallet}/arm`, {
+            method: 'POST', body: JSON.stringify({ secretKey: secretB58 }),
+          });
+        } catch (err) {
+          // The wallet exists and its key is sealed here; it just is not armed
+          // yet. Say so plainly instead of pretending the creation failed.
+          toast(`Wallet saved, but the bot could not arm it: ${err.message}`, 'warn');
+        }
+        btn.disabled = false;
+        btn.textContent = label2;
+        toast(`Burner "${name}" created — unlocked for this session`, '');
         closeModal();
         await refreshAll(); renderAll();
         // Land in the wallet's own config, NOT straight in the funding modal.
@@ -2821,7 +2959,12 @@ function demoTickLaunches() {
       exits: [], ageMs: 0, entryTxSignature: `SIM${now.toString(36)}`, closeTxSignature: null,
       exitReason: null, meta: { simulated: true, source: 'demo' }, simulated: true,
     };
+    // A wallet row can arrive without the array — the demo list carries none, and
+    // the preview's paper trades died on this line with a TypeError that reached the
+    // console and nowhere else. Guarded rather than assumed.
+    if (!Array.isArray(w.openPositions)) w.openPositions = [];
     w.openPositions.push(p);
+    if (!Array.isArray(S.positions)) S.positions = [];
     S.positions.push(p);
     w.exposureSol = Number(((w.exposureSol || 0) + spend).toFixed(6));
     verdicts.push({ name: w.name, action: 'bought', reason: null });
@@ -2887,12 +3030,13 @@ async function demoApi(path, opts = {}) {
     return { engine: S.status, keystore: S.keystore, global: S.config, presets: S.presets };
   }
   if (seg[0] === 'wallets' && seg.length === 1 && method === 'GET') {
-    // Mirror the server: a wallet whose key is not loaded is still reported, with
-    // keyLocked set, rather than vanishing from the list.
-    if (S.keystore && S.keystore.initialised && !S.keystore.unlocked) {
-      return S.wallets.map((w) => ({ ...w, keyLocked: true, balanceSol: null, stats: null, openPositions: [], recentPositions: [] }));
-    }
-    return S.wallets;
+    // Mirror the server: a wallet whose key this session does not hold is still
+    // reported, flagged, rather than vanishing from the list. `keyArmed` is the
+    // browser-held equivalent of the old server keystore being open — a restart
+    // clears it, and one passphrase on the card brings it back.
+    return S.wallets.map((w) => (w.keyArmed === false
+      ? { ...w, keyLocked: true, keyArmed: false, balanceSol: null, openPositions: [], recentPositions: [] }
+      : w));
   }
   if (seg[0] === 'positions' && seg.length === 1 && method === 'GET') return S.positions;
   if (seg[0] === 'scan' && method === 'GET') {
@@ -2932,7 +3076,13 @@ async function demoApi(path, opts = {}) {
   /* ------------------------------ keystore ------------------------------ */
   if (seg[0] === 'keystore' && method === 'POST') {
     const pass = String(body.passphrase || '');
-    if (seg[1] === 'lock') { S.keystore = { initialised: true, unlocked: false }; return { ok: true }; }
+    if (seg[1] === 'lock') {
+      S.keystore = { initialised: true, unlocked: false };
+      // A restart forgets every session key. The wallets themselves — and their
+      // sealed keys in the browser — are untouched, which is the whole point.
+      S.wallets.forEach((w) => { w.keyArmed = false; });
+      return { ok: true };
+    }
     if (seg[1] === 'reset') {
       if (body.confirm !== 'RESET') throw new Error('confirmation_required');
       if (pass.length < 8) throw new Error('Passphrase must be at least 8 characters.');
@@ -2964,6 +3114,23 @@ async function demoApi(path, opts = {}) {
   if (seg[0] === 'wallets' && seg.length === 1 && method === 'POST') {
     const name = String(body.name || '').trim();
     if (!name) throw new Error('name_required');
+
+    /* The normal path now: the key was made in the browser and only the address
+     * is registered here. Mirrors the real route, including being idempotent on
+     * the address so a re-registered wallet comes back as itself. */
+    if (body.address) {
+      const existing = S.wallets.find((w) => w.publicKey === body.address);
+      if (existing) return { ok: true, existing: true, wallet: existing.id, publicKey: body.address };
+      const w = demoNewWallet(name, body.preset);
+      w.publicKey = String(body.address);
+      w.imported = Boolean(body.imported);
+      w.keyArmed = false;
+      S.wallets.push(w);
+      demoPushLog(`Registered ${w.name} — its key stays sealed in this browser`);
+      return { ok: true, wallet: w.id, publicKey: w.publicKey, keyHolder: 'browser' };
+    }
+
+    // The legacy path, kept for a key generated server-side.
     if (!S.keystore || !S.keystore.unlocked) {
       throw new Error('keystore_locked: open the keystore before adding wallets.');
     }
@@ -2999,6 +3166,20 @@ async function demoApi(path, opts = {}) {
       if (body.enabled !== undefined) w.enabled = Boolean(body.enabled);
       demoPushLog(`Updated ${w.name}'s configuration`);
       return w;
+    }
+
+    if (action === 'arm' && method === 'POST') {
+      if (!body.secretKey) throw new Error('secret_key_required');
+      w.keyArmed = true;
+      demoPushLog(`🔓 ${w.name} unlocked for this session — key in memory only`, 'info', w.name);
+      return { ok: true, armed: true, walletId: w.id, publicKey: w.publicKey, wallet: w };
+    }
+
+    if (action === 'lock' && method === 'POST') {
+      w.keyArmed = false;
+      w.enabled = false; w.armed = false;
+      demoPushLog(`🔒 ${w.name} locked — its key is out of the bot's memory`, 'warn', w.name);
+      return { ok: true, armed: false, walletId: w.id };
     }
 
     if (action === 'start' || action === 'resume') {
@@ -3316,6 +3497,46 @@ document.addEventListener('click', async (e) => {
   // tapping Fund or Withdraw on a wallet did NOTHING, while the same features
   // reached from the Config or Trades modal worked. Reported from the live
   // deployment, twice, as "the buttons don't respond".
+  if (t.dataset.arm) {
+    const id = t.dataset.arm;
+    const field = document.querySelector(`#armpass-${id}`);
+    const pass = field ? field.value : '';
+    if (!pass) { toast('Type that wallet’s passphrase', 'warn'); if (field) field.focus(); return; }
+    const label = t.textContent;
+    t.disabled = true; t.textContent = 'Unlocking…';
+    try {
+      await unlockWallet(id, pass);
+    } catch {
+      // unlockWallet already said what went wrong, next to nothing else.
+    } finally {
+      t.disabled = false; t.textContent = label;
+    }
+    return;
+  }
+  if (t.dataset.lock) { await lockWallet(t.dataset.lock); return; }
+  if (t.dataset.importhere) {
+    // The key is not on this device, so the only way back is to paste it. Seal it
+    // here — after this, the wallet is this browser's, and the server never needs
+    // to hold it again.
+    const w = (S.wallets || []).find((x) => x.id === t.dataset.importhere);
+    const s = walletStore();
+    if (!s) { toast('The wallet store did not load — reload the page', 'err'); return; }
+    const key = window.prompt(`Paste the private key for ${w ? w.name : 'this wallet'}\n\nIt is sealed in this browser under a passphrase you choose next.`);
+    if (!key) return;
+    try {
+      const parsed = await s.parseSecret(key);
+      if (w && w.publicKey && parsed.address !== w.publicKey) {
+        toast(`That key belongs to ${parsed.address.slice(0, 6)}…, not to ${w.name}`, 'err');
+        return;
+      }
+      const pass = window.prompt(`Choose a passphrase to seal ${w ? w.name : 'this wallet'} with (at least ${s.PASS_MIN} characters).\n\nThere is no recovery — keep it somewhere safe.`);
+      if (!pass) return;
+      await s.seal({ secretKey: parsed.secretKey, address: parsed.address, passphrase: pass, label: w ? w.name : 'Wallet' });
+      await unlockWallet(w.id, pass);
+      renderWallets();
+    } catch (err) { toast(err.message, 'err'); }
+    return;
+  }
   if (t.dataset.fund) openFund(t.dataset.fund);
   if (t.dataset.withdraw) openWithdraw(t.dataset.withdraw);
   if (detail) openWalletDetail(detail);
@@ -3334,8 +3555,10 @@ document.addEventListener('click', async (e) => {
     )) return;
     try {
       await api(`/api/wallets/${t.dataset.delrecord}`, { method: 'DELETE' });
+      const store = walletStore();
+      if (store && addr) store.remove(addr);
       await refreshAll(); renderAll();
-      toast('Wallet record deleted', 'warn');
+      toast('Wallet deleted', 'warn');
     } catch (err) { toast(err.message, 'err'); }
   }
 
