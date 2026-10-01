@@ -35,6 +35,23 @@
   <button class="btn" id="btnAdd">＋ Wallet</button>
 </header>
 
+<!-- ═════════════════════════ DRY RUN ⇄ LIVE ═════════════════════════
+     The switch itself, always on screen — never buried in settings. Two facts
+     have to be readable at a glance: which mode you are in, and how to change
+     it. The chip in the header says what the mode MEANS; this says how to
+     switch, and it is the same two-button control on a phone and on a desktop.
+     ------------------------------------------------------------------ -->
+<div class="mode-bar" id="modeBar">
+  <div class="mode-bar-text">
+    <div class="mode-bar-title" id="modeBarTitle">🧪 DRY RUN — paper trading</div>
+    <div class="mode-bar-sub" id="modeBarSub">Trades are simulated against a paper balance. Nothing is broadcast, and no real SOL is spent. Press ▶ Start on a wallet to see paper trades appear below.</div>
+  </div>
+  <div class="mode-switch" id="modeSwitch" role="group" aria-label="Trading mode — dry run or live">
+    <button type="button" class="mode-opt" id="modeDry" title="Simulate everything. Trades are recorded as paper trades on a paper balance; no transaction is ever signed or sent.">DRY RUN</button>
+    <button type="button" class="mode-opt" id="modeLive" title="Spend real funds. Every buy and sell is a real signed transaction from your wallets. You will be asked to confirm.">LIVE</button>
+  </div>
+</div>
+
 <div class="wrap">
   <!-- ═══════════════════════════ LEFT COLUMN ═══════════════════════════ -->
   <div class="col">
@@ -93,6 +110,10 @@
           <span class="feed-dot" id="scanDot" title="Connection to the launch feed"><i></i><span id="scanDotText">idle</span></span>
         </div>
       </div>
+      <!-- What the counters above mean, in one line: how many launches were
+           detected this session and how many of them are in the list below. The
+           panel and the "tokens scanned" card must never disagree silently. -->
+      <div class="scan-meta" id="scanMeta"></div>
       <div id="scanFeed" class="scan-feed"></div>
     </section>
 

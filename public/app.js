@@ -203,7 +203,8 @@ function startDemo() {
   ];
 
   S.wallets = [
-    { id: 'w_a', name: 'Alpha', publicKey: 'DEMO-Alpha-not-a-real-address', enabled: true,
+    { id: 'w_a', name: 'Alpha', publicKey: 'DEMO-Alpha-not-a-real-address', enabled: true, armed: true,
+      paperTrading: true, paperBalanceSol: 10,
       balanceSol: 4.82, exposureSol: 0.9, lastEntryAt: Date.now() - 45000,
       stats: { day: '2026-09-28', tradesToday: 14, realisedPnlSol: 2.41, consecutiveLosses: 0, wins: 9, losses: 5, paused: false, pauseReason: null },
       openPositions: [mkPos({ id: 'p1', walletId: 'w_a', wallet: 'Alpha', mint: 'A'.repeat(43), symbol: 'MOON', name: 'Mooncoin', spent: 0.4, pnlSol: 0.51, pnlPct: 128.4, peak: 162.0, remaining: 0.34, stop: 96.0, age: 94000,
@@ -219,7 +220,8 @@ function startDemo() {
         limits: { dailyLossLimitSol: 2, maxTradesPerDay: 100, maxExposureSol: 3 },
         filters: { maxDevHoldPct: 20, minLiquiditySol: 1, maxLiquiditySol: 0 } } },
 
-    { id: 'w_b', name: 'Scalper', publicKey: 'DEMO-Scalper-not-a-real-address', enabled: true,
+    { id: 'w_b', name: 'Scalper', publicKey: 'DEMO-Scalper-not-a-real-address', enabled: true, armed: true,
+      paperTrading: true, paperBalanceSol: 10,
       balanceSol: 2.10, exposureSol: 0.22, lastEntryAt: Date.now() - 8000,
       stats: { day: '2026-09-28', tradesToday: 61, realisedPnlSol: 0.88, consecutiveLosses: 0, wins: 38, losses: 23, paused: false, pauseReason: null },
       openPositions: [mkPos({ id: 'p2', walletId: 'w_b', wallet: 'Scalper', mint: 'B'.repeat(43), symbol: 'PEPE2', name: 'Pepe Two', spent: 0.22, pnlSol: 0.036, pnlPct: 16.2, peak: 22.0, remaining: 0.5, stop: 9.0, age: 21000,
@@ -235,7 +237,8 @@ function startDemo() {
         limits: { dailyLossLimitSol: 1, maxTradesPerDay: 300, maxExposureSol: 2 },
         filters: { maxDevHoldPct: 20, minLiquiditySol: 1, maxLiquiditySol: 0 } } },
 
-    { id: 'w_c', name: 'Degen', publicKey: 'DEMO-Degen-not-a-real-address', enabled: false,
+    { id: 'w_c', name: 'Degen', publicKey: 'DEMO-Degen-not-a-real-address', enabled: false, armed: false,
+      paperTrading: true, paperBalanceSol: 10,
       balanceSol: 1.02, exposureSol: 0, lastEntryAt: 0,
       stats: { day: '2026-09-28', tradesToday: 3, realisedPnlSol: -0.44, consecutiveLosses: 2, wins: 0, losses: 3, paused: false, pauseReason: null },
       openPositions: [], recentPositions: [],
@@ -271,28 +274,10 @@ function startDemo() {
 }
 
 function connectDemoTicker() {
-  setInterval(() => {
-    if (!S.demo) return;
-    // Gently drift prices so the UI visibly lives.
-    for (const p of S.positions) {
-      const drift = (Math.random() - 0.48) * 3.2;
-      p.pnlPct = Math.max(-70, p.pnlPct + drift);
-      p.priceGainPct = p.pnlPct;
-      p.peakGainPct = Math.max(p.peakGainPct, p.pnlPct);
-      p.pnlSol = (p.pnlPct / 100) * (Number(p.solSpent) / 1e9);
-      p.ageMs += 1200;
-      const stop = p.stopLevelPct ?? 0;
-      if (p.pnlPct <= stop) {
-        // Book it like a real exit: history, realised P&L, win/loss counters.
-        const w = S.wallets.find((x) => x.id === p.walletId);
-        if (w) demoSellPosition(w, p, 'stop_loss');
-      }
-    }
-    S.status.stats.detected += Math.floor(Math.random() * 3);
-    $('scanner') && renderScanner();
-    renderStats(); renderWallets(); renderPositions();
-  }, 1400);
+  setInterval(demoTickAll, 1400);
 }
+
+
 
 const DEMO_PRESETS = {
   safe: { label: 'Safe', description: 'Small size, strict filters, tight loss limit.' },
@@ -317,6 +302,14 @@ async function boot() {
     S.presets = st.presets;
     S.keystore = st.keystore;
     await refreshAll();
+    /* The launch-scanner list, once, on load.
+     *
+     * The WebSocket snapshot carries it too, but a page that opens while the
+     * engine is between launches used to render an empty panel next to a
+     * non-zero "tokens scanned" card — which reads as a broken scanner. Fetching
+     * it here means the panel is right the moment the page paints, socket or no
+     * socket. */
+    S.scanFeed = await api('/api/scan?limit=200').then((r) => (r && r.rows) || []).catch(() => []);
     connectWs();
     S.connected = true;
     renderAll();
@@ -389,6 +382,11 @@ function handleWs(msg) {
       S.positions = msg.data.positions.filter((p) => p.status === 'OPEN');
       S.prices = msg.data.prices || {};
       S.logs = msg.data.logs || [];
+      /* The snapshot has always CARRIED the launch feed; nothing ever read it.
+       * That is half of why the panel sat empty while the counter climbed — a
+       * reload would have filled it in and a live page never would. */
+      if (Array.isArray(msg.data.scanFeed)) S.scanFeed = msg.data.scanFeed;
+      S.scanStats = msg.data.scan || null;
       renderAll();
       break;
     case 'tick':
@@ -517,12 +515,90 @@ function renderChips() {
   $('modeChip').title = dry
     ? 'DRY RUN: the bot hunts, scores and tracks positions exactly as it would live, but it does NOT buy or sell anything — every trade is simulated against a paper balance.\n\nWhat is real even in dry run: funding a wallet, and withdrawing from it. Those move actual SOL from the wallet you connected.'
     : 'LIVE: every buy and sell is a real, signed transaction spending real SOL from your wallets.';
+  paintModeSwitch(dry);
 
   const c = $('connChip');
   c.className = `run-chip${S.connected ? ' on' : ''}`;
   $('connText').textContent = S.demo ? 'OFFLINE PREVIEW' : (S.connected ? 'connected' : 'disconnected');
   if (S.demo) c.classList.add('offline');
   else c.classList.remove('offline');
+}
+
+/**
+ * Paint the DRY RUN ⇄ LIVE switch (the bar under the header).
+ *
+ * The switch lives in the page, not in a settings dialog, because "which mode
+ * am I in, and how do I change it" has to be answerable without opening
+ * anything. It is painted from the same state the header chip is painted from,
+ * so the two can never disagree.
+ */
+function paintModeSwitch(dry) {
+  const bar = $('modeBar');
+  if (!bar) return;
+  bar.classList.toggle('live', !dry);
+
+  const title = $('modeBarTitle');
+  const sub = $('modeBarSub');
+  if (title) title.textContent = dry ? '🧪 DRY RUN — paper trading' : '🔴 LIVE — real funds';
+  if (sub) {
+    sub.textContent = dry
+      ? 'Trades are simulated against a paper balance. Nothing is broadcast and no real SOL is spent. Press ▶ Start on a wallet card to watch paper trades open, hit their targets and close into history below.'
+      : 'Every buy and sell is a real, signed transaction spending real SOL from your wallets. Funding and withdrawing were always real; now the trades are too.';
+  }
+
+  const dryBtn = $('modeDry');
+  const liveBtn = $('modeLive');
+  if (dryBtn) {
+    dryBtn.classList.toggle('on', dry);
+    dryBtn.setAttribute('aria-pressed', dry ? 'true' : 'false');
+  }
+  if (liveBtn) {
+    liveBtn.classList.toggle('on', !dry);
+    liveBtn.setAttribute('aria-pressed', dry ? 'false' : 'true');
+  }
+}
+
+/**
+ * Change the trading mode. The ONLY path that does — the header switch, the
+ * settings dialog and the dry-run banner all call this.
+ *
+ * Arming live is irreversible in the sense that matters (it can spend money), so
+ * it keeps the typed confirmation. Returning to dry run is free and immediate:
+ * making someone type a phrase to STOP risking money would be perverse.
+ */
+async function setTradingMode(goLive) {
+  const dry = !goLive;
+  const already = S.status ? S.status.dryRun !== false : true;
+  if (already === dry) {
+    toast(dry ? 'Already in dry run — nothing here spends real SOL.' : 'Already live.', '');
+    return;
+  }
+
+  let confirmWord;
+  if (goLive) {
+    const typed = prompt(
+      'LIVE MODE\n\n' +
+      'From here on, every buy and sell is a real transaction signed by your wallets.\n' +
+      'Your stop loss and kill switches still work, but a bad fill costs real SOL.\n\n' +
+      'Type exactly: I_UNDERSTAND_THE_RISK',
+    );
+    if (typed !== 'I_UNDERSTAND_THE_RISK') { toast('Cancelled — still in dry run', ''); return; }
+    confirmWord = typed;
+  }
+
+  try {
+    await api('/api/engine/dry-run', {
+      method: 'POST',
+      body: JSON.stringify({ dryRun: dry, confirm: confirmWord }),
+    });
+    const st = await api('/api/status');
+    S.status = st.engine; S.config = st.global;
+    renderAll();
+    toast(
+      dry ? '🧪 Back to DRY RUN — trades are simulated again' : '🔴 LIVE armed — real funds from here',
+      dry ? '' : 'err',
+    );
+  } catch (err) { toast(err.message, 'err'); }
 }
 
 /* ------------------------------------------------------------------ *
@@ -1221,8 +1297,11 @@ function renderNotices() {
       and every trade it takes is <b>simulated</b>. Each wallet shows two numbers:
       <b>Real bal.</b> is the SOL that wallet actually holds on Solana, and
       <b>Sim. balance</b> is the pretend money the simulation trades with.
-      Funding a wallet and withdrawing from it <b>are real</b> and move actual SOL either way.
-      <div style="margin-top:6px"><a href="#" data-open-settings="1" style="color:var(--accent)">Arm live trading in ⚙ Settings</a> when you are ready to spend real money.</div>
+      Funding a wallet and withdrawing from it <b>are real</b> and move actual SOL either way —
+      that is the only thing dry run does not cover.
+      <div style="margin-top:6px">Watch a paper trade happen: press <b>▶ Start</b> on a wallet card.
+      The switch between this and real money is the <b>DRY RUN / LIVE</b> control at the top of the page
+      (<a href="#" data-mode-live="1" style="color:var(--accent)">switch to LIVE</a> when you are ready).</div>
     </div></div>`);
   }
 
@@ -1266,13 +1345,20 @@ function renderStats() {
   const winRate = wins + losses > 0 ? (wins / (wins + losses)) * 100 : 0;
   const detected = S.status?.stats?.detected || 0;
   const bought = S.status?.stats?.bought || 0;
+  // Say "paper" on every money figure that dry run invented. The user's exact
+  // complaint was not being able to tell which numbers were pretend.
+  const dry = S.status ? S.status.dryRun !== false : true;
+  const armedCount = ws.filter((w) => (w.armed !== undefined ? w.armed : (w.enabled && !w.stats?.paused))).length;
+  const feedRows = (S.scanFeed || []).length;
 
   const cards = [
-    ['Realised P&L (day)', `${fmtSol(totalPnl)} SOL`, `${ws.filter((w) => w.enabled).length} wallets armed`, cls(totalPnl), cls(totalPnl) === 'pos' ? 'accent' : cls(totalPnl) === 'neg' ? 'red' : ''],
-    ['Unrealised', `${fmtSol(unrealised)} SOL`, `${open.length} open`, cls(unrealised), 'blue'],
-    ['Win rate', wins + losses ? `${winRate.toFixed(1)}%` : '—', `${wins}W / ${losses}L`, winRate >= 50 ? 'pos' : 'dim', ''],
-    ['Exposure', `${fmtSol(exposure, 2)} SOL`, `of ${fmtSol(balance, 2)} balance`, 'dim', 'amber'],
-    ['Tokens scanned', detected.toLocaleString(), `${bought} bought · ${detected ? ((bought / detected) * 100).toFixed(1) : '0'}% hit`, 'dim', ''],
+    [dry ? 'Realised P&L (day) · paper' : 'Realised P&L (day)', `${fmtSol(totalPnl)} SOL`,
+      `${armedCount} wallet${armedCount === 1 ? '' : 's'} armed${dry ? ' · simulated' : ''}`, cls(totalPnl), cls(totalPnl) === 'pos' ? 'accent' : cls(totalPnl) === 'neg' ? 'red' : ''],
+    [dry ? 'Unrealised · paper' : 'Unrealised', `${fmtSol(unrealised)} SOL`, `${open.length} open${dry ? ' · simulated' : ''}`, cls(unrealised), 'blue'],
+    ['Win rate', wins + losses ? `${winRate.toFixed(1)}%` : '—', `${wins}W / ${losses}L${dry ? ' · paper' : ''}`, winRate >= 50 ? 'pos' : 'dim', ''],
+    ['Exposure', `${fmtSol(exposure, 2)} SOL`, `${dry ? 'of ' + fmtSol(balance, 2) + ' paper balance' : 'of ' + fmtSol(balance, 2) + ' balance'}`, 'dim', 'amber'],
+    ['Tokens scanned', detected.toLocaleString(),
+      `${bought} bought · ${detected ? ((bought / detected) * 100).toFixed(1) : '0'}% hit · ${feedRows} in the feed below`, 'dim', ''],
   ];
 
   $('stats').innerHTML = cards.map(([label, value, sub, vcls, accent]) => `
@@ -1374,12 +1460,21 @@ function renderWallets() {
     const open = w.openPositions || [];
     const filledTiers = open.length ? (open[0].tiers || []).filter((t) => t.filled).length : 0;
 
-    const state = !w.enabled ? 'off' : st.paused ? 'paused' : 'enabled';
-    const stateLabel = !w.enabled
-      ? 'disabled'
+    /* ARMED is the only state the control below keys off.
+     *
+     * It used to key off `paused` alone. Every wallet you create has
+     * enabled:false, so a brand-new wallet — which has never traded and can't —
+     * showed "⏸ Stop", which reads exactly like "this wallet is already
+     * trading". Reported from the live app as "the start button is already
+     * turned on". Armed answers the question actually being asked. */
+    const armed = w.armed !== undefined ? Boolean(w.armed) : (Boolean(w.enabled) && !st.paused);
+    const paperMode = w.paperTrading || (S.status ? S.status.dryRun !== false : false);
+    const state = armed ? 'enabled' : st.paused ? 'paused' : 'off';
+    const stateLabel = armed
+      ? (paperMode ? 'paper trading' : 'trading')
       : st.paused
-        ? `stopped · ${esc(st.pauseReason || '')}`
-        : 'trading';
+        ? `stopped · ${esc(st.pauseReason || 'stopped')}`
+        : 'not started — press ▶ Start';
 
     return `<div class="wallet ${state}">
       <div class="wallet-top">
@@ -1428,11 +1523,11 @@ function renderWallets() {
       </div>
 
       <div class="wallet-actions">
-        <span class="badge ${st.paused ? 'lost' : w.enabled ? 'won' : 'sim'}" style="align-self:center">${stateLabel}</span>
+        <span class="badge ${armed ? 'won' : st.paused ? 'lost' : 'sim'}" style="align-self:center">${stateLabel}</span>
         <div style="flex:1"></div>
-        ${st.paused
-          ? `<button class="btn btn-sm btn-primary" data-start="${esc(w.id)}" title="Resume trading for this wallet">▶ Start</button>`
-          : `<button class="btn btn-sm btn-warn" data-stop="${esc(w.id)}" title="Stop new entries for this wallet. Open positions are still managed, so your stops keep working.">⏸ Stop</button>`}
+        ${armed
+          ? `<button class="btn btn-sm btn-warn" data-stop="${esc(w.id)}" title="Stop new entries for this wallet. Open positions are still managed, so your stops keep working.">⏸ Stop</button>`
+          : `<button class="btn btn-sm btn-primary" data-start="${esc(w.id)}" title="Start this wallet${paperMode ? ' — it is in DRY RUN, so its trades will be simulated (paper trades on a paper balance)' : ''}. This also starts the engine if it is stopped.">▶ Start</button>`}
         <button class="btn btn-sm" data-detail="${esc(w.id)}" title="This wallet's open positions and its own trade history">📄 Trades</button>
         <button class="btn btn-sm" data-edit="${esc(w.id)}" title="Strategy, limits, exits and filters for this wallet">⚙ Config</button>
         <button class="btn btn-sm" data-withdraw="${esc(w.id)}" title="Move SOL out of this wallet">Withdraw</button>
@@ -1560,10 +1655,12 @@ function renderPositions() {
   const ps = S.positions || [];
   $('posCount').textContent = ps.length;
 
+  const dry = S.status ? S.status.dryRun !== false : true;
   if (!ps.length) {
     $('positions').innerHTML = `<div class="empty"><div class="empty-icon">◎</div>
       <div class="empty-title">No open positions</div>
-      <div class="empty-sub">The engine is watching for new launches. Positions appear here the moment a wallet fills.</div></div>`;
+      <div class="empty-sub">The engine is watching for new launches. Positions appear here the moment a wallet fills${
+        dry ? ' — in dry run these are <b>paper</b> positions, opened and closed by exactly the same rules, with no transaction sent.' : '.'}</div></div>`;
     return;
   }
 
@@ -1593,7 +1690,10 @@ function positionRow(p) {
   const filled = tiers.filter((t) => t.filled).length;
 
   return `<tr>
-    <td class="sym">${esc(p.symbol || short(p.mint, 4))}${p.adopted ? '<span class="badge adopted" title="Recovered after a restart — size verified against the on-chain balance">♻ resumed</span>' : ''}<div class="mute" style="font-size:10px;font-weight:400">${esc(short(p.mint, 5))}</div></td>
+    <td class="sym">${esc(p.symbol || short(p.mint, 4))}${p.adopted ? '<span class="badge adopted" title="Recovered after a restart — size verified against the on-chain balance">♻ resumed</span>' : ''}${
+      (p.simulated || (S.status && S.status.dryRun !== false))
+        ? '<span class="badge sim" title="Paper trade: simulated in dry run. No transaction was signed, sent or paid for.">SIM</span>'
+        : ''}<div class="mute" style="font-size:10px;font-weight:400">${esc(short(p.mint, 5))}</div></td>
     <td><span class="mute">${esc(p.wallet || p.walletId)}</span></td>
     <td class="num">${esc((Number(p.solSpent) / 1e9).toFixed(3))}</td>
     <td class="num">${esc(((Number(p.solSpent) / 1e9) + (p.pnlSol || 0)).toFixed(3))}</td>
@@ -1615,13 +1715,17 @@ function renderHistory() {
   const h = (S.history || []).slice(0, 40);
   $('histCount').textContent = (S.history || []).length;
   if (!h.length) {
-    $('history').innerHTML = `<div class="empty" style="padding:26px"><div class="empty-sub">Closed trades will be listed here with their exit reason.</div></div>`;
+    const dry = S.status ? S.status.dryRun !== false : true;
+    $('history').innerHTML = `<div class="empty" style="padding:26px"><div class="empty-sub">Nothing closed yet.
+      Every exit — take-profit tier, trailing stop, loss limit, kill — lands here with its reason.${
+      dry ? '<br/><br/>You are in <b>DRY RUN</b>: these will be <b>paper</b> trades, opened and closed by the real rules against a paper balance. Press <b>▶ Start</b> on a wallet card to make some happen.' : ''}</div></div>`;
     return;
   }
   $('history').innerHTML = `<table>
     <thead><tr><th>Token</th><th>Wallet</th><th class="num">Spent</th><th class="num">Returned</th><th class="num">P&L</th><th>Exit reason</th><th class="num">Held</th></tr></thead>
     <tbody>${h.map((p) => `<tr>
-      <td class="sym">${esc(p.symbol || short(p.mint, 4))}</td>
+      <td class="sym">${esc(p.symbol || short(p.mint, 4))}${
+        (p.simulated || (S.status && S.status.dryRun !== false)) ? '<span class="badge sim" title="Paper trade: simulated in dry run — no transaction was sent.">SIM</span>' : ''}</td>
       <td class="mute">${esc(p.wallet || p.walletId)}</td>
       <td class="num">${esc((Number(p.solSpent) / 1e9).toFixed(3))}</td>
       <td class="num">${esc((Number(p.realisedSol) / 1e9).toFixed(3))}</td>
@@ -1643,7 +1747,25 @@ function renderScanFeed() {
   if (!mount) return;
   const rows = S.scanFeed || [];
   const count = $('scanCount');
+  // The number in this panel is the number of launches IN THIS LIST. It used to
+  // be able to disagree with the "tokens scanned" card by 100 rows with nothing
+  // on screen to explain it, which is what the user reported.
   if (count) count.textContent = String(rows.length);
+
+  const meta = $('scanMeta');
+  if (meta) {
+    const evaluated = (S.status && S.status.stats && S.status.stats.detected) || 0;
+    const feed = S.scanStats || (S.status && S.status.scan) || null;
+    const bits = [`<b>${rows.length}</b> launch${rows.length === 1 ? '' : 'es'} in this list`];
+    if (evaluated > rows.length) {
+      bits.push(`the wallets evaluated <b>${evaluated.toLocaleString()}</b> token${evaluated === 1 ? '' : 's'} this session`);
+    } else {
+      bits.push(`the wallets evaluated every one of them`);
+    }
+    if (feed && feed.dropped) bits.push(`${feed.dropped} older row(s) rolled off (the list keeps the newest 200)`);
+    if (S.status && S.status.running === false) bits.push('the engine is stopped, so nothing new is arriving');
+    meta.innerHTML = bits.join(' · ');
+  }
 
   // The dot reports the FEED, not the engine: a connected socket with the scanner
   // stopped is a different state from a dead socket, and they look the same if you
@@ -1662,12 +1784,28 @@ function renderScanFeed() {
   }
 
   if (!rows.length) {
+    const running = S.status ? S.status.running !== false : false;
+    const connected = Boolean(sc.connected);
+    const body = !running
+      ? {
+          title: 'The engine is stopped, so nothing is being scanned.',
+          sub: 'Press <b>▶ Engine</b> in the top bar (or <b>▶ Start</b> on a wallet card — that starts it too). '
+             + 'Launches start filling this list within seconds, each with what the checks found and what every wallet decided about it.',
+        }
+      : connected
+        ? {
+            title: 'Watching pump.fun now — no launch has arrived yet.',
+            sub: 'The feed is connected. New tokens appear here the moment they are created, usually several a minute. '
+               + 'Nothing else is needed from you.',
+          }
+        : {
+            title: 'The engine is running, but the launch feed is not connected.',
+            sub: 'That is why this list is empty while the counters move — check the dot above, then your RPC endpoint or your network.',
+          };
     mount.innerHTML = `
       <div class="scan-empty">
-        <p><b>No launches scanned yet.</b></p>
-        <p class="muted">Start the engine and pump.fun launches will stream in here, each with what the
-        checks found and what every wallet decided about it. If the scanner is running and this stays
-        empty, the feed is not connected — check the dot above, then your RPC or your network.</p>
+        <p><b>${body.title}</b></p>
+        <p class="muted">${body.sub}</p>
       </div>`;
     return;
   }
@@ -2414,21 +2552,12 @@ function openSettings() {
     </div>`, (root) => {
     const q = (s) => root.querySelector(s);
 
+    // One code path for the mode change: this button, the header switch and the
+    // dry-run banner all call setTradingMode(), so they cannot drift apart.
     q('#g_toggle').onclick = async () => {
       const goingLive = (S.config?.dryRun !== false);
-      let confirmWord;
-      if (goingLive) {
-        const typed = prompt('This will spend REAL funds.\n\nType exactly: I_UNDERSTAND_THE_RISK');
-        if (typed !== 'I_UNDERSTAND_THE_RISK') return toast('Cancelled', '');
-        confirmWord = typed;
-      }
-      try {
-        await api('/api/engine/dry-run', { method: 'POST', body: JSON.stringify({ dryRun: !goingLive, confirm: confirmWord }) });
-        const st = await api('/api/status');
-        S.status = st.engine; S.config = st.global;
-        renderAll(); closeModal();
-        toast(goingLive ? '🔴 LIVE trading armed' : '🧪 Back to dry run', goingLive ? 'err' : '');
-      } catch (err) { toast(err.message, 'err'); }
+      await setTradingMode(goingLive);
+      closeModal();
     };
 
     q('#g_probe').onclick = async () => {
@@ -2556,6 +2685,39 @@ function demoPushLog(message, level = 'info', wallet = null) {
   S.logs = S.logs.slice(0, 300);
 }
 
+/**
+ * One heartbeat of the preview: drift the marks, run the exits, and let new
+ * launches arrive.
+ *
+ * Split out of the interval so a test can call it directly. Behaviour under test
+ * that only exists inside a setInterval is behaviour nobody can assert on.
+ */
+function demoTickAll() {
+  if (!S.demo) return;
+  // Gently drift prices so the UI visibly lives.
+  for (const p of S.positions) {
+    const drift = (Math.random() - 0.48) * 3.2;
+    p.pnlPct = Math.max(-70, p.pnlPct + drift);
+    p.priceGainPct = p.pnlPct;
+    p.peakGainPct = Math.max(p.peakGainPct, p.pnlPct);
+    p.pnlSol = (p.pnlPct / 100) * (Number(p.solSpent) / 1e9);
+    p.ageMs += 1200;
+    const stop = p.stopLevelPct ?? 0;
+    const w = S.wallets.find((x) => x.id === p.walletId);
+    if (p.pnlPct <= stop) {
+      // Book it like a real exit: history, realised P&L, win/loss counters.
+      if (w) demoSellPosition(w, p, 'stop_loss');
+    } else if (p.demoTargetPct && p.pnlPct >= p.demoTargetPct) {
+      // Take profit, booked the same way — a paper trade that only ever lost
+      // would teach the wrong thing about what dry run is for.
+      if (w) demoSellPosition(w, p, `tp_${Math.round(p.demoTargetPct)}pct`);
+    }
+  }
+  S.status.stats.detected += Math.floor(Math.random() * 3);
+  if (S.status.running) demoTickLaunches();
+  $('scanner') && renderScanner();
+  renderStats(); renderWallets(); renderPositions(); renderScanFeed();
+}
 /** Book a simulated full exit: move the position into that wallet's history. */
 function demoSellPosition(w, p, reason) {
   const spent = Number(p.solSpent) / 1e9;
@@ -2586,6 +2748,96 @@ function demoSellPosition(w, p, reason) {
   return { ok: true, signature: `SIM${Date.now().toString(36).toUpperCase()}` };
 }
 
+/* ══════════════ dry-run paper trading, in the offline preview ══════════════ */
+
+const DEMO_TICKER = ['WOJAK2', 'MOONCAT', 'BANANA', 'TURBO', 'CHAD', 'PONZI', 'DOGWIF', 'SNIPE', 'GIGA', 'PEPE3'];
+const DEMO_SKIP_REASONS = [
+  'dev_hold_high(34.0%>20%)', 'liquidity_below_min(0.42)', 'freeze_authority_live',
+  'mint_authority_live', 'top10_concentrated(52%)', 'name_copycat(WOJAK)', 'bonding_curve_too_far(71%)',
+];
+let demoLaunchSeq = 0;
+
+/**
+ * One launch arrives, and the armed wallets do what they do in dry run: paper
+ * trades that open, get managed and close into history.
+ *
+ * This is the preview's answer to "in the dry run am not seeing any dry run
+ * trade happening". The real engine does this against the real pump.fun feed;
+ * this does it against a ticker, with the same shape of data, so the preview
+ * shows the lifecycle rather than describing it.
+ */
+function demoTickLaunches() {
+  demoLaunchSeq += 1;
+  if (demoLaunchSeq % 3 !== 0) return; // roughly one launch every 4 seconds
+
+  const now = Date.now();
+  const symbol = DEMO_TICKER[demoLaunchSeq % DEMO_TICKER.length] + (demoLaunchSeq % 7);
+  const mint = `DEMO${demoLaunchSeq}notarealmint${'a'.repeat(20)}`;
+  const armedWallets = (S.wallets || []).filter((w) => w.enabled && !w.stats?.paused);
+
+  const skipped = Math.random() < 0.45 || !armedWallets.length;
+  const reason = DEMO_SKIP_REASONS[demoLaunchSeq % DEMO_SKIP_REASONS.length];
+  const verdicts = [];
+
+  if (skipped) {
+    for (const w of armedWallets) verdicts.push({ name: w.name, action: 'skipped', reason });
+    upsertScanRow({
+      mint, symbol, name: symbol.toLowerCase(), devWallet: `DEMO-dev-${demoLaunchSeq}-not-real`,
+      devHoldPct: skipped ? 34.0 : 3.4, liquiditySol: skipped ? 0.42 : 12.5,
+      riskScore: skipped ? 25 : 0, riskNotes: skipped ? ['mint_authority_live'] : [],
+      decision: skipped ? 'skipped' : 'checking', skipReason: skipped ? reason : null,
+      detectedAt: now, decidedAt: skipped ? now : null, wallets: verdicts,
+    });
+    return;
+  }
+
+  // Buy: each armed wallet with room opens a paper position at its own size.
+  let opened = 0;
+  for (const w of armedWallets) {
+    const maxOpen = w.config?.buy?.maxConcurrentPositions ?? 4;
+    if ((w.openPositions || []).length >= maxOpen) {
+      verdicts.push({ name: w.name, action: 'skipped', reason: 'max_concurrent_positions' });
+      continue;
+    }
+    const min = w.config?.buy?.minAmountSol ?? 0.1;
+    const max = w.config?.buy?.maxAmountSol ?? 1;
+    const spend = Number((min + Math.random() * Math.max(0, max - min)).toFixed(3));
+    const stop = -Math.abs(w.config?.exits?.stopLossPct ?? 25);
+    const p = {
+      id: `p_demo_${demoLaunchSeq}_${w.id}`,
+      walletId: w.id, wallet: w.name, mint, symbol, name: symbol,
+      status: 'OPEN', openedAt: now, closedAt: null,
+      entryPrice: '0', lastPrice: '0', highWaterPrice: '0',
+      originalTokens: '0', tokensHeld: '0',
+      solSpent: String(Math.round(spend * 1e9)), realisedSol: '0', pnlLamports: '0',
+      pnlSol: 0, pnlPct: 0, priceGainPct: 0, peakGainPct: 0,
+      remainingFraction: 1, stopLevelPct: stop,
+      // The first take-profit tier is what a paper trade is booked against, so a
+      // preview run shows both outcomes — winners and stop-outs — within a
+      // minute, instead of only ever grinding down to the stop.
+      demoTargetPct: Math.min(Number(w.config?.exits?.takeProfitTiers?.[0]?.gainPct ?? 50) || 50, 60),
+      tiers: (w.config?.exits?.takeProfitTiers || [{ gainPct: 50, sellPct: 100 }]).map((t) => ({ ...t, filled: false })),
+      exits: [], ageMs: 0, entryTxSignature: `SIM${now.toString(36)}`, closeTxSignature: null,
+      exitReason: null, meta: { simulated: true, source: 'demo' }, simulated: true,
+    };
+    w.openPositions.push(p);
+    S.positions.push(p);
+    w.exposureSol = Number(((w.exposureSol || 0) + spend).toFixed(6));
+    verdicts.push({ name: w.name, action: 'bought', reason: null });
+    opened += 1;
+    demoPushLog(`🟢 BOUGHT ${symbol} · ${spend.toFixed(3)} SOL · ${(Math.random() * 40 + 8).toFixed(1)}M tokens`, 'trade', w.name);
+  }
+
+  upsertScanRow({
+    mint, symbol, name: symbol.toLowerCase(), devWallet: `DEMO-dev-${demoLaunchSeq}-not-real`,
+    devHoldPct: 3.4, liquiditySol: 12.5, riskScore: 0, riskNotes: [],
+    decision: opened ? 'bought' : 'skipped',
+    skipReason: opened ? null : 'no wallet had room for another position',
+    detectedAt: now, decidedAt: now, wallets: verdicts,
+  });
+  void opened;
+}
+
 /** A fresh demo wallet. The address is deliberately not valid base58. */
 function demoNewWallet(name, preset) {
   const slug = name.replace(/[^a-zA-Z0-9]/g, '').slice(0, 12) || 'Wallet';
@@ -2596,7 +2848,10 @@ function demoNewWallet(name, preset) {
     id,
     name,
     publicKey: `DEMO-${slug}-not-a-real-address`, // never base58: cannot be funded by accident
-    enabled: true,
+    // Creating a wallet is not a decision to trade. Mirrors the server, where a
+    // fresh wallet is created stopped and shows ▶ Start, not ⏸ Stop.
+    enabled: false,
+    armed: false,
     imported: false,
     balanceSol: 0,
     paperBalanceSol: 10,
@@ -2746,20 +3001,27 @@ async function demoApi(path, opts = {}) {
     }
 
     if (action === 'start' || action === 'resume') {
+      w.enabled = true; w.armed = true;
       w.stats.paused = false; w.stats.pauseReason = null;
       S.status.running = true;
-      demoPushLog(`▶ ${w.name} started`, 'info', w.name);
-      return { ok: true, running: true, paused: false, engineRunning: S.status.running, wallet: w };
+      const dry = S.status.dryRun !== false;
+      demoPushLog(
+        `▶ ${w.name} armed — ${dry ? 'DRY RUN: paper trades only, nothing is sent' : 'LIVE: real funds'}`,
+        dry ? 'info' : 'warn', w.name,
+      );
+      return { ok: true, running: true, enabled: true, armed: true, paused: false, dryRun: dry, engineRunning: S.status.running, wallet: w };
     }
     if (action === 'stop' || action === 'pause') {
+      w.enabled = false; w.armed = false;
       w.stats.paused = true; w.stats.pauseReason = 'stopped from the dashboard';
-      demoPushLog(`⏸ ${w.name} stopped — open positions still managed`, 'warn', w.name);
-      return { ok: true, running: false, paused: true, wallet: w };
+      demoPushLog(`⏸ ${w.name} stopped — no new entries; positions it holds are still managed`, 'warn', w.name);
+      return { ok: true, running: false, enabled: false, armed: false, paused: true, wallet: w };
     }
     if (action === 'kill-all' || action === 'close-all') {
       const open = (w.openPositions || []).slice();
       open.forEach((pos) => demoSellPosition(w, pos, 'manual_kill_all'));
       w.stats.paused = true; w.stats.pauseReason = 'killed all trades from the dashboard';
+      w.enabled = false; w.armed = false;
       demoPushLog(`⛔ ${w.name}: killed ${open.length} position(s) and stopped`, 'warn', w.name);
       return { ok: true, attempted: open.length, sold: open.length, failed: 0, stopped: true, wallet: w };
     }
@@ -3016,6 +3278,8 @@ document.addEventListener('click', async (e) => {
       toast(running ? 'Engine stopped' : 'Engine started', '');
     } catch (err) { toast(err.message, 'err'); }
   }
+  if (t.id === 'modeDry' || t.dataset.modeDry) await setTradingMode(false);
+  if (t.id === 'modeLive' || t.dataset.modeLive) await setTradingMode(true);
   if (t.id === 'btnConnect' || t.id === 'btnConnect2') openConnectModal();
   if (t.id === 'connChip' && S.demo) openPreviewNotice();
   if (t.id === 'btnPanic') {
@@ -3087,16 +3351,22 @@ document.addEventListener('click', async (e) => {
     try {
       const r = await api(`/api/wallets/${start}/start`, { method: 'POST', body: '{}' });
       await refreshAll(); renderAll();
-      toast(r.engineRunning ? '▶ Trading — engine running' : '▶ Started', '');
+      const nm = (S.wallets || []).find((x) => x.id === start);
+      const label = nm ? nm.name : 'Wallet';
+      toast(
+        r.dryRun === false
+          ? `▶ ${label} armed — LIVE: real funds`
+          : `▶ ${label} armed — DRY RUN: it will take paper trades (no real funds). Watch them on its card.`,
+        r.dryRun === false ? 'err' : '',
+      );
     } catch (err) { toast(err.message, 'err'); }
   }
 
   if (stop) {
     try {
-      const r = await api(`/api/wallets/${stop}/stop`, { method: 'POST', body: '{}' });
+      await api(`/api/wallets/${stop}/stop`, { method: 'POST', body: '{}' });
       await refreshAll(); renderAll();
-      toast('⏸ Stopped. Open positions are still managed, so your stops keep working.', 'warn');
-      void r;
+      toast('⏸ Stopped. No new entries for this wallet; positions it still holds are sold by its own exits.', 'warn');
     } catch (err) { toast(err.message, 'err'); }
   }
 
