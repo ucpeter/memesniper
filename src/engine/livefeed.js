@@ -144,6 +144,9 @@ class LiveFeed {
     row.decision = DECISION.BOUGHT;
     row.skipReason = null;
     row.decidedAt = Date.now();
+    // `wallet` is the name, `walletId` the key. Prefer the name: the row already
+    // has one entry per wallet from token:analyzed keyed by name, and keying this
+    // one by id listed the same wallet twice under two different labels.
     row.boughtBy = position.wallet || position.walletId || null;
     this.stats.bought += 1;
     this._pushWallet(row, row.boughtBy, 'bought', null);

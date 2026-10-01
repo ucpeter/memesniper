@@ -12,10 +12,18 @@ const bus = require('../util/events');
 let seq = 0;
 
 class Position {
-  constructor({ walletId, mint, symbol, name, entryPrice, tokensHeld, solSpent, txSignature, meta = {} }) {
+  constructor({ walletId, wallet = null, mint, symbol, name, entryPrice, tokensHeld, solSpent, txSignature, meta = {} }) {
     seq += 1;
     this.id = `pos_${Date.now().toString(36)}_${seq}`;
     this.walletId = walletId;
+    /* The human name of the owning wallet, carried WITH the position.
+     *
+     * The id is what the engine keys on, but every list a person reads — history,
+     * the launch feed, a kill confirmation — showed `w_99fde369a87a` instead of
+     * "PaperProbe". Looking the name up at render time only works for a wallet
+     * that is currently loaded, so the name travels with the trade.
+     */
+    this.wallet = wallet || null;
     this.mint = mint;
     this.symbol = symbol || '???';
     this.name = name || '';
@@ -61,7 +69,7 @@ class Position {
    */
   snapshot() {
     return {
-      id: this.id, walletId: this.walletId, mint: this.mint, symbol: this.symbol, name: this.name,
+      id: this.id, walletId: this.walletId, wallet: this.wallet || null, mint: this.mint, symbol: this.symbol, name: this.name,
       meta: this.meta,
       openedAt: this.openedAt,
       entryPrice: this.entryPrice.toString(),
@@ -81,7 +89,7 @@ class Position {
   /** Rebuild a position from snapshot(). Caller must set tokensHeld from chain. */
   static fromSnapshot(s) {
     const p = new Position({
-      walletId: s.walletId, mint: s.mint, symbol: s.symbol, name: s.name,
+      walletId: s.walletId, wallet: s.wallet || null, mint: s.mint, symbol: s.symbol, name: s.name,
       entryPrice: BigInt(s.entryPrice), tokensHeld: BigInt(s.tokensHeld || 0),
       solSpent: BigInt(s.solSpent), txSignature: s.entryTxSignature, meta: s.meta || {},
     });
@@ -166,11 +174,14 @@ class Position {
     return {
       id: this.id,
       walletId: this.walletId,
+      wallet: this.wallet || null,
       mint: this.mint,
       symbol: this.symbol,
       name: this.name,
       status: this.status,
       adopted: Boolean(this.adopted),
+      // true = a dry-run (paper) fill. Never broadcast, never real money.
+      simulated: Boolean(this.meta && this.meta.simulated),
       openedAt: this.openedAt,
       closedAt: this.closedAt,
       entryPrice: this.entryPrice.toString(),

@@ -20,6 +20,7 @@ const log = require('../util/logger');
 const Scanner = require('./scanner');
 const Trader = require('./trader');
 const Executor = require('./executor');
+const { LiveFeed } = require('./livefeed');
 const safety = require('./safety');
 const curve = require('./curve');
 const fs = require('node:fs');
@@ -50,6 +51,18 @@ class Engine {
     this.traders = new Map(); // walletId -> Trader
     this.scanner = new Scanner(config.global);
     this.executor = new Executor(config.global, keystore);
+
+    /* The launch-scanner feed the dashboard shows.
+     *
+     * It lives HERE, on the engine, for one reason: it subscribes to the same
+     * process bus the scanner publishes on, so it must be created exactly once,
+     * next to the scanner. It used to be created nowhere — the class and its
+     * tests were fine, but nothing ever attached it, so `/api/scan` answered
+     * from an undefined property and the panel stayed empty while the counters
+     * climbed. Attaching it here is what makes the panel and the counters agree:
+     * every launch the scanner detects now produces exactly one row.
+     */
+    this.liveFeed = new LiveFeed().attach();
     this.priceCache = new Map(); // mint -> { price, virtualSolReserves, virtualTokenReserves, ts, liquidityDropPct, initialLiquiditySol }
     this.running = false;
     this.priceTimer = null;
@@ -478,6 +491,9 @@ class Engine {
         name: cfg.name,
         publicKey: cfg.publicKey || null,
         enabled: cfg.enabled,
+        // Reported for a locked wallet too, so the card can word its state
+        // consistently the moment the keystore is opened.
+        armed: Boolean(cfg.enabled) && !(cfg.stats && cfg.stats.paused),
         imported: Boolean(cfg.imported),
         keyLocked: true,
         // "locked" and "gone" are different, and the dashboard words them
@@ -540,6 +556,18 @@ class Engine {
         detected: this.scanner.stats.detected,
       },
       stats: this.stats,
+      // The feed's own tally, next to the engine's. They answer different
+      // questions: `stats.detected` counts what was evaluated, `scan.seen`
+      // counts the rows the panel is showing. If they ever disagree, the panel
+      // says so out loud instead of leaving the user to spot it.
+      scan: {
+        rows: this.liveFeed.size,
+        seen: this.liveFeed.stats.seen,
+        bought: this.liveFeed.stats.bought,
+        skipped: this.liveFeed.stats.skipped,
+        errors: this.liveFeed.stats.errors,
+        dropped: this.liveFeed.stats.dropped,
+      },
       priceFeedSize: this.priceCache.size,
       priceFeed: {
         ok: this.priceHealth ? this.priceHealth.ok : true,

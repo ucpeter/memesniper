@@ -277,6 +277,7 @@ class Trader {
 
       const position = new Position({
         walletId: this.cfg.id,
+        wallet: this.cfg.name,
         mint,
         symbol: candidate.symbol,
         name: candidate.name,
@@ -292,6 +293,10 @@ class Trader {
           devHoldPct: report?.devHoldPct ?? null,
           detectedAt: candidate.detectedAt,
           source: candidate.source,
+          // Recorded at fill time, not read from the current mode: a paper trade
+          // stays a paper trade after you switch to live, and a real one is
+          // never relabelled as simulated by a later switch.
+          simulated: Boolean(this.executor && this.executor.dryRun),
         },
       });
 
@@ -341,7 +346,15 @@ class Trader {
    * Called on each price tick from the engine's poller.
    */
   async manage(ctx) {
-    if (!this.cfg.enabled) return;
+    /* Deliberately NOT gated on cfg.enabled.
+     *
+     * cfg.enabled governs NEW ENTRIES (see risk.canOpenNewPosition). Exits are a
+     * different promise: the Stop button says "open positions are still managed,
+     * so your stops keep working", and returning early here made that false — a
+     * stopped wallet with a live position had no stop loss and no trailing stop,
+     * which is the one state you must never leave a bag in. A wallet with no
+     * open positions costs nothing here: the loop below is empty.
+     */
     const g = this.getConfig();
 
     for (const position of this.openPositions()) {
@@ -636,6 +649,7 @@ class Trader {
     if (held <= 0n) return null; // genuinely empty: already sold, nothing to manage
 
     const p = Position.fromSnapshot(snap);
+    p.wallet = this.cfg.name; // snapshots written before the name was stored still get one
     p.tokensHeld = held; // chain wins
     if (p.tokensHeld > p.originalTokens) p.originalTokens = p.tokensHeld;
     p.status = 'OPEN';
@@ -664,6 +678,10 @@ class Trader {
       name: this.cfg.name,
       publicKey: this.publicKey,
       enabled: this.cfg.enabled,
+      // One field the UI can trust for its Start/Stop control. "enabled" alone
+      // was not enough: the card keyed off `paused`, so a wallet that had never
+      // been started still showed ⏸ Stop, which reads as "already trading".
+      armed: Boolean(this.cfg.enabled) && !this.stats.paused,
       imported: Boolean(this.cfg.imported), // true = user-supplied key, not a generated burner
       balanceSol: this.balanceSol,
       paperBalanceSol: this.isPaperTrading ? this.effectiveBalanceSol() : 0,
