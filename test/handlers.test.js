@@ -200,10 +200,39 @@ const saveHandlerSrc = extractSaveHandler(src);
  */
 const SAVE_HANDLER_SCOPE = [
   'S', 'api', 'toast', 'confirm', 'q', 'esc', 'closeModal', 'refreshAll', 'renderAll',
-  'openFund', 'openWalletDetail', 'isKeystoreUnlocked', 'keystoreState',
+  'openWallet', 'walletStore',
 ];
 
-function walletSaveHandler({ state, api, toast, confirm, q, openWallet, calls }) {
+/**
+ * A stand-in for public/wallets.js: the browser-side wallet store.
+ *
+ * It records what the app asks it to do, so a test can tell "the key was made in
+ * this browser" from "the key was made in this browser and never sent to the
+ * server" — which is the whole point of this design.
+ */
+function fakeStore(calls = {}) {
+  const log = [];
+  const push = (what, data) => { log.push(what); if (calls.on) calls.on(what, data); };
+  return {
+    PASS_MIN: 8,
+    supported: () => true,
+    list: () => (calls.wallets || []).map((w) => ({ id: w.id, label: w.label, address: w.address })),
+    record: (address) => ({ address, ciphertext: 'sealed' }) && (calls.here ? calls.here(address) : null),
+    create: async ({ label }) => { push('create', { label }); return { id: 'w_store_1', address: 'ADDR_ALPHA' }; },
+    seal: async (a) => { push('seal', a); return 'w_store_2'; },
+    unlock: async (address, pass) => {
+      push('unlock', { address, pass });
+      if (calls.passphrase && pass !== calls.passphrase) throw new Error('Wrong passphrase for this wallet');
+      return new Uint8Array(64).fill(7);
+    },
+    parseSecret: async (key) => { push('parseSecret', { key }); return { secretKey: new Uint8Array(64).fill(9), address: 'ADDR_IMPORTED' }; },
+    secretToBase58: (sk) => `SECRET_${sk[0]}`,
+    remove: (address) => { push('remove', { address }); return true; },
+    log,
+  };
+}
+
+function walletSaveHandler({ state, api, toast, confirm, q, openWallet, calls, store }) {
   const injected = {
     S: state,
     api,
@@ -213,12 +242,9 @@ function walletSaveHandler({ state, api, toast, confirm, q, openWallet, calls })
     closeModal: () => {},
     refreshAll: async () => {},
     renderAll: () => {},
-    openFund: () => {},
-    openWalletDetail: () => {},
     openWallet: (id) => { if (calls) calls.push({ p: `openWallet:${id}` }); },
     esc: (v) => String(v ?? ''),
-    isKeystoreUnlocked: () => keystoreStateOf(state).open,
-    keystoreState: () => keystoreStateOf(state),
+    walletStore: () => store || fakeStore(),
   };
   assertScopeIsHonest(injected, 'save handler');
   return build(saveHandlerSrc, injected);
@@ -244,68 +270,95 @@ async function test(name, fn) {
 (async () => {
   console.log('\nThe wallet form handler — executed, not just parsed\n');
 
-  await test('a locked keystore with an existing file is opened, THEN the wallet is created', async () => {
+  await test('creating a wallet makes the key IN THIS BROWSER and tells the server only the address', async () => {
     const calls = [];
-    const state = { editing: { isNew: true }, keystore: { initialised: true, unlocked: false }, wallets: [] };
+    const store = fakeStore();
+    const state = { editing: { isNew: true }, wallets: [] };
     const handler = walletSaveHandler({
       state,
-      api: async (p, o) => {
-        calls.push({ p, method: o && o.method });
-        if (p === '/api/status') return { keystore: { initialised: true, unlocked: true } };
-        return { ok: true, wallet: 'w_new' };
-      },
-      q: makeQ({ '#edName': 'Alpha', '#edPass': 'correct-horse', '#edKey': '' }),
+      store,
+      api: async (p, o) => { calls.push({ p, method: o && o.method, body: o && o.body }); return { ok: true, wallet: 'w_new' }; },
+      q: makeQ({ '#edName': 'Alpha', '#edPass': 'correct-horse', '#edKey': '', '#edPresetSel': 'balanced' }),
     });
 
     // A ReferenceError here is the bug that shipped twice, as `init is not
-    // defined` and then as `vaultExists is not defined`.
+    // defined` and then as `vaultExists is not defined`. Now the same shape of
+    // mistake would be `walletStore is not defined`.
     await handler();
 
+    assert.ok(store.log.includes('create'), 'the keypair is generated in the browser');
     const paths = calls.map((c) => c.p);
-    const openAt = paths.indexOf('/api/keystore/unlock');
-    const createAt = paths.indexOf('/api/wallets');
-    assert.ok(openAt !== -1, `the keystore must be opened first, saw ${paths.join(', ') || 'nothing'}`);
-    assert.ok(createAt !== -1, `the wallet must then be created, saw ${paths.join(', ')}`);
-    assert.ok(openAt < createAt, 'and in that order');
-    assert.strictEqual(calls[openAt].method, 'POST', 'opening it is a POST');
+    assert.ok(
+      !paths.some((p) => String(p).startsWith('/api/keystore')),
+      `the server keystore is not involved at all now, saw ${paths.join(', ')}`,
+    );
+
+    const reg = calls.find((c) => c.p === '/api/wallets');
+    assert.ok(reg, 'the wallet is registered with the server');
+    const body = JSON.parse(reg.body);
+    assert.strictEqual(body.address, 'ADDR_ALPHA', 'the server is told the ADDRESS');
+    assert.strictEqual(body.name, 'Alpha', 'and the name');
+    assert.ok(!/SECRET/.test(reg.body), 'and never the secret key');
+
+    const arm = calls.find((c) => /\/arm$/.test(c.p));
+    assert.ok(arm, 'then the key is handed over for this session');
+    assert.strictEqual(JSON.parse(arm.body).secretKey, 'SECRET_7', 'so the bot can sign');
   });
 
-  await test('a first run CREATES the keystore instead of trying to open one', async () => {
+  await test('a first run needs no keystore at all, and still creates a wallet', async () => {
     const calls = [];
     const state = { editing: { isNew: true }, keystore: undefined, wallets: [] };
     const handler = walletSaveHandler({
       state,
-      api: async (p, o) => {
-        calls.push({ p, method: o && o.method });
-        if (p === '/api/status') return { keystore: { initialised: true, unlocked: true } };
-        return { ok: true, wallet: 'w_new' };
-      },
-      q: makeQ({ '#edName': 'First', '#edPass': 'eightchr', '#edKey': '' }),
+      store: fakeStore(),
+      api: async (p, o) => { calls.push({ p, body: o && o.body }); return { ok: true, wallet: 'w_new' }; },
+      q: makeQ({ '#edName': 'First', '#edPass': 'eightchr', '#edKey': '', '#edPresetSel': 'balanced' }),
     });
 
     await handler();
 
     const paths = calls.map((c) => c.p);
-    assert.ok(paths.includes('/api/keystore/init'), `must create the keystore, saw ${paths.join(', ')}`);
-    assert.ok(!paths.includes('/api/keystore/unlock'), 'must not try to open a keystore that does not exist');
-    assert.ok(paths.includes('/api/wallets'), 'and then create the wallet');
+    assert.ok(!paths.includes('/api/keystore/init'), `nothing to initialise — saw ${paths.join(', ')}`);
+    assert.ok(paths.includes('/api/wallets'), 'the wallet itself is registered');
+    assert.ok(paths.some((p) => /\/arm$/.test(p)), 'and armed');
   });
 
   await test('an empty passphrase stops before any request', async () => {
     const calls = [];
     const toasts = [];
-    const state = { editing: { isNew: true }, keystore: { initialised: true, unlocked: false }, wallets: [] };
+    const store = fakeStore();
+    const state = { editing: { isNew: true }, wallets: [] };
+    const q = makeQ({ '#edName': 'Alpha', '#edPass': '', '#edKey': '' });
     const handler = walletSaveHandler({
-      state,
+      state, store,
       api: async (p) => { calls.push(p); return {}; },
       toast: (m) => toasts.push(m),
-      q: makeQ({ '#edName': 'Alpha', '#edPass': '', '#edKey': '' }),
+      q,
     });
 
     await handler();
 
     assert.strictEqual(calls.length, 0, 'nothing may be sent without a passphrase');
+    assert.ok(!store.log.includes('create'), 'and no key may be generated');
     assert.ok(toasts.some((t) => /passphrase/i.test(t)), 'the user must be told why');
+    assert.match(q('#edPassErr').innerHTML, /At least 8 characters/, 'and told the rule, next to the field');
+  });
+
+  await test('a passphrase that is too short is refused as well', async () => {
+    const calls = [];
+    const store = fakeStore();
+    const state = { editing: { isNew: true }, wallets: [] };
+    const handler = walletSaveHandler({
+      state, store,
+      api: async (p) => { calls.push(p); return {}; },
+      toast: () => {},
+      q: makeQ({ '#edName': 'Alpha', '#edPass': 'short12', '#edKey': '' }),
+    });
+
+    await handler();
+
+    assert.strictEqual(calls.length, 0, 'seven characters is not a passphrase here');
+    assert.ok(!store.log.includes('create'), 'and no key is generated');
   });
 
   await test('a missing name stops before any request', async () => {
@@ -325,50 +378,94 @@ async function test(name, fn) {
     assert.ok(toasts.some((t) => /name/i.test(t)), 'the user must be told why');
   });
 
-  await test('a wrong passphrase is reported, and no wallet is created', async () => {
+  await test('a wallet is NEVER created without its own passphrase, even with the keystore open', async () => {
     const calls = [];
-    const toasts = [];
-    const state = { editing: { isNew: true }, keystore: { initialised: true, unlocked: false }, wallets: [] };
-    const handler = walletSaveHandler({
-      state,
-      api: async (p) => {
-        calls.push(p);
-        if (p === '/api/keystore/unlock') throw new Error('Keystore unlock failed: wrong passphrase or the file has been tampered with.');
-        return {};
-      },
-      // The handler funnels failures into toast(err.message, 'err') rather than
-      // throwing at the caller — that is the app's existing error surface, so
-      // assert on what the user actually sees.
-      toast: (m, kind) => toasts.push({ m, kind }),
-      q: makeQ({ '#edName': 'Alpha', '#edPass': 'wrong', '#edKey': '' }),
-    });
-
-    await handler();
-
-    assert.ok(
-      toasts.some((t) => /wrong passphrase/i.test(t.m)),
-      `the reason must reach the user, saw: ${JSON.stringify(toasts)}`,
-    );
-    assert.ok(toasts.some((t) => t.kind === 'err'), 'and it must be shown as an error, not as success');
-    assert.ok(!calls.includes('/api/wallets'), 'no wallet may be created on a failed unlock');
-    assert.ok(!toasts.some((t) => /created/i.test(t.m)), 'and nothing may claim a wallet was created');
-  });
-
-  await test('an unlocked keystore creates the wallet with no passphrase', async () => {
-    const calls = [];
+    const store = fakeStore();
     const state = { editing: { isNew: true }, keystore: { initialised: true, unlocked: true }, wallets: [] };
     const handler = walletSaveHandler({
-      state,
-      api: async (p, o) => { calls.push({ p, body: o && o.body }); return { ok: true, wallet: 'w_new' }; },
+      state, store,
+      api: async (p) => { calls.push(p); return {}; },
+      toast: () => {},
       q: makeQ({ '#edName': 'Alpha', '#edPass': '', '#edKey': '' }),
     });
 
     await handler();
 
-    assert.deepStrictEqual(calls.map((c) => c.p), ['/api/wallets'], 'exactly one request');
-    const body = JSON.parse(calls[0].body);
-    assert.strictEqual(body.name, 'Alpha', 'the name is sent');
-    assert.strictEqual(body.secretKey, undefined, 'no key means a generated burner');
+    assert.strictEqual(calls.length, 0, 'the wallet is sealed with ITS passphrase — there is no session-wide shortcut');
+    assert.ok(!store.log.includes('create'), 'and nothing is generated');
+  });
+
+  await test('importing a key proves it owns the address before anything is sealed', async () => {
+    const calls = [];
+    const store = fakeStore();
+    const state = { editing: { isNew: true }, wallets: [] };
+    const handler = walletSaveHandler({
+      state, store,
+      api: async (p, o) => { calls.push({ p, body: o && o.body }); return { ok: true, wallet: 'w_new' }; },
+      q: makeQ({ '#edName': 'Imported', '#edPass': 'longenough1', '#edKey': 'BASE58KEY', '#edPresetSel': 'balanced' }),
+    });
+
+    await handler();
+
+    assert.ok(store.log.includes('parseSecret'), 'the pasted key is parsed and verified in the browser');
+    assert.ok(store.log.includes('seal'), 'and sealed there');
+    const reg = calls.find((c) => c.p === '/api/wallets');
+    const body = JSON.parse(reg.body);
+    assert.strictEqual(body.address, 'ADDR_IMPORTED', 'the address comes from the key itself');
+    assert.strictEqual(body.imported, true, 'and it is marked as an imported key');
+  });
+
+  await test('unlocking a wallet sends the key to the bot ONLY for the session', async () => {
+    const calls = [];
+    const store = fakeStore({ passphrase: 'rightpass1' });
+    const state = {
+      wallets: [{ id: 'w_1', name: 'Alpha', publicKey: 'ADDR_ALPHA' }],
+      positions: [], logs: [],
+    };
+    const toasts = [];
+    // extractFunction returns `(function name(...){…})`; the keyword inside has to
+    // become `async function` or its own `await` is a syntax error.
+    const unlock = build(extractFunction(src, 'unlockWallet').replace('(function', '(async function'), {
+      S: state,
+      walletStore: () => store,
+      keyHere: () => true,
+      api: async (p, o) => { calls.push({ p, body: o && o.body }); return { ok: true }; },
+      toast: (m, k) => toasts.push({ m, k }),
+      refreshAll: async () => {},
+      renderAll: () => {},
+    });
+
+    await unlock('w_1', 'rightpass1');
+    const arm = calls.find((c) => /\/arm$/.test(c.p));
+    assert.ok(arm, `the key is handed over for the session, saw ${JSON.stringify(calls)}`);
+    assert.strictEqual(JSON.parse(arm.body).secretKey, 'SECRET_7', 'as a base58 key the server can sign with');
+
+    // ...and a wrong passphrase never reaches the server at all.
+    calls.length = 0;
+    await unlock('w_1', 'wrongpass').catch(() => {});
+    assert.strictEqual(calls.length, 0, 'a key that will not unseal is never sent anywhere');
+    assert.ok(toasts.some((t) => /wrong passphrase/i.test(t.m)), `the reason reaches the user: ${JSON.stringify(toasts)}`);
+  });
+
+  await test('a wallet whose key is not in this browser cannot be "unlocked" — it is refused', async () => {
+    const calls = [];
+    const toasts = [];
+    const state = { wallets: [{ id: 'w_9', name: 'Ghost', publicKey: 'ADDR_GHOST' }], positions: [], logs: [] };
+    // extractFunction returns `(function name(...){…})`; the keyword inside has to
+    // become `async function` or its own `await` is a syntax error.
+    const unlock = build(extractFunction(src, 'unlockWallet').replace('(function', '(async function'), {
+      S: state,
+      walletStore: () => fakeStore(),
+      keyHere: () => false,
+      api: async (p) => { calls.push(p); return {}; },
+      toast: (m, k) => toasts.push({ m, k }),
+      refreshAll: async () => {},
+      renderAll: () => {},
+    });
+
+    await unlock('w_9', 'anything');
+    assert.strictEqual(calls.length, 0, 'nothing is sent');
+    assert.ok(toasts.some((t) => /import it/i.test(t.m)), `and the user is told the way back: ${JSON.stringify(toasts)}`);
   });
 
   await test('the test scope cannot be widened to hide a missing variable', () => {
@@ -384,87 +481,41 @@ async function test(name, fn) {
     assert.strictEqual(typeof scope, 'function', 'the handler must build with exactly these names');
     assert.deepStrictEqual(
       SAVE_HANDLER_SCOPE.slice().sort(),
-      ['S', 'api', 'toast', 'confirm', 'q', 'esc', 'closeModal', 'refreshAll', 'renderAll', 'openFund', 'openWalletDetail', 'isKeystoreUnlocked', 'keystoreState'].sort(),
+      ['S', 'api', 'toast', 'confirm', 'q', 'esc', 'closeModal', 'refreshAll', 'renderAll', 'openWallet', 'walletStore'].sort(),
       'the sanctioned name list changed — justify it in app.js first',
     );
   });
 
   console.log('\nThe wallets panel — executed, not just parsed\n');
 
-  await test('an empty panel with a locked keystore renders (this is the crash that shipped)', () => {
-    const { $, els } = makeDom();
-    const state = { wallets: [], keystore: { initialised: true, unlocked: false } };
-    const renderWallets = build(extractFunction(src, 'renderWallets'), {
-      $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
-      esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
-    });
-    assertScopeIsHonest({
-      $, S: state, keystoreState: () => {}, openKeystore: () => {}, esc: () => {}, fmtSol: () => {}, cls: () => {}, winRateOf: () => {},
-    }, 'renderWallets');
+  await test('an empty panel renders, whatever the server keystore is doing', () => {
+    // This test used to run four times, for four keystore states, because the
+    // empty panel branched on a server-side file. The wallets live in the BROWSER
+    // now, so there is one empty state and one truth — and the three-way branch
+    // that could render the wrong sentence cannot come back.
+    for (const keystore of [undefined, { initialised: true, unlocked: false }, { initialised: true, unlocked: true }]) {
+      const { $, els } = makeDom();
+      const state = { wallets: [], keystore };
+      const opened = [];
+      const renderWallets = build(extractFunction(src, 'renderWallets'), {
+        $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: (id) => opened.push(id),
+        keyHere: () => false,
+        esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
+      });
+      assertScopeIsHonest({
+        $, S: state, keystoreState: () => {}, openKeystore: () => {}, openWallet: () => {}, keyHere: () => {}, esc: () => {}, fmtSol: () => {}, cls: () => {}, winRateOf: () => {},
+      }, 'renderWallets');
 
-    renderWallets(); // threw `vaultExists is not defined` before the fix
+      renderWallets(); // threw `vaultExists is not defined` before the fix
 
-    const html = els['wallets'].innerHTML;
-    assert.match(html, /No wallet is missing/, 'an empty panel with a locked keystore must explain itself');
-    assert.match(html, /Create your first wallet/, 'and offer the one useful action');
-    assert.ok(!/vault/i.test(html), 'the user-facing name is keystore');
-  });
-
-  await test('an empty panel with no keystore at all renders as a first run', () => {
-    const { $, els } = makeDom();
-    const state = { wallets: [], keystore: undefined };
-    const opened = [];
-    const renderWallets = build(extractFunction(src, 'renderWallets'), {
-      $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: (id) => opened.push(id),
-      esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
-    });
-
-    renderWallets();
-
-    const html = els['wallets'].innerHTML;
-    assert.match(html, /Nothing here yet/, 'a first run must say there is nothing yet');
-    assert.match(html, /no wallets, and no passphrase set/, 'and say plainly that nothing exists yet');
-    assert.match(html, /Create your first wallet/, 'and offer to create one');
-    // The button must open the CREATE FORM, not the keystore modal — the user
-    // asked for this twice.
-    els['emptyCreate'].click();
-    assert.deepStrictEqual(opened, [null], 'the button opens the create form directly');
-  });
-
-  await test('an empty panel after a restart says nothing is missing, and still creates', () => {
-    const { $, els } = makeDom();
-    const state = { wallets: [], keystore: { initialised: true, unlocked: false } };
-    const opened = [];
-    let modals = 0;
-    const renderWallets = build(extractFunction(src, 'renderWallets'), {
-      $, S: state, keystoreState: () => keystoreStateOf(state),
-      openKeystore: () => { modals += 1; }, openWallet: (id) => opened.push(id),
-      esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
-    });
-
-    renderWallets();
-
-    const html = els['wallets'].innerHTML;
-    assert.match(html, /No wallet is missing/, 'a restart must not look like data loss');
-    els['emptyCreate'].click();
-    assert.strictEqual(modals, 0, 'and it must not put a keystore dialog in front of create');
-    assert.deepStrictEqual(opened, [null], 'it opens the create form');
-  });
-
-  await test('an empty panel with an open keystore is just "add a wallet"', () => {
-    const { $, els } = makeDom();
-    const state = { wallets: [], keystore: { initialised: true, unlocked: true } };
-    const renderWallets = build(extractFunction(src, 'renderWallets'), {
-      $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
-      esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
-    });
-
-    renderWallets();
-
-    const html = els['wallets'].innerHTML;
-    assert.match(html, /Add a wallet/, 'the plain empty state');
-    assert.ok(!/passphrase/i.test(html), 'no passphrase talk when none is needed');
-    assert.ok(!/No wallet is missing/.test(html), 'and none of the recovery language');
+      const html = els['wallets'].innerHTML;
+      assert.match(html, /No wallets yet/, 'an empty panel must say so');
+      assert.match(html, /created in this browser/i, 'and say where a wallet lives now');
+      assert.match(html, /Create your first wallet/, 'and offer the one useful action');
+      assert.ok(!/vault/i.test(html), 'the user-facing name is keystore, never vault');
+      els['emptyCreate'].click();
+      assert.deepStrictEqual(opened, [null], 'the button opens the create form directly, never a keystore dialog');
+    }
   });
 
   await test('a wallet list renders a card per wallet with its own controls', () => {
@@ -519,7 +570,10 @@ async function test(name, fn) {
 
   console.log('\nThe create-wallet form the user actually sees\n');
 
-  await test('the form shows a passphrase field when the keystore is closed', () => {
+  await test('the create form always asks for THIS wallet\'s passphrase — one per wallet', () => {
+    // The passphrase no longer opens a shared server file; it seals this wallet's
+    // key in this browser. So it is asked for every time, in the form itself, and
+    // never described as something that already exists somewhere else.
     const captured = [];
     const state = {
       wallets: [], editing: null, keystore: { initialised: true, unlocked: false },
@@ -542,54 +596,10 @@ async function test(name, fn) {
     assert.match(html, /id="edPass"/, 'the passphrase field must be in the form itself');
     assert.match(html, /id="edSave"/, 'and the save button');
     assert.match(html, /Create wallet/, 'which says Create wallet');
-    assert.match(html, /passphrase you chose when you created your first wallet/i,
-      'the label must say WHICH passphrase is wanted');
-    assert.match(html, /keystore/i, 'and name the file it belongs to');
-    assert.match(html, /not a password for this new wallet/i,
-      'and say out loud that it is not this wallet\'s own password');
+    assert.match(html, /this wallet/i, 'the label must name the wallet it protects');
+    assert.match(html, /in this browser/i, 'and say where the key is created and kept');
+    assert.match(html, /There is no recovery/i, 'and that this passphrase is the only way back');
     assert.ok(!/vault/i.test(html), 'never "vault"');
-    assert.ok(!/unlock/i.test(html), 'and never tells anyone to unlock a wallet');
-  });
-
-  await test('the form asks a first-time user to CHOOSE a passphrase', () => {
-    const captured = [];
-    const state = { wallets: [], editing: null, keystore: undefined, config: {}, positions: [] };
-    const openWallet = buildWith(extractFunction(src, 'openWallet'), {
-      S: state,
-      keystoreState: () => keystoreStateOf(state),
-      openModal: (html) => captured.push(html),
-      esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '',
-      renderEditorPanes: () => {}, wireEditor: () => {}, toast: () => {}, q: makeQ({}),
-      isKeystoreUnlocked: () => false,
-      DEMO_PRESETS: { balanced: { label: 'Balanced', description: 'steady' } },
-    }, ['defaultCfg', 'withDefaultCfg']);
-
-    openWallet(null);
-
-    const html = captured[0];
-    assert.match(html, /Choose a passphrase/, 'a first run is told to choose one');
-    assert.match(html, /id="edPass"/, 'in the form itself');
-    assert.ok(!/Keystore passphrase/.test(html), 'not told to produce one that exists');
-  });
-
-  await test('an unlocked session needs no passphrase in the form at all', () => {
-    const captured = [];
-    const state = { wallets: [], editing: null, keystore: { initialised: true, unlocked: true }, config: {}, positions: [] };
-    const openWallet = buildWith(extractFunction(src, 'openWallet'), {
-      S: state,
-      keystoreState: () => keystoreStateOf(state),
-      openModal: (html) => captured.push(html),
-      esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '',
-      renderEditorPanes: () => {}, wireEditor: () => {}, toast: () => {}, q: makeQ({}),
-      isKeystoreUnlocked: () => true,
-      DEMO_PRESETS: { balanced: { label: 'Balanced', description: 'steady' } },
-    }, ['defaultCfg', 'withDefaultCfg']);
-
-    openWallet(null);
-
-    const html = captured[0];
-    assert.ok(!/id="edPass"/.test(html), 'no passphrase field when none is needed');
-    assert.match(html, /Create wallet/, 'but the same Create wallet button');
   });
 
   console.log('\nA wallet whose key is not loaded — visible, not missing\n');
@@ -606,6 +616,7 @@ async function test(name, fn) {
     };
     const renderWallets = build(extractFunction(src, 'renderWallets'), {
       $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
+      keyHere: () => true,
       esc: (v) => String(v ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
     });
 
@@ -614,9 +625,12 @@ async function test(name, fn) {
     const html = els['wallets'].innerHTML;
     assert.match(html, /Alpha/, 'the wallet is named, not hidden');
     assert.match(html, /6AQbPqPtB7ez/, 'and its on-chain address is shown');
-    assert.match(html, /key locked/i, 'and it says why it cannot trade');
-    assert.match(html, /This wallet is not lost/i, 'and that nothing has been lost');
-    assert.match(html, /data-keystore/, 'and offers the one action that fixes it');
+    assert.match(html, /locked/i, 'and it says why it cannot trade');
+    assert.match(html, /sealed in this browser/i, 'and where its key is');
+    // THE FIX: a locked card must carry the control that unlocks it. It used to
+    // say "locked" and offer nothing at all.
+    assert.match(html, /id="armpass-w_1"/, 'a passphrase field, on the card');
+    assert.match(html, /data-arm="w_1"/, 'and an Unlock button that arms it');
     assert.ok(!/data-close=/.test(html), 'it must not offer to kill a wallet it cannot reach');
     assert.ok(!/data-withdraw=/.test(html), 'nor to withdraw from it');
   });
@@ -633,25 +647,27 @@ async function test(name, fn) {
     };
     const renderWallets = build(extractFunction(src, 'renderWallets'), {
       $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
+      keyHere: () => false,
       esc: (v) => String(v ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
     });
 
     renderWallets();
 
     const html = els['wallets'].innerHTML;
-    assert.match(html, /not in it|not in your keystore/i, 'it must say the key is not in the keystore');
+    assert.match(html, /No key for this wallet is stored here/i, 'it must say the key is not on this device');
     assert.match(html, /stays on chain/i, 'and that funds are unaffected');
-    assert.match(html, /data-delrecord/, 'and offer to delete the record');
-    assert.ok(!/data-keystore/.test(html), 'opening the keystore cannot help here, so it must not be offered');
+    assert.match(html, /data-importhere/, 'and offer the one action that can bring it back');
+    assert.match(html, /data-delrecord/, 'and to delete the record');
+    assert.ok(!/id="armpass-/.test(html), 'a field to type a passphrase would be a lie: there is nothing here to open');
   });
 
-  await test('the banner counts only the wallets a keystore can still recover', () => {
+  await test('the banner names the locked wallets and points at their own cards', () => {
     const { $ } = makeDom();
     const state = {
       wallets: [
-        { id: 'a', name: 'A', keyLocked: true, config: {}, stats: {} },
-        { id: 'b', name: 'B', keyLocked: true, keyMissing: true, config: {}, stats: {} },
-        { id: 'c', name: 'C', config: {}, stats: {} },
+        { id: 'a', name: 'A', publicKey: 'ADDR_A', keyLocked: true, config: {}, stats: {} },
+        { id: 'b', name: 'B', publicKey: 'ADDR_B', keyLocked: true, keyMissing: true, config: {}, stats: {} },
+        { id: 'c', name: 'C', publicKey: 'ADDR_C', config: {}, stats: {} },
       ],
       keystore: { initialised: true, unlocked: false },
       status: { dryRun: true },
@@ -659,18 +675,18 @@ async function test(name, fn) {
     const notices = [];
     const renderNotices = build(extractFunction(src, 'renderNotices'), {
       $: (sel) => ({ ...makeElement(), set innerHTML(v) { notices.push(v); }, querySelector: () => null }),
-      S: state, esc: (v) => String(v ?? ''), openKeystore: () => {},
+      S: state, esc: (v) => String(v ?? ''), openKeystore: () => {}, keyHere: (a) => a === 'ADDR_A',
     });
 
     renderNotices();
 
     const html = notices.join('');
     // Shorter copy (round 9: "I don't need a long note to understand what a
-    // feature does"), same two facts: HOW MANY are locked, and that opening the
-    // keystore is the fix. The "not lost" reassurance lives on the wallet card,
-    // where the user is actually looking when they wonder about one wallet.
-    assert.match(html, /1 wallet is locked/, 'one recoverable wallet, not two');
-    assert.match(html, /keystore locks on every restart/i, 'and say why it is locked at all');
+    // feature does"), and the same two facts as before: HOW MANY are locked, and
+    // where the fix is. The fix moved from a shared server file to each wallet's
+    // own card, so the banner points there instead of at the keystore modal.
+    assert.match(html, /2 wallets are locked/, 'both keyless wallets, named by count');
+    assert.match(html, /card below/i, 'and where to unlock them');
     // Measure the LOCKED banner alone — the strip may legitimately carry other
     // one-line notices beside it.
     // The strip renders as one block, so pick out the LOCKED banner itself — the
@@ -680,8 +696,7 @@ async function test(name, fn) {
       .filter((piece) => /wallet is locked|wallets are locked/.test(piece))
       .join('');
     const bannerText = lockedHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-    assert.ok(bannerText.length < 130, `the locked-wallet banner reads ${bannerText.length} characters — too long for a note`);
-    assert.match(html, /data-keystore/, 'with a button to open the keystore');
+    assert.ok(bannerText.length < 160, `the locked-wallet banner reads ${bannerText.length} characters — too long for a note`);
   });
 
   await test('the reset flow demands the confirm word and the new passphrase', async () => {

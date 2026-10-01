@@ -180,7 +180,55 @@ const candidate = (n) => ({
     });
   });
 
-  await test('the row is broadcast so the dashboard can patch it live', () => {
+  await test('dev hold, liquidity and RISK arrive for a launch NO wallet evaluated', () => {
+  // Reported from the live app, with a screenshot: the scanner table showed
+  // "—" in DEV HOLD and RISK. Both numbers used to be produced only as a side
+  // effect of an armed wallet running its filters, so a launch seen while every
+  // wallet was stopped — or one rejected before the distribution check — left the
+  // columns empty. token:recon is read for the launch itself.
+  const feed = new LiveFeed().attach();
+  const mint = 'ReconOnlyMint111111111111111111111111111111';
+  bus.safeEmit('token:detected', { mint, symbol: 'RCN', detectedAt: Date.now() });
+
+  bus.safeEmit('token:recon', {
+    candidate: { mint },
+    report: {
+      liquiditySol: 2.4,
+      devHoldPct: 7.25,
+      top10Pct: 18.5,
+      honeypot: { risk: 25, notes: ['mint_authority_live'], pass: true },
+    },
+  });
+
+  const row = feed.snapshot().find((r) => r.mint === mint);
+  assert.ok(row, 'the row exists');
+  assert.strictEqual(row.devHoldPct, 7.25, 'dev hold comes from the recon pass');
+  assert.strictEqual(row.liquiditySol, 2.4, 'and so does liquidity');
+  assert.strictEqual(row.riskScore, 25, 'and the risk score');
+  assert.deepStrictEqual(row.riskNotes, ['mint_authority_live']);
+  // It is a fact read, not a verdict: the row must not claim a wallet decided.
+  assert.strictEqual(row.decision, 'checking', 'no wallet has decided anything');
+  assert.strictEqual(row.wallets.length, 0, 'and no wallet is credited with a verdict');
+});
+
+test('recon never erases a number a wallet already measured', () => {
+  const feed = new LiveFeed().attach();
+  const mint = 'ReconKeepsMint1111111111111111111111111111';
+  bus.safeEmit('token:detected', { mint, symbol: 'KEEP', detectedAt: Date.now() });
+  bus.safeEmit('token:analyzed', {
+    candidate: { mint }, wallet: 'Alpha', ok: true, reasons: [],
+    report: { liquiditySol: 9.9, devHoldPct: 3.3, honeypot: { risk: 60, notes: ['freeze_authority_live'] } },
+  });
+  // A later, shallower recon (curve unreachable) must not blank the columns.
+  bus.safeEmit('token:recon', { candidate: { mint }, report: { liquiditySol: null, devHoldPct: null, honeypot: null } });
+
+  const row = feed.snapshot().find((r) => r.mint === mint);
+  assert.strictEqual(row.liquiditySol, 9.9);
+  assert.strictEqual(row.devHoldPct, 3.3);
+  assert.strictEqual(row.riskScore, 60, 'the highest risk seen still wins');
+});
+
+test('the row is broadcast so the dashboard can patch it live', () => {
     const seen = [];
     const h = (row) => seen.push(row.mint);
     bus.on('scan:update', h);

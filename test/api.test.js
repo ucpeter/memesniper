@@ -36,6 +36,8 @@ process.env.DATA_DIR = TMP;
 process.env.SESSION_TOKEN = 'test-session-token';
 process.env.DRY_RUN = 'true';
 
+const { Keypair } = require('@solana/web3.js');
+const bs58 = require('bs58');
 const cfg = require('../src/config');
 const keystore = require('../src/wallets/keystore');
 const Engine = require('../src/engine/engine');
@@ -83,6 +85,8 @@ const { server } = createServer(engine, {
 });
 
 let PORT = 0;
+const get = (url) => api('GET', url);
+const post = (url, body) => api('POST', url, body);
 const api = async (method, url, body) => {
   const res = await fetch(`http://127.0.0.1:${PORT}${url}`, {
     method,
@@ -264,6 +268,111 @@ const api = async (method, url, body) => {
     assert.ok(snapshot.scanFeed.length >= 1, 'and carry the rows already scanned');
     assert.ok(snapshot.scan, 'with the feed tally beside it');
   });
+
+  /* ──────────────── the browser-held wallet, through the API ─────────── */
+
+  console.log('\nThe wallet the browser holds — register, arm, lock\n');
+
+  /* The stubbed keystore above answers "yes" to everything — `has()` is true for
+   * wallets that have no key at all. That is precisely what this model does NOT
+   * do, so these tests run against the real module's answers: a wallet exists
+   * server-side with no key, and one arrives only when it is armed. */
+  const STUBBED_KEYSTORE = { has: keystore.has, getKeypair: keystore.getKeypair, isUnlocked: keystore.isUnlocked };
+  keystore.has = REAL_KEYSTORE.has;
+  keystore.getKeypair = REAL_KEYSTORE.getKeypair;
+  keystore.isUnlocked = REAL_KEYSTORE.isUnlocked;
+
+  await test('a wallet generated in the BROWSER is registered without any server keystore', async () => {
+    // This is the fix for "the wallet just abruptly deleted itself": the key is
+    // made in the browser, only the address is registered here, and nothing about
+    // it depends on the server's disk surviving.
+    const paired = Keypair.generate();
+    const address = paired.publicKey.toBase58();
+    const res = await post('/api/wallets', { name: 'Browser Alpha', address });
+    assert.strictEqual(res.status, 201, `expected 201, got ${res.status}: ${JSON.stringify(res.body)}`);
+    assert.strictEqual(res.body.publicKey, address, 'the address is what comes back');
+    assert.strictEqual(res.body.keyHolder, 'browser', 'and it is recorded as browser-held');
+
+    const list = await get('/api/wallets');
+    const found = list.body.find((w) => w.publicKey === address);
+    assert.ok(found, 'the wallet is listed');
+    assert.strictEqual(found.keyArmed, false, 'but NOT armed — no key has been handed over');
+    assert.strictEqual(found.enabled, false, 'and it is not trading');
+  });
+
+  await test('re-registering the same address returns the SAME wallet, not a duplicate', async () => {
+    const paired = Keypair.generate();
+    const address = paired.publicKey.toBase58();
+    const first = await post('/api/wallets', { name: 'Twice', address });
+    const again = await post('/api/wallets', { name: 'Twice', address });
+    assert.strictEqual(again.status, 200, 'the second call is not a create');
+    assert.strictEqual(again.body.wallet, first.body.wallet, 'same wallet id — the card comes back as itself');
+    const list = await get('/api/wallets');
+    assert.strictEqual(list.body.filter((w) => w.publicKey === address).length, 1, 'one card for one address');
+  });
+
+  await test('a key that belongs to a DIFFERENT address is refused, not armed', async () => {
+    const paired = Keypair.generate();
+    const other = Keypair.generate();
+    const created = await post('/api/wallets', { name: 'Mismatch', address: paired.publicKey.toBase58() });
+    const b58 = (bs58.default ? bs58.default : bs58).encode(other.secretKey);
+    const res = await post(`/api/wallets/${created.body.wallet}/arm`, { secretKey: b58 });
+    assert.strictEqual(res.status, 400, 'a key that does not match the address must not arm the wallet');
+    assert.strictEqual(res.body.error, 'cannot_arm', `got ${JSON.stringify(res.body)}`);
+    const list = await get('/api/wallets');
+    const w = list.body.find((x) => x.id === created.body.wallet);
+    assert.strictEqual(w.keyArmed, false, 'and the wallet is still not armed');
+  });
+
+  await test('arming a wallet loads its key for the session, and the key is never written to disk', async () => {
+    const paired = Keypair.generate();
+    const address = paired.publicKey.toBase58();
+    const created = await post('/api/wallets', { name: 'Armed', address });
+    const id = created.body.wallet;
+    const b58 = (bs58.default ? bs58.default : bs58).encode(paired.secretKey);
+
+    const armRes = await post(`/api/wallets/${id}/arm`, { secretKey: b58 });
+    assert.strictEqual(armRes.status, 200, `arm failed: ${JSON.stringify(armRes.body)}`);
+    assert.strictEqual(armRes.body.armed, true);
+    assert.strictEqual(armRes.body.keyArmed, true, 'and it says so with the same word the list uses');
+
+    const list = await get('/api/wallets');
+    const w = list.body.find((x) => x.id === id);
+    assert.ok(w, 'the wallet is now a live trader, not a locked record');
+    assert.strictEqual(w.keyArmed, true, 'and the API says it is armed');
+
+    // The whole point: the key is in MEMORY. Nothing anywhere under DATA_DIR may
+    // contain it — not the config, not any keystore file.
+    const files = fs.readdirSync(TMP);
+    for (const f of files) {
+      const body = fs.readFileSync(path.join(TMP, f), 'utf8');
+      assert.ok(!body.includes(b58), `${f} contains the private key — it must never be written to disk`);
+    }
+  });
+
+  await test('locking a wallet drops its key and stops it trading', async () => {
+    const paired = Keypair.generate();
+    const created = await post('/api/wallets', { name: 'ToLock', address: paired.publicKey.toBase58() });
+    const id = created.body.wallet;
+    await post(`/api/wallets/${id}/arm`, { secretKey: (bs58.default ? bs58.default : bs58).encode(paired.secretKey) });
+    await post(`/api/wallets/${id}/start`, {});
+
+    const locked = await post(`/api/wallets/${id}/lock`, {});
+    assert.strictEqual(locked.body.armed, false);
+    assert.strictEqual(locked.body.keyArmed, false, 'no key is held any more');
+
+    const list = await get('/api/wallets');
+    const w = list.body.find((x) => x.id === id);
+    assert.strictEqual(w.keyLocked, true, 'the wallet is back to a locked card');
+    assert.notStrictEqual(w.keyMissing, true, 'and it is NOT reported as gone — its key is simply not loaded here');
+
+    const start = await post(`/api/wallets/${id}/start`, {});
+    assert.strictEqual(start.status, 400, 'starting a locked wallet is refused');
+    assert.strictEqual(start.body.error, 'wallet_not_armed', `got ${JSON.stringify(start.body)}`);
+    assert.match(String(start.body.hint || ''), /unlock/i, 'with a hint in the user\'s words');
+  });
+
+  Object.assign(keystore, { has: STUBBED_KEYSTORE.has, getKeypair: STUBBED_KEYSTORE.getKeypair, isUnlocked: STUBBED_KEYSTORE.isUnlocked });
 
   /* ───────────────────────────────────────────────────────────────────── */
 

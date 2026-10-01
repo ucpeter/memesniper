@@ -43,6 +43,38 @@ const api = fn(
   () => null, noop, noop, noop, noop, noop,
 );
 
+/**
+ * The real browser wallet store, with a memory localStorage.
+ *
+ * The simulator tests exercise the create flow, and the create flow now runs
+ * through public/wallets.js — the same module the browser loads. Stubbing it here
+ * would let the preview pass while the real dashboard could not create a wallet.
+ */
+const WalletStore = require('../public/wallets.js');
+{
+  const mem = new Map();
+  global.localStorage = {
+    getItem: (k) => (mem.has(k) ? mem.get(k) : null),
+    setItem: (k, v) => mem.set(k, String(v)),
+    removeItem: (k) => mem.delete(k),
+  };
+}
+
+/** A named top-level function from app.js, as a callable source string. */
+function extractFn(name) {
+  const i = src.indexOf(`function ${name}(`);
+  if (i === -1) throw new Error(`no ${name}() in app.js`);
+  let depth = 0;
+  for (let j = src.indexOf('{', i); j < src.length; j += 1) {
+    if (src[j] === '{') depth += 1;
+    else if (src[j] === '}') {
+      depth -= 1;
+      if (depth === 0) return src.slice(i, j + 1);
+    }
+  }
+  throw new Error(`unbalanced braces in ${name}()`);
+}
+
 (async () => {
   const w = { id:'w1', name:'Alpha', enabled:true, balanceSol:4.82, exposureSol:0.4, publicKey:'DEMO-Alpha',
     stats:{ realisedPnlSol:2.41, wins:9, losses:5, tradesToday:14, paused:false },
@@ -129,6 +161,34 @@ const api = fn(
       eq(p.simulated, true, 'and the position must be tagged simulated, so it is never mistaken for a real fill');
       if (!p.demoTargetPct) throw new Error('a paper position needs a target, or it can only ever stop out');
       eq(probe.openPositions.length, S.positions.length, 'the wallet and the board agree');
+    } finally {
+      Math.random = realRandom;
+      S.wallets = savedWallets;
+      S.positions = savedPositions;
+    }
+  });
+
+  await t('a paper trade survives a wallet row that arrives without its position list', async () => {
+    // The heartbeat used to die here: `w.openPositions.push(p)` on a row that had
+    // no such array threw a TypeError, which the browser printed to a console
+    // nobody was reading — so the preview looked like it had stopped trading. A row
+    // can legitimately arrive that way (a wallet re-registered from the browser
+    // carries its name and address and nothing else yet).
+    const realRandom = Math.random;
+    const savedWallets = S.wallets.slice();
+    const savedPositions = S.positions;
+    Math.random = () => 0.9;
+    try {
+      const probe = api.demoNewWallet('Bare', 'balanced');
+      probe.enabled = true; probe.armed = true; probe.stats.paused = false;
+      delete probe.openPositions;
+      S.wallets = [probe];
+      S.positions = [];
+
+      for (let i = 0; i < 3; i += 1) api.demoTickLaunches();
+      eq(Array.isArray(probe.openPositions), true, 'the tick must repair the row, not throw');
+      eq(probe.openPositions.length, S.positions.length, 'and the paper trade must be on both the wallet and the board');
+      eq(S.positions[0].simulated, true, 'still tagged as simulated');
     } finally {
       Math.random = realRandom;
       S.wallets = savedWallets;
@@ -247,19 +307,24 @@ const api = fn(
     }
   });
 
-  await t('the create-wallet flow cannot silently skip the passphrase', () => {
+  await t('the create-wallet flow cannot skip the passphrase, or the sealing', () => {
     const i = src.indexOf("const name = q('#edName').value.trim();");
     if (i === -1) throw new Error('create handler not found');
-    const handler = src.slice(i, i + 2000);
-    if (!/if \(!isKeystoreUnlocked\(\)\)/.test(handler)) {
-      throw new Error('the create handler does not check/repair lock state');
+    const handler = src.slice(i, i + 5000);
+    if (!/pass\.length < store\.PASS_MIN/.test(handler)) {
+      throw new Error('the create handler does not enforce this wallet\'s passphrase');
     }
-    if (!/if \(!pass\) \{/.test(handler)) {
-      throw new Error('no empty-passphrase guard in the handler');
+    if (!/store\.create\(|store\.seal\(/.test(handler)) {
+      throw new Error('the key is not generated/sealed in the browser');
     }
-    if (!/Choose a passphrase to protect your wallet keys/.test(handler)
-        && !/Enter your keystore passphrase/.test(handler)) {
-      throw new Error('no guidance when the passphrase is empty');
+    if (!/\/api\/wallets\/\$\{created\.wallet\}\/arm/.test(handler)) {
+      throw new Error('the wallet is created but never armed, so it cannot trade');
+    }
+    if (/secretKey: pass\b|secretKey: body\.secretKey/.test(handler)) {
+      throw new Error('the passphrase is being posted as if it were the key');
+    }
+    if (!/At least \$\{store\.PASS_MIN\} characters/.test(src)) {
+      throw new Error('no guidance next to the field when the passphrase is too short');
     }
   });
 
@@ -326,44 +391,38 @@ const api = fn(
     }
   });
 
-  await t('the passphrase block distinguishes "nothing yet" from "closed after a restart"', () => {
-    // The two questions are answered in ONE place, by a function, because a local
-    // variable cannot be seen by the handler that lives in another function —
-    // that mistake has now shipped twice as `x is not defined`.
+  await t('the create form asks for THIS wallet\'s passphrase, every time', () => {
+    // One passphrase per wallet, sealing one key in one browser. There is no
+    // session-wide shortcut any more, so the field is unconditional — an
+    // "already open" branch is exactly how it went missing on a first run before.
     if (!/function keystoreState\(\)/.test(src)) throw new Error('the keystore-state accessor is gone');
     if (/vaultExists|vaultLocked|vaultIsNew/.test(src)) {
       throw new Error('a keystore-state local is back — only keystoreState() may answer this');
     }
-    // First run says "Choose a passphrase"; a returning session says "Keystore
-    // passphrase". One label cannot serve both.
-    if (!/'Choose a passphrase'/.test(src)) throw new Error('no label for a first-time user');
-    if (!/'Keystore passphrase'/.test(src)) throw new Error('no label for a returning user');
-    // The field must appear whenever the keystore is not open — which includes a
-    // first run. `ks.locked` alone excluded it, and a brand-new user could not
-    // create their first wallet at all.
-    if (!/\$\{!ks\.open \? `/.test(src)) throw new Error('the passphrase field is hidden on a first run again');
-    // The form must be able to create the keystore itself, in the same step.
-    if (!/ksIsNew \? '\/api\/keystore\/init' : '\/api\/keystore\/unlock'/.test(src)) {
-      throw new Error('the form cannot create the keystore it depends on');
+    if (!/id="edPass"/.test(src)) throw new Error('the passphrase field is gone from the create form');
+    if (!/Choose a passphrase for <b>this wallet<\/b>/.test(src)) {
+      throw new Error('the label no longer says whose passphrase it wants');
     }
-    // And the button must not narrate keystore mechanics.
+    if (!/created <b>in this browser<\/b>/.test(src)) {
+      throw new Error('the form does not say where the key is made and kept');
+    }
     if (!/id="edSave">\$\{isNew \? 'Create wallet' : 'Save changes'\}/.test(src)) {
       throw new Error('the create button no longer simply says Create wallet');
     }
   });
 
-  await t('the empty wallets panel covers all three states, and never says "unlock"', () => {
-    if (!/Nothing here yet — no wallets, and no passphrase set/.test(src)) {
+  await t('the empty wallets panel says where a wallet lives, and never says "unlock"', () => {
+    if (!/No wallets yet/.test(src)) {
       throw new Error('no first-run wording for the empty panel');
     }
-    if (!/The keystore locks on every restart/.test(src)) {
-      throw new Error('the empty panel no longer says why a passphrase is being asked for');
+    if (!/created in this browser/i.test(src)) {
+      throw new Error('the empty panel does not say where a wallet is created');
     }
-    if (!/No wallet is missing/.test(src)) {
-      throw new Error('the restart case does not reassure that no wallet is missing');
+    if (!/sealed here under its own passphrase/.test(src)) {
+      throw new Error('the empty panel does not say how the key is protected');
     }
-    if (!/Add a wallet to give it its own strategy/.test(src)) {
-      throw new Error('the ordinary empty state is gone');
+    if (!/cannot be lost when the server restarts/.test(src)) {
+      throw new Error('the empty panel does not say what this design is FOR');
     }
     // One button, and it must open the CREATE FORM. It used to open the keystore
     // modal, which is a wall in front of "create" — the exact thing the user
@@ -422,9 +481,54 @@ const api = fn(
     eq(list[0].balanceSol, null, 'and with no invented balance');
     eq(Boolean(list[0].publicKey), true, 'and its address, which is what makes it identifiable');
 
-    await api.demoApi('/api/keystore/unlock', { method: 'POST', body: JSON.stringify({ passphrase: 'preview-pass' }) });
+    // Unlocking the keystore is no longer what brings a wallet back — arming it
+    // is. (The keystore only ever held SERVER-side keys; the wallet's own key is
+    // sealed in the browser and is loaded one wallet at a time.)
+    await api.demoApi(`/api/wallets/${list[0].id}/arm`, { method: 'POST', body: JSON.stringify({ secretKey: 'demo' }) });
     const back = await api.demoApi('/api/wallets');
-    eq(back[0].keyLocked, undefined, 'and the flag is gone once the keystore is open');
+    eq(back[0].keyLocked, undefined, 'and the flag is gone once the wallet is armed');
+    eq(back[0].keyArmed, true, 'because this session holds its key again');
+  });
+
+  await t('a wallet survives the SERVER being wiped — it is re-registered from this browser', async () => {
+    // THE BUG, in one test: on a hosted deploy the server's disk is rebuilt, and
+    // the old build kept the wallets there, so they ceased to exist. The wallets
+    // live in the browser now, and the dashboard puts them back on the server.
+    const calls = [];
+    const store = {
+      supported: () => true,
+      list: () => ([{ id: 'w_store_1', label: 'Alpha', address: 'ADDR_ALPHA' }]),
+    };
+    const state = {
+      wallets: [], positions: [], logs: [],
+      status: { running: true, dryRun: true, stats: {} },
+      keystore: { initialised: true, unlocked: false },
+      config: {},
+    };
+    const syncBrowserWallets = new Function(
+      'S', 'api', 'toast', 'walletStore',
+      `return (async ${extractFn('syncBrowserWallets')});`,
+    )(
+      state,
+      async (p, o) => { calls.push({ p, body: o && o.body }); return { ok: true, wallet: 'w_new' }; },
+      () => {},
+      () => store,
+    );
+
+    const added = await syncBrowserWallets();
+    eq(added, 1, 'the forgotten wallet is re-registered');
+    eq(calls.length, 1, 'with one request');
+    eq(calls[0].p, '/api/wallets', 'to the wallet route');
+    const body = JSON.parse(calls[0].body);
+    eq(body.address, 'ADDR_ALPHA', 'carrying the address the browser holds');
+    eq(body.name, 'Alpha', 'and its name');
+    eq(/SECRET|key/i.test(calls[0].body), false, 'and NEVER its key — that stays sealed here');
+
+    // Already-known wallets are left alone: no duplicate cards on every page load.
+    state.wallets = [{ id: 'w_x', publicKey: 'ADDR_ALPHA' }];
+    calls.length = 0;
+    eq(await syncBrowserWallets(), 0, 'a wallet the server already knows is not re-sent');
+    eq(calls.length, 0, 'and no request is made at all');
   });
 
   await t('the preview can start over with a fresh keystore, and refuses a bare call', async () => {
@@ -451,21 +555,25 @@ const api = fn(
     S.keystore = undefined;
   });
 
-  await t("the create form says out loud that the passphrase is not the new wallet's", () => {
-    // Round 9 shortened this line; the FACT it exists to prevent is unchanged —
-    // someone reading "passphrase" while creating a wallet and thinking it is
-    // that wallet's own password.
-    if (!/not a password for this new wallet/i.test(src)) {
-      throw new Error('the form must rule out the wrong reading of the passphrase field');
+  await t('the create form says out loud that this passphrase seals THIS wallet in THIS browser', () => {
+    // The user's own words, twice: "build and configure the wallet the way it is
+    // done in the repo project". In the repo the key is generated in the browser,
+    // sealed with its own passphrase, and never sent to the server at creation —
+    // so the form has to say exactly that, and say there is no recovery.
+    if (!/sealed here with this passphrase/i.test(src)) {
+      throw new Error('the form does not say what the passphrase does');
     }
-    if (!/One passphrase, one <b>keystore<\/b> file, for every wallet/i.test(src)) {
-      throw new Error('and say that there is one passphrase for all wallets');
+    if (!/not sent anywhere/i.test(src)) {
+      throw new Error('the form does not say the key stays in this browser');
+    }
+    if (!/Each wallet has its own/.test(src)) {
+      throw new Error('the form does not say one passphrase per wallet');
+    }
+    if (!/There is no recovery/i.test(src)) {
+      throw new Error('the form must say the passphrase is the only way back');
     }
     if (!/id="edPassErr"/.test(src)) {
-      throw new Error('the wrong-passphrase error needs somewhere to appear next to the field');
-    }
-    if (!/Forgot your passphrase\?/.test(src)) {
-      throw new Error('a forgotten passphrase must have a way out');
+      throw new Error('a rejected passphrase needs somewhere to appear next to the field');
     }
   });
 
@@ -530,13 +638,14 @@ const api = fn(
   });
 
   await t('an empty passphrase is caught before any request is made', () => {
-    // The form guards on this itself; the simulator would reject it too.
-    const pass = '';
-    if (pass) throw new Error('unreachable');
-    // Assert the guard exists in the source rather than faking a request.
-    if (!/if \(!pass\) \{/.test(src)) throw new Error('no empty-passphrase guard in the form');
-    if (!/Choose a passphrase to protect your wallet keys/.test(src)) throw new Error('no first-time guidance');
-    if (!/Enter your keystore passphrase/.test(src)) throw new Error('no returning-user guidance');
+    // The form guards on this itself; the store would reject it too.
+    if (!/pass\.length < store\.PASS_MIN/.test(src)) throw new Error('no empty-passphrase guard in the form');
+    if (!/Choose a passphrase of at least \$\{store\.PASS_MIN\} characters/.test(src)) {
+      throw new Error('the user is not told the rule when they leave it empty');
+    }
+    if (!/At least \$\{store\.PASS_MIN\} characters\./.test(src)) {
+      throw new Error('the inline error does not state the minimum');
+    }
   });
 
 

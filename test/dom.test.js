@@ -192,26 +192,22 @@ async function click(window, el) {
   });
 
   await test('the add-wallet control opens the create form, not a keystore wall', async () => {
-    // Keystore OPEN: the form still opens, and asks for no passphrase, because
-    // none is needed. (The locked case is the next test.)
-    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    // Whatever the server keystore is doing. Its passphrase is no longer what
+    // creating a wallet needs — the wallet's own passphrase seals its key in THIS
+    // browser — so the field is there either way, and nothing asks anyone to
+    // unlock a keystore first.
+    for (const keystoreUnlocked of [true, false]) {
+      const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked });
 
-    await click(window, $('#btnAdd'));
-    assert.ok($(MODAL), 'Add wallet did nothing');
-    const text = $(MODAL).textContent;
-    assert.match(text, /Create wallet/i, 'the form must offer Create wallet');
-    assert.ok(!/unlock/i.test(text), 'and must never use the word unlock');
-    assert.strictEqual($('#edPass'), null, 'an open keystore needs no passphrase field');
-  });
-
-  await test('with the keystore closed, the create form carries the passphrase in itself', async () => {
-    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: false });
-
-    await click(window, $('#btnAdd'));
-    assert.ok($(MODAL), 'Add wallet did nothing');
-    assert.ok($('#edPass'), 'the passphrase field must be IN the form, never only in a dialog behind it');
-    assert.match($(MODAL).textContent, /Create wallet/i, 'and the button just says Create wallet');
-    assert.ok(!/unlock/i.test($(MODAL).textContent), 'and never says unlock');
+      await click(window, $('#btnAdd'));
+      assert.ok($(MODAL), 'Add wallet did nothing');
+      const text = $(MODAL).textContent;
+      assert.match(text, /Create wallet/i, 'the form must offer Create wallet');
+      assert.match(text, /this wallet/i, 'and say whose passphrase it wants');
+      assert.ok(!/unlock/i.test(text), 'and must never use the word unlock');
+      assert.ok($('#edPass'), 'the passphrase field is in the form itself, always');
+      assert.match(text, /in this browser/i, 'and the form says where the key is created');
+    }
   });
 
   await test('the create form can be closed too', async () => {
@@ -225,21 +221,68 @@ async function click(window, el) {
     assert.strictEqual($(MODAL), null, 'Cancel must close the form');
   });
 
-  await test('a locked wallet card offers a way to open the keystore', async () => {
-    const { window, $, $$ } = await bootDashboard({ wallets: 1, keystoreUnlocked: false });
+  await test('a locked wallet card carries the control that unlocks IT', async () => {
+    // This is the dead end the user hit: the card said "locked" and offered
+    // nothing to do about it. Every locked card must carry its own way back —
+    // a passphrase field when the key is sealed in this browser, an Import button
+    // when it is not on this device at all.
+    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: false });
     // Pull the list through the simulator so it carries the same keyLocked flag
     // the real API sends. Setting S.wallets by hand skips that and would test
     // nothing.
-    await window.eval("(async () => { S.wallets = await demoApi('/api/wallets'); renderAll(); })()");
+    // A restart forgets the session keys: that is what `keyArmed: false` means.
+    // With no key for this wallet in the browser either, the card must say so and
+    // offer the one action that can bring it back — Import.
+    await window.eval(`
+      (async () => {
+        S.wallets.forEach((w) => { w.keyArmed = false; });
+        S.wallets = await demoApi('/api/wallets');
+        window.WalletStore = { PASS_MIN: 8, supported: () => true, record: () => null, list: () => [] };
+        renderAll();
+      })()
+    `);
     for (let i = 0; i < 10; i += 1) await new Promise((r) => setTimeout(r, 0));
     const card = $('.wallet');
-    assert.match(card.textContent, /key locked/i, 'the card must say the key is locked');
-    const ksBtn = card.querySelector('button[data-keystore]');
-    assert.ok(ksBtn, 'and offer a button to open the keystore');
+    assert.match(card.textContent, /no key here/i, 'the card must say there is no key for it on this device');
+    const importBtn = card.querySelector('button[data-importhere]');
+    assert.ok(importBtn, 'a wallet whose key is not on this device offers Import');
+    assert.ok(!card.querySelector('button[data-arm]'), 'and no Unlock button, which would be a lie');
 
-    await click(window, ksBtn);
-    assert.ok($(MODAL), 'that button must open the keystore dialog');
-    assert.match($(MODAL).textContent, /keystore/i, 'and it must be the keystore dialog');
+    // With the key sealed here, the card shows the passphrase row and the Unlock
+    // button instead — and typing a passphrase that does not open it must not
+    // pretend it did.
+    await window.eval(`
+      S.wallets = S.wallets.map((w) => Object.assign({}, w, { id: 'w_dom', publicKey: 'ADDR_DOM' }));
+      window.WalletStore = { PASS_MIN: 8, supported: () => true, record: () => ({ address: 'ADDR_DOM' }),
+        list: () => [], unlock: async () => { throw new Error('Wrong passphrase for this wallet'); } };
+      renderWallets();
+    `);
+    const locked = $('.wallet');
+    assert.match(locked.textContent, /locked/i, 'with the key here, the card says locked');
+    assert.match(locked.textContent, /sealed in this browser/i, 'and where the key is');
+    const pass = locked.querySelector('input[type="password"]');
+    assert.ok(pass, 'the locked card has a passphrase field of its own');
+    const unlockBtn = locked.querySelector('button[data-arm]');
+    assert.ok(unlockBtn, 'and an Unlock button');
+    pass.value = 'not-it';
+    await click(window, unlockBtn);
+    assert.ok($('#toasts') ? /Wrong passphrase/i.test($('#toasts').textContent) : true, 'a wrong passphrase is reported');
+
+    // A THIRD case, and it is the one every wallet made before the browser
+    // keystore existed is in: the key is encrypted on the server, in the keystore
+    // file, and one 🔐 away. Saying "no key here, import it" about that wallet is
+    // false — and it is the card the user's own three wallets get, so it must offer
+    // the keystore, not an import box.
+    await window.eval(`
+      S.wallets = S.wallets.map((w) => Object.assign({}, w, { keyLocked: true, keyArmed: false, keyMissing: false, balanceSol: null }));
+      window.WalletStore = { PASS_MIN: 8, supported: () => true, record: () => null, list: () => [] };
+      renderWallets();
+    `);
+    const inKeystore = $('.wallet');
+    assert.match(inKeystore.textContent, /keystore/i, 'the card must say the key is in the keystore');
+    assert.ok(inKeystore.querySelector('button[data-keystore]'), 'and offer to open it');
+    assert.ok(!inKeystore.querySelector('button[data-importhere]'), 'importing is not the answer while the keystore may hold it');
+    assert.ok(!inKeystore.querySelector('button[data-arm]'), 'nor is a passphrase field, which is for the browser-sealed case');
   });
 
   await test('the wallet card separates REAL money from the simulation', async () => {
@@ -282,7 +325,7 @@ async function click(window, el) {
     // dashboard has to say so too — and offer the way out.
     const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
     const before = $('#notices').textContent;
-    assert.ok(!/deletes your wallets/i.test(before), 'no warning when the host keeps its disk');
+    assert.ok(!/rebuilds its disk/i.test(before), 'no warning when the host keeps its disk');
 
     const storage = {
       dataDir: '/tmp/wherever',
@@ -292,8 +335,9 @@ async function click(window, el) {
     await window.eval(`S.status = Object.assign({}, S.status, { storage: ${JSON.stringify(storage)} }); renderAll();`);
 
     const after = $('#notices').textContent;
-    assert.match(after, /deletes your wallets/i, 'the warning must appear');
-    assert.match(after, /rebuilds its disk/i, 'with the reason from the API');
+    assert.match(after, /rebuilds its disk/i, 'the warning must appear');
+    assert.match(after, /wallets are safe/i, 'and say plainly that the wallets themselves are not at risk');
+    assert.match(after, /sealed in this browser/i, 'because their keys live in the browser, not on that disk');
     assert.ok($('#notices').querySelector('[data-backup]'), 'and offer a Backup button');
     assert.ok($('#notices').querySelector('[data-restore]'), 'and a Restore button');
   });

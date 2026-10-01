@@ -855,6 +855,53 @@ test('UNITS: a rate-limited RPC yields an INFRA verdict, not a token rejection',
   assert.ok(!v.reasons.includes('mint_account_not_found'), 'must NOT blame the token');
 });
 
+/**
+ * The scanner table's own read pass. It must produce numbers with NO wallet
+ * config, NO filters and NO verdict — because the table shows one row per launch
+ * even when every wallet is stopped.
+ */
+function curveAccount({ realSolReserves = 2_500_000_000n, complete = false } = {}) {
+  const data = Buffer.alloc(80);
+  data.writeBigUInt64LE(1_000_000_000_000_000n, 8);   // virtual token reserves
+  data.writeBigUInt64LE(30_000_000_000n, 16);         // virtual sol reserves
+  data.writeBigUInt64LE(500_000_000_000_000n, 24);    // real token reserves
+  data.writeBigUInt64LE(realSolReserves, 32);         // real sol reserves
+  data.writeBigUInt64LE(1_000_000_000_000_000n, 40);  // token total supply
+  data.writeUInt8(complete ? 1 : 0, 48);
+  return data;
+}
+
+test('UNITS: recon() fills liquidity, dev hold and risk for a wallet-free read', async () => {
+  const mint = 'R'.repeat(43);
+  const conn = {
+    getAccountInfo: async (addr) => {
+      // The curve PDA and the mint are different accounts; serve both.
+      return { owner: safety.PUMP_PROGRAM, data: curveAccount(), executable: false, lamports: 1 };
+    },
+    getTokenLargestAccounts: async () => ({
+      value: [
+        { address: { toBase58: () => 'dev1111111111111111111111111111111111111111' }, amount: '180000000' },
+        { address: { toBase58: () => 'a11111111111111111111111111111111111111111' }, amount: '20000000' },
+      ],
+    }),
+  };
+
+  const out = await safety.recon({ mint, symbol: 'RCN' }, { conn, config: cfg.defaultGlobalConfig() });
+  assert.ok(out.report, 'a report is always returned');
+  assert.strictEqual(out.report.liquiditySol, 2.5, `liquidity in SOL, got ${out.report.liquiditySol}`);
+  // The largest NON-curve holder is the dev-hold estimate (90% here).
+  assert.strictEqual(out.report.devHoldPct, 90, `dev hold %, got ${out.report.devHoldPct}`);
+  assert.ok(typeof out.report.honeypot.risk === 'number', 'a numeric risk score is always present');
+});
+
+test('UNITS: recon() reports an unreachable RPC instead of inventing numbers', async () => {
+  const out = await safety.recon({ mint: 'R'.repeat(43), symbol: 'X' }, { conn: rateLimitedConn, config: cfg.defaultGlobalConfig() });
+  assert.strictEqual(out.ok, false);
+  assert.strictEqual(out.infra, true, 'a dead RPC must be flagged, never shown as a real reading');
+  assert.strictEqual(out.report.liquiditySol, null, 'and the cells stay blank');
+  assert.strictEqual(out.report.devHoldPct, null);
+});
+
 test('UNITS: a definitive "no such account" is still a HARD token rejection', async () => {
   const v = await safety.evaluate({ mint: 'M'.repeat(43), symbol: 'X' }, walletCfg, { conn: emptyConn, config: cfg.defaultGlobalConfig() });
   assert.strictEqual(v.ok, false);
