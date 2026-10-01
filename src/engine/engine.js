@@ -68,6 +68,10 @@ class Engine {
     this.priceTimer = null;
     this.priceHealth = { ok: true, consecutiveFailures: 0, lastOkAt: 0, lastError: null, suppressedSince: 0 };
     this._evalQueue = 0;
+    // The scanner table's own read pass — see _recon(). Kept separate from the
+    // entry queue so a stopped wallet does not empty the table.
+    this._reconQueue = 0;
+    this._reconSeen = new Set();
     this.stats = { detected: 0, evaluated: 0, bought: 0, skipped: 0, infraErrors: 0, evalTimeouts: 0, startedAt: null };
     this.stats.recovered = 0; // positions re-adopted after a restart
     this._persistTimer = null;
@@ -123,6 +127,13 @@ class Engine {
   _onToken(candidate) {
     if (!this.running) return;
 
+    // Fill in what the launch actually IS before anything can decide whether to
+    // skip it. Deliberately the first thing here, and deliberately outside the
+    // entry queue below: the table has to show dev hold, liquidity and risk for a
+    // launch even when every wallet is stopped or the entry queue is saturated —
+    // which is exactly the moment a human is staring at the table.
+    this._recon(candidate);
+
     // Bound concurrency — a launch storm must not spawn thousands of in-flight
     // RPC evaluations and rate-limit us into oblivion.
     const max = Math.max(1, this.config.global.scanner.evaluateConcurrency || 2);
@@ -171,6 +182,43 @@ class Engine {
         if (bought) bus.safeEmit('engine:stats', this.stats);
       })
       .catch((err) => log.error(`Evaluation pipeline error: ${err.message}`));
+  }
+
+  /**
+   * Read the token's own facts — liquidity, dev hold, honeypot risk — for the
+   * scanner table.
+   *
+   * Once per mint, best-effort, bounded, and completely independent of entry:
+   * it runs no filters and cannot buy or refuse anything. It shares the per-mint
+   * report cache with the wallets' evaluations, so on a launch that any wallet
+   * also inspects this costs nothing extra.
+   */
+  _recon(candidate) {
+    if (!candidate || !candidate.mint) return;
+    if (this._reconSeen.has(candidate.mint)) return;
+
+    const max = Math.max(1, this.config.global.scanner.reconConcurrency || 2);
+    if (this._reconQueue >= max) return; // shed load rather than pile up
+
+    this._reconSeen.add(candidate.mint);
+    // Bounded memory: a long session must not accumulate every mint it has seen.
+    if (this._reconSeen.size > 2000) {
+      const keep = [...this._reconSeen].slice(-500);
+      this._reconSeen = new Set(keep);
+    }
+
+    this._reconQueue += 1;
+    safety.recon(candidate, { conn: this.executor.conn(), config: this.config.global })
+      .then((out) => {
+        bus.safeEmit('token:recon', {
+          candidate,
+          report: out.report || {},
+          infra: Boolean(out.infra),
+          reason: out.reason || null,
+        });
+      })
+      .catch((err) => log.debug(`Recon failed for ${candidate.mint}: ${err.message}`))
+      .finally(() => { this._reconQueue -= 1; });
   }
 
   /* ---------------------------- price feed ------------------------------- */
@@ -491,17 +539,17 @@ class Engine {
         name: cfg.name,
         publicKey: cfg.publicKey || null,
         enabled: cfg.enabled,
-        // Reported for a locked wallet too, so the card can word its state
-        // consistently the moment the keystore is opened.
+        // Reported for a keyless wallet too, so the card can word its state
+        // consistently the moment its key is armed.
         armed: Boolean(cfg.enabled) && !(cfg.stats && cfg.stats.paused),
         imported: Boolean(cfg.imported),
         keyLocked: true,
-        // "locked" and "gone" are different, and the dashboard words them
-        // differently. If the keystore is OPEN and hydrate() still could not build
-        // this wallet, then its key is not in the keystore at all — a reset
-        // archived it, or it was never generated. Saying "open your keystore to
-        // trade again" would then be a lie.
-        keyMissing: this.keystore.isUnlocked(),
+        // With browser-held wallets, a wallet with no key loaded is simply NOT
+        // ARMED yet — its key is sealed in the browser, waiting for its passphrase.
+        // "keyMissing" now means the harder case: no key here and none in the old
+        // server keystore either, so nothing can arm it except importing the key.
+        keyMissing: !this.keystore.has(cfg.id) && this.keystore.isUnlocked(),
+        keyArmed: false,
         balanceSol: null,
         paperBalanceSol: 0,
         paperTrading: false,
@@ -576,6 +624,7 @@ class Engine {
         lastError: this.priceHealth ? this.priceHealth.lastError : null,
       },
       evalQueue: this._evalQueue,
+      reconQueue: this._reconQueue,
       recoveredPositions: this.stats.recovered || 0,
       positionsPersistedAt: this._persistedAt || 0,
     };

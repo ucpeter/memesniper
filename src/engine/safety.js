@@ -337,6 +337,73 @@ function _cacheSet(mint, bundle, ttlMs) {
   }
 }
 
+/**
+ * [RECON] The shared facts about a launch, with NO verdict attached.
+ *
+ * WHY THIS EXISTS
+ * The scanner table shows dev hold, liquidity and risk per launch. Those numbers
+ * were only ever produced as a side effect of a WALLET evaluating the token, and
+ * `evaluate()` returns early on its first hard failure — so a token rejected on
+ * liquidity never reached the distribution check, and a token seen while no
+ * wallet was armed was never evaluated at all. Both cases left the columns empty
+ * on screen, reported from the live app as "dev hold and risk is not displayed".
+ *
+ * This runs ONCE per mint for the table, independent of every wallet:
+ *   · it shares the per-mint report cache, so an armed wallet evaluating the same
+ *     launch does not pay for these reads twice;
+ *   · it never decides anything — no filters, no score, no refusal;
+ *   · it is best-effort by construction. An RPC that cannot be reached returns
+ *     nulls and the caller leaves the cells blank rather than inventing numbers.
+ */
+async function recon(candidate, ctx = {}) {
+  const conn = ctx.conn;
+  const config = ctx.config;
+  const ttlMs = config?.scanner?.reportCacheMs ?? 2000;
+
+  if (!conn || !candidate || !candidate.mint) return { ok: false, reason: 'no_connection' };
+
+  let bundle = _cacheGet(candidate.mint, ttlMs);
+  if (!bundle) {
+    const [mintReportFresh, curveReportFresh] = await Promise.all([
+      checkMintAuthorities(conn, candidate.mint),
+      checkCurve(conn, candidate.mint),
+    ]);
+    bundle = { mintReport: mintReportFresh, curveReport: curveReportFresh };
+    const good = mintReportFresh.pass || mintReportFresh.absent || mintReportFresh.confidence !== 'INFRA';
+    const goodCurve = curveReportFresh.pass || curveReportFresh.absent || curveReportFresh.confidence !== 'INFRA';
+    if (good && goodCurve) _cacheSet(candidate.mint, bundle, ttlMs);
+  }
+  const { mintReport, curveReport } = bundle;
+
+  const unreachable = [mintReport, curveReport].filter((r) => r.confidence === 'INFRA');
+  const distribution = unreachable.length
+    ? null
+    // A curve read that failed still gives us a mint report worth showing; a
+    // distribution read that fails gives null and leaves the cell blank.
+    : await checkDistribution(conn, candidate.mint, bondingCurvePda(candidate.mint)).catch(() => null);
+
+  // Risk is judged against the HARDEST reasonable reading of the mint account
+  // (live freeze authority, live mint authority) — no wallet's preferences are
+  // involved, because this number is shown to a human, not used to buy.
+  const honeypot = mintReport && mintReport.confidence !== 'INFRA'
+    ? assessHoneypotRisk(mintReport, { maxHoneypotRisk: 50 })
+    : null;
+
+  return {
+    ok: unreachable.length === 0,
+    infra: unreachable.length > 0,
+    reason: unreachable.length ? unreachable.map((r) => r.reason).join('; ') : null,
+    report: {
+      liquiditySol: curveReport && curveReport.confidence !== 'INFRA' ? curveReport.liquiditySol ?? null : null,
+      progressPct: curveReport && curveReport.confidence !== 'INFRA' ? curveReport.progressPct ?? null : null,
+      devHoldPct: distribution ? estimateDevHold(distribution) : null,
+      top10Pct: distribution && distribution.top10Pct !== undefined ? distribution.top10Pct : null,
+      holderSample: distribution ? distribution.holderSample ?? null : null,
+      honeypot,
+    },
+  };
+}
+
 async function evaluate(candidate, cfg, ctx) {
   const { conn, config } = ctx;
   const f = cfg.filters;
@@ -481,5 +548,6 @@ module.exports = {
   checkDistribution,
   checkMetadata,
   assessHoneypotRisk,
+  recon,
   evaluate,
 };

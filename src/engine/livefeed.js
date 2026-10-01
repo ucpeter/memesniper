@@ -51,6 +51,7 @@ class LiveFeed {
     this._bound = true;
 
     bus.on('token:detected', (c) => this.note(c));
+    bus.on('token:recon', (e) => this.recon(e));
     bus.on('token:analyzed', (e) => this.analyze(e));
     bus.on('token:skipped', (e) => this.skip(e));
     bus.on('position:opened', (p) => this.bought(p));
@@ -100,10 +101,38 @@ class LiveFeed {
     const row = evt && evt.candidate ? this.rows.get(evt.candidate.mint) : null;
     if (!row) return null;
 
-    const r = evt.report || {};
-    // The report is only filled where the check got far enough to produce it — a
-    // token rejected on mint authorities never reaches the curve. Never overwrite a
-    // real number with null from a later, shallower report.
+    this._mergeFacts(row, evt.report || {});
+    void evt;
+
+    this._pushWallet(row, evt.wallet, evt.ok === false ? 'filtered' : 'checking', (evt.reasons || [])[0] || null);
+    this._emit(row);
+    return row;
+  }
+
+  /**
+   * The shared facts about a launch, from whoever read them first.
+   *
+   * This is separate from any wallet's verdict on purpose. The table's Dev hold
+   * and Risk columns are facts about the TOKEN; they used to arrive only when an
+   * armed wallet ran its filters, so a launch seen while every wallet was stopped
+   * showed two empty columns. `token:recon` now delivers them for every launch.
+   */
+  recon(evt) {
+    const row = evt && evt.candidate ? this.rows.get(evt.candidate.mint) : null;
+    if (!row) return null;
+    this._mergeFacts(row, evt.report || {});
+    this._emit(row);
+    return row;
+  }
+
+  /**
+   * Merge one report into a row, without overwriting a real number with a blank.
+   *
+   * Reports arrive at different depths — a token rejected on mint authorities
+   * never reaches the curve, and a failed distribution read returns nothing —
+   * so "later report wins" would erase good data with null.
+   */
+  _mergeFacts(row, r) {
     if (r.liquiditySol !== undefined && r.liquiditySol !== null) row.liquiditySol = r.liquiditySol;
     if (r.devHoldPct !== undefined && r.devHoldPct !== null) row.devHoldPct = r.devHoldPct;
     if (r.honeypot && typeof r.honeypot.risk === 'number') {
@@ -113,11 +142,7 @@ class LiveFeed {
       for (const n of r.honeypot.notes || []) if (!row.riskNotes.includes(n)) row.riskNotes.push(n);
     }
     if (r.top10Pct !== undefined && r.top10Pct !== null) row.top10Pct = r.top10Pct;
-    void evt;
-
-    this._pushWallet(row, evt.wallet, evt.ok === false ? 'filtered' : 'checking', (evt.reasons || [])[0] || null);
-    this._emit(row);
-    return row;
+    if (r.progressPct !== undefined && r.progressPct !== null) row.curvePct = r.progressPct;
   }
 
   /** One wallet declined this launch, with its reason. */
