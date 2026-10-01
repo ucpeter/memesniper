@@ -326,6 +326,59 @@ const api = async (method, url, body) => {
     assert.strictEqual(found.enabled, false, 'and it is not trading');
   });
 
+  await test('WS snapshot AND heartbeat keep a registered, locked browser wallet visible', async () => {
+    // The actual reported failure: GET returned the wallet, but the next 2s
+    // heartbeat replaced that list with traders ONLY (zero while the key is
+    // sealed here). Two wallets then fell back to "Register again" forever.
+    const WebSocket = require('ws');
+    const address = Keypair.generate().publicKey.toBase58();
+    const result = await post('/api/wallets', { name: 'Visible after tick', address });
+    assert.strictEqual(result.status, 201);
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`);
+    try {
+      const [snapshot, tick] = await new Promise((resolve, reject) => {
+        const messages = [];
+        const timer = setTimeout(() => reject(new Error('heartbeat missing')), 5000);
+        ws.on('message', (data) => {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === 'snapshot' || msg.type === 'tick') messages.push(msg);
+          if (messages.length === 2) { clearTimeout(timer); resolve(messages); }
+        });
+        ws.on('error', (err) => { clearTimeout(timer); reject(err); });
+      });
+      for (const message of [snapshot, tick]) {
+        const w = message.data.wallets.find((x) => x.publicKey === address);
+        assert.ok(w, `${message.type} must include a wallet with a sealed browser key`);
+        assert.strictEqual(w.name, 'Visible after tick');
+        assert.strictEqual(w.keyLocked, true);
+        assert.strictEqual(w.persistent, false);
+      }
+    } finally { ws.close(); }
+  });
+
+  await test('the home launch endpoint has NO wallet fields and uses fixed public risk rules', async () => {
+    const mint = Keypair.generate().publicKey.toBase58();
+    engine.liveFeed.note({ mint, symbol: 'HOME', creator: 'DevAddress',
+      initialBuy: 300000000, vSolInBondingCurve: 1.2 });
+    const before = engine.running;
+    const savedRisk = config.global.risk;
+    config.global.risk = { maxDevHoldPct: 99, minLiquidityUsd: 0 }; // a wallet/global setting
+    const response = await fetch(`http://127.0.0.1:${PORT}/api/launches`); // NO session token
+    assert.strictEqual(response.status, 200, 'public launch stream does not need a wallet session');
+    const got = { status: response.status, body: await response.json() };
+    config.global.risk = savedRisk;
+    assert.strictEqual(got.status, 200);
+    const row = got.body.rows.find((r) => r.mint === mint);
+    assert.ok(row, 'the public stream shows a token even with no wallet trading');
+    assert.strictEqual(row.devHoldPct, 30);
+    assert.ok(row.liquidityUsd !== null);
+    assert.ok(row.riskScore > 0, 'informational risk ignores wallet/global trading thresholds');
+    assert.strictEqual(engine.running, before, 'reading the launch does NOT start trading');
+    for (const name of ['wallets', 'boughtBy', 'walletId', 'skipReason', 'config', 'secretKey']) {
+      assert.ok(!(name in row), `public feed must not expose ${name}`);
+    }
+  });
+
   await test('re-registering the same address returns the SAME wallet, not a duplicate', async () => {
     const paired = Keypair.generate();
     const address = paired.publicKey.toBase58();

@@ -146,6 +146,24 @@ async function click(window, el) {
     assert.match(html, /Wallet 1/, 'and the wallet names');
   });
 
+  await test('a heartbeat never erases a passphrase while it is being typed', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: false });
+    // Render a locked browser-held wallet, the EXACT screen from the screenshot.
+    window.eval(`S.wallets[0].id='w_phone'; S.wallets[0].name='Sniper 1';
+      S.wallets[0].keyLocked=true; S.wallets[0].keyMissing=false;
+      S.wallets[0].publicKey='PhoneAddress';
+      window.WalletStore = { supported:()=>true,
+        record:()=>({address:'PhoneAddress'}),list:()=>[{address:'PhoneAddress'}] };
+      renderWallets();`);
+    const field = $('[id^="armpass-"]');
+    assert.ok(field, 'registered wallet shows its passphrase field');
+    field.focus(); field.value = 'test passphrase';
+    window.eval(`renderWallets(); handleWs({type:'tick', data:{
+      status:S.status, wallets:S.wallets, prices:{} }});`);
+    assert.strictEqual($('[id^="armpass-"]'), field, 'same input node; mobile keyboard stays open');
+    assert.strictEqual(field.value, 'test passphrase', 'what the owner typed survives the tick');
+  });
+
   await test('a wallet card offers Fund, and tapping it OPENS the fund dialog', async () => {
     const { window, $, $$ } = await bootDashboard({ wallets: 1 });
     const fundBtn = $$('.wallet button[data-fund]')[0];
@@ -461,21 +479,17 @@ async function click(window, el) {
    * does not, so the panel has to say which cause it is instead of leaving the
    * contradiction on screen.
    */
-  await test('the empty scanner panel names which of the three causes it is', async () => {
+  await test('the public scanner keeps connecting when wallet trading is idle', async () => {
     const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
-
-    await window.eval(`S.status = Object.assign({}, S.status, { running: false, scanner: { source: 'pumpportal', connected: false } });
-      S.scanFeed = []; renderScanFeed();`);
-    assert.match($('#scanFeed').textContent, /engine is stopped/i, 'the engine being off is one cause');
-    assert.match($('#scanFeed').textContent, /▶ Start scanning/, 'and it must name the control that fixes it');
-
-    await window.eval(`S.status = Object.assign({}, S.status, { running: true, scanner: { source: 'pumpportal', connected: true } });
-      renderScanFeed();`);
-    assert.match($('#scanFeed').textContent, /no launch has arrived yet/i, 'watching and quiet is another');
-
-    await window.eval(`S.status = Object.assign({}, S.status, { running: true, scanner: { source: 'pumpportal', connected: false } });
-      renderScanFeed();`);
-    assert.match($('#scanFeed').textContent, /feed is not connected/i, 'a dead feed is the third — the one that read as the counter lying');
+    window.eval(`S.status = Object.assign({}, S.status, { running: false,
+      scanner: { source: 'pumpportal', connected: false } }); S.scanFeed = []; renderScanFeed();`);
+    assert.match($('#scanFeed').textContent, /connecting to pump.fun/i);
+    assert.doesNotMatch($('#scanFeed').textContent, /start scanning/i);
+    window.eval(`S.status = Object.assign({}, S.status, { running: false,
+      scanner: { source: 'pumpportal', connected: true } }); renderScanFeed();`);
+    assert.match($('#scanFeed').textContent, /watching pump.fun/i,
+      'with zero wallets trading, public launches still stream');
+    assert.ok(!$('#btnStart'), 'there is no master engine switch on screen');
   });
 
   await test('the panel counter, the list and the meta line agree', async () => {
@@ -599,19 +613,12 @@ async function click(window, el) {
     assert.match($('#stats').textContent, /paper/i, 'and the headline P&L says it is paper');
   });
 
-  await test('the feed dot distinguishes "scanner stopped" from "feed offline"', async () => {
-    // Both are "no rows arriving", but they are different problems with different
-    // fixes, so they must not look identical.
+  await test('the scanner dot follows the feed, not whether a wallet is trading', async () => {
     const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
-
-    await window.eval("S.status = Object.assign({}, S.status, { running: true, scanner: { source: 'pumpportal', connected: true } }); renderScanFeed();");
+    window.eval("S.status = Object.assign({}, S.status, { running: false, scanner: { source: 'pumpportal', connected: true } }); renderScanFeed();");
     assert.strictEqual($('#scanDotText').textContent, 'live');
-
-    await window.eval("S.status = Object.assign({}, S.status, { running: false, scanner: { source: 'pumpportal', connected: true } }); renderScanFeed();");
-    assert.strictEqual($('#scanDotText').textContent, 'scanner stopped');
-
-    await window.eval("S.status = Object.assign({}, S.status, { running: true, scanner: { source: 'pumpportal', connected: false } }); renderScanFeed();");
-    assert.strictEqual($('#scanDotText').textContent, 'offline');
+    window.eval("S.status = Object.assign({}, S.status, { running: true, scanner: { source: 'pumpportal', connected: false } }); renderScanFeed();");
+    assert.strictEqual($('#scanDotText').textContent, 'connecting');
   });
 
   /**
@@ -840,16 +847,19 @@ async function click(window, el) {
       renderWallets();
     `);
 
-    const btn = [...window.document.querySelectorAll('button[data-feed]')].find((b) => b.dataset.feed === 'w_alpha');
-    assert.ok(btn, 'each wallet card must offer its own feed');
-    await click(window, btn);
-
-    const modal = $('#modalRoot').textContent;
-    assert.match(modal, /ALPHACOIN/, 'a launch this wallet bought must be listed');
-    assert.match(modal, /BETACOIN/, 'and a launch it declined must be listed too — that is the interesting one');
-    assert.match(modal, /bought/i, "with this wallet's own verdict");
-    assert.match(modal, /dev holds too much/, 'including the reason it was filtered out');
-    assert.ok(!/skipped\s*liquidity_below_min/.test(modal), "and NOT another wallet's verdict as if it were this one's");
+    const feed = [...window.document.querySelectorAll('[data-wallet-feed]')]
+      .find((el) => el.getAttribute('data-wallet-feed') === 'w_alpha');
+    assert.ok(feed, 'the feed must be EMBEDDED in Alpha’s card');
+    assert.match(feed.textContent, /ALPHACOIN/, 'a launch this wallet bought must be listed');
+    assert.match(feed.textContent, /BETACOIN/, 'and a launch it declined must be listed');
+    assert.match(feed.textContent, /bought/i, "with this wallet's own verdict");
+    assert.match(feed.textContent, /dev holds too much/, 'including its own filter reason');
+    assert.doesNotMatch(feed.textContent, /liquidity_below_min/, 'not Beta’s verdict');
+    const beta = [...window.document.querySelectorAll('[data-wallet-feed]')]
+      .find((el) => el.getAttribute('data-wallet-feed') === 'w_beta');
+    assert.match(beta.textContent, /liquidity below min/, 'Beta has its own reason');
+    assert.match(feed.textContent, /\$2,000/, 'liquidity displayed in dollars');
+    assert.match(feed.textContent, /2\.0%/, 'dev hold appears on wallet card');
   });
 
   /* ────────────── withdrawing: who signs it, in plain words ────────────── */

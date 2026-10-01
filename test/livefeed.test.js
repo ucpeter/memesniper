@@ -60,6 +60,21 @@ const candidate = (n) => ({
 (async () => {
   console.log('\nThe live launch scanner feed\n');
 
+  await test('two wallets with the SAME name keep separate scan decisions by ID', () => {
+    withFeed((feed) => {
+      const c = candidate('twins');
+      feed.note(c);
+      feed.analyze({ walletId: 'id_a', wallet: 'Sniper 1', candidate: c,
+        ok: false, reasons: ['dev hold too high'], report: {} });
+      feed.analyze({ walletId: 'id_b', wallet: 'Sniper 1', candidate: c,
+        ok: true, reasons: [], report: {} });
+      const rows = feed.snapshot()[0].wallets;
+      assert.strictEqual(rows.length, 2, 'same display name must NOT merge two wallet decisions');
+      assert.strictEqual(rows.find((w) => w.walletId === 'id_a').action, 'filtered');
+      assert.strictEqual(rows.find((w) => w.walletId === 'id_b').action, 'checking');
+    });
+  });
+
   await test('a detected launch appears immediately, as "checking"', () => {
     withFeed((feed) => {
       feed.note(candidate(1));

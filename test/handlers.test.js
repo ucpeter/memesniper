@@ -501,7 +501,7 @@ async function test(name, fn) {
         $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: (id) => opened.push(id),
         keyHere: () => false,
         esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
-        browserHeldWallets: () => [], usdOf: () => '',
+        browserHeldWallets: () => [], usdOf: () => '', renderWalletFeeds: () => {},
       });
       assertScopeIsHonest({
         $, S: state, keystoreState: () => {}, openKeystore: () => {}, openWallet: () => {}, keyHere: () => {}, esc: () => {}, fmtSol: () => {}, cls: () => {}, winRateOf: () => {},
@@ -538,7 +538,7 @@ async function test(name, fn) {
       $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
       keyHere: () => true,
       esc: (v) => String(v ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
-      browserHeldWallets: () => held,
+      browserHeldWallets: () => held, renderWalletFeeds: () => {},
     });
 
     renderWallets();
@@ -573,7 +573,7 @@ async function test(name, fn) {
       $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
       keyHere: () => true, usdOf,
       esc: (v) => String(v ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
-      browserHeldWallets: () => [],
+      browserHeldWallets: () => [], renderWalletFeeds: () => {},
     });
 
     renderWallets();
@@ -615,7 +615,7 @@ async function test(name, fn) {
     const renderWallets = build(extractFunction(src, 'renderWallets'), {
       $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
       esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 50,
-      browserHeldWallets: () => [], usdOf: () => '',
+      browserHeldWallets: () => [], usdOf: () => '', renderWalletFeeds: () => {},
     });
 
     renderWallets();
@@ -702,7 +702,7 @@ async function test(name, fn) {
       $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
       keyHere: () => true,
       esc: (v) => String(v ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
-      browserHeldWallets: () => [], usdOf: () => '',
+      browserHeldWallets: () => [], usdOf: () => '', renderWalletFeeds: () => {},
     });
 
     renderWallets();
@@ -734,7 +734,7 @@ async function test(name, fn) {
       $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
       keyHere: () => false,
       esc: (v) => String(v ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
-      browserHeldWallets: () => [], usdOf: () => '',
+      browserHeldWallets: () => [], usdOf: () => '', renderWalletFeeds: () => {},
     });
 
     renderWallets();

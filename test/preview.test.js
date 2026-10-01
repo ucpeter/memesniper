@@ -340,6 +340,34 @@ function extractFn(name) {
     if (!/cannot be undone/.test(src)) throw new Error('does not say it is irreversible');
   });
 
+  await t('the HOME scanner renders real launch facts without a wallet or Start button', async () => {
+    const { JSDOM } = require('jsdom');
+    const html = fs.readFileSync(require('path').join(__dirname, '..', 'public', 'landing.html'), 'utf8');
+    const calls = [];
+    const dom = new JSDOM(html, { runScripts: 'dangerously', url: 'http://localhost:8787/',
+      beforeParse(win) {
+        win.setInterval = () => 1; // keep the test finite, no timers left open
+        win.fetch = async (url) => {
+          calls.push(url);
+          return { ok: true, json: async () => url === '/api/launches'
+            ? { connected: true, rows: [{ mint: 'MintABC123', symbol: 'NEWCOIN',
+                devWallet: 'DEV123456789', devHoldPct: 3.4, liquidityUsd: 2500,
+                liquidityApprox: false, riskScore: 12 }] }
+            : { engine: { running: false, dryRun: true, wallets: 0 },
+                keystore: { unlocked: false } } };
+        };
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const doc = dom.window.document;
+    if (!calls.includes('/api/launches')) throw new Error('the home page never fetches its public scanner');
+    if (!doc.querySelector('#launchRows').textContent.includes('NEWCOIN')) throw new Error('launch token not shown');
+    if (!doc.querySelector('#launchRows').textContent.includes('$2,500')) throw new Error('USD liquidity not shown');
+    if (!/Live/.test(doc.querySelector('#launchState').textContent)) throw new Error('feed connection state missing');
+    if (/btnStart|Start scanning/.test(html)) throw new Error('master Start Engine button leaked onto home page');
+    dom.window.close();
+  });
+
   await t('the app is named MEME SNIPER and carries a self-contained icon', () => {
     const fs2 = require('fs');
     const path2 = require('path');
