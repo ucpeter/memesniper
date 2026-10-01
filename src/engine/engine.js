@@ -90,6 +90,15 @@ class Engine {
   }
 
   /* ------------------------------ lifecycle ------------------------------ */
+  /** Public launch feed only. Never loads keys, arms a wallet or trades. */
+  startScanner() {
+    if (!this._onTokenBound) {
+      this._onTokenBound = (c) => this._onToken(c);
+      bus.on('token:detected', this._onTokenBound);
+    }
+    this.scanner.start();
+  }
+
   start() {
     if (this.running) return;
     this.running = true;
@@ -101,10 +110,9 @@ class Engine {
     }
     this.hydrate();
 
-    // The scanner publishes every candidate on the bus; register exactly once.
-    bus.on('token:detected', this._onTokenBound = (c) => this._onToken(c));
-
-    this.scanner.start();
+    // Shares the already-running read-only launch feed. Only the explicitly
+    // started wallet/engine path below can place orders.
+    this.startScanner();
     this._startPricePoller();
     this._refreshBalances();
     this.refreshLockedBalances().catch(() => {});
@@ -119,11 +127,11 @@ class Engine {
 
   stop() {
     this.running = false;
-    this.scanner.stop();
+    // Stop wallet evaluation, not the public launch stream.
+    // The live home feed stays connected even after an engine stop.
     if (this.priceTimer) clearInterval(this.priceTimer);
     if (this._priceTimer) { clearInterval(this._priceTimer); this._priceTimer = null; }
-    if (this._onTokenBound) bus.off('token:detected', this._onTokenBound);
-    log.info('Engine stopped');
+    log.info('Wallet evaluation stopped; launch feed still running');
     bus.safeEmit('engine:status', this.status());
   }
 
@@ -182,6 +190,8 @@ class Engine {
 
   /* ------------------------------- entry --------------------------------- */
   _onToken(candidate) {
+    // Independent public feed, even with no wallets or no trading enabled.
+    this._recon(candidate);
     if (!this.running) return;
 
     // Fill in what the launch actually IS before anything can decide whether to
@@ -189,8 +199,6 @@ class Engine {
     // entry queue below: the table has to show dev hold, liquidity and risk for a
     // launch even when every wallet is stopped or the entry queue is saturated —
     // which is exactly the moment a human is staring at the table.
-    this._recon(candidate);
-
     // Bound concurrency — a launch storm must not spawn thousands of in-flight
     // RPC evaluations and rate-limit us into oblivion.
     const max = Math.max(1, this.config.global.scanner.evaluateConcurrency || 2);
@@ -235,6 +243,7 @@ class Engine {
           mint: candidate.mint,
           outcomes,
           walletNames: [...this.traders.values()].map((t) => t.cfg.name),
+          walletIds: [...this.traders.keys()],
         });
         if (bought) bus.safeEmit('engine:stats', this.stats);
       })

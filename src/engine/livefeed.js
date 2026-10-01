@@ -228,7 +228,7 @@ class LiveFeed {
     this._mergeFacts(row, evt.report || {});
     void evt;
 
-    this._pushWallet(row, evt.wallet, evt.ok === false ? 'filtered' : 'checking', (evt.reasons || [])[0] || null);
+    this._pushWallet(row, evt.wallet, evt.ok === false ? 'filtered' : 'checking', (evt.reasons || [])[0] || null, evt.walletId);
     this._emit(row);
     return row;
   }
@@ -302,7 +302,7 @@ class LiveFeed {
     const row = evt && evt.candidate ? this.rows.get(evt.candidate.mint) : null;
     if (!row) return null;
     const reason = (evt.reasons || [])[0] || 'filters';
-    this._pushWallet(row, evt.wallet, evt.infra ? 'rpc_error' : 'skipped', reason);
+    this._pushWallet(row, evt.wallet, evt.infra ? 'rpc_error' : 'skipped', reason, evt.walletId);
     if (evt.infra) {
       row.decision = DECISION.ERROR;
       row.skipReason = 'rpc unavailable — this is infrastructure, not the token';
@@ -325,8 +325,9 @@ class LiveFeed {
     // has one entry per wallet from token:analyzed keyed by name, and keying this
     // one by id listed the same wallet twice under two different labels.
     row.boughtBy = position.wallet || position.walletId || null;
+    row.boughtById = position.walletId || null;
     this.stats.bought += 1;
-    this._pushWallet(row, row.boughtBy, 'bought', null);
+    this._pushWallet(row, row.boughtBy, 'bought', null, position.walletId);
     this._emit(row);
     return row;
   }
@@ -335,7 +336,7 @@ class LiveFeed {
    * Every wallet has finished evaluating. Called by the engine once the evaluation
    * promise settles, because only there is it known whether ANY wallet bought.
    */
-  finalize({ mint, outcomes, walletNames }) {
+  finalize({ mint, outcomes, walletNames, walletIds }) {
     const row = mint ? this.rows.get(mint) : null;
     if (!row) return null;
 
@@ -354,7 +355,7 @@ class LiveFeed {
     }
     row.decidedAt = Date.now();
     if (walletNames && !row.wallets.length) {
-      row.wallets = walletNames.map((name) => ({ name, action: 'skipped', reason: row.skipReason }));
+      row.wallets = walletNames.map((name, i) => ({ name, walletId: walletIds?.[i] || null, action: 'skipped', reason: row.skipReason }));
     }
     this._emit(row);
     return row;
@@ -377,15 +378,17 @@ class LiveFeed {
 
   /* ------------------------------- internals ------------------------------ */
 
-  _pushWallet(row, walletName, action, reason) {
+  _pushWallet(row, walletName, action, reason, walletId = null) {
     if (!walletName) return;
-    const existing = row.wallets.find((w) => w.name === walletName);
+    const existing = row.wallets.find((w) => walletId && w.walletId
+      ? w.walletId === walletId : !w.walletId && w.name === walletName);
     if (existing) {
       // A later, better-informed verdict supersedes an earlier one.
+      if (walletId) existing.walletId = walletId;
       if (action !== 'checking') { existing.action = action; existing.reason = reason; }
       return;
     }
-    row.wallets.push({ name: walletName, action, reason });
+    row.wallets.push({ name: walletName, walletId, action, reason });
   }
 
   _trim() {
