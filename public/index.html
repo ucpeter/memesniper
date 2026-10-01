@@ -29,7 +29,6 @@
   <a class="btn btn-ghost" id="btnLanding" href="/" title="Back to the landing page">◂ Landing</a>
 
   <span id="runChip" class="run-chip"><span class="dot"></span><span id="runText">stopped</span></span>
-  <button class="btn btn-primary" id="btnStart" title="Master switch for the launch scanner. Each wallet has its own ▶ Start / ⏸ Stop on its card.">▶ Engine</button>
   <button class="btn btn-danger" id="btnPanic" title="Sell everything in EVERY wallet and stop all new entries">■ Panic (all wallets)</button>
   <button class="btn" id="btnSettings">⚙ Settings</button>
   <button class="btn" id="btnAdd">＋ Wallet</button>
@@ -44,7 +43,7 @@
 <div class="mode-bar" id="modeBar">
   <div class="mode-bar-text">
     <div class="mode-bar-title" id="modeBarTitle">🧪 DRY RUN — paper trading</div>
-    <div class="mode-bar-sub" id="modeBarSub">Simulated trades on a paper balance. ▶ Start a wallet to watch them open and close below.</div>
+    <div class="mode-bar-sub" id="modeBarSub">Start each wallet separately.</div>
   </div>
   <div class="mode-switch" id="modeSwitch" role="group" aria-label="Trading mode — dry run or live">
     <button type="button" class="mode-opt" id="modeDry" title="Simulate everything. Trades are recorded as paper trades on a paper balance; no transaction is ever signed or sent.">DRY RUN</button>
@@ -61,7 +60,7 @@
     <!-- headline stats: the total across EVERY wallet -->
     <div class="board-head">
       <span class="board-title">All wallets — combined</span>
-      <span class="board-sub">Totals across every wallet. Each wallet has its own figures on its card below.</span>
+
     </div>
     <div class="stats" id="stats"></div>
 

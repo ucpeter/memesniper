@@ -855,7 +855,36 @@ html, body { max-width: 100%; overflow-x: hidden; }
   100% { box-shadow: 0 0 0 0 rgba(0, 255, 102, 0); }
 }
 
+/* Inline per-wallet decisions stay WITH the wallet, including on phones. */
+.wallet-feed { border-top: 1px solid var(--border-hi); margin-top: 12px; padding-top: 10px; min-width: 0; }
+.wallet-feed-title { font-weight: 700; font-size: 12px; margin-bottom: 7px; }
+.wallet-feed-empty { color: var(--text-mute); font-size: 11px; padding: 7px 0; }
+.wallet-feed .scan-tbl { min-width: 460px; }
+.wallet-feed .tbl-wrap { max-height: 270px; overflow: auto; }
+.wallet-feed .scan-tbl td { padding: 6px 7px; }
+.wallet-feed .scan-tbl th { padding: 7px; }
 @media (max-width: 760px) {
   .scan-feed { max-height: 320px; }
   .scan-reason, .scan-wallets { max-width: 150px; }
 }
+
+/* Phone: the header must SCROLL AWAY. The previous sticky seven-row header
+   covered more than half the viewport while the owner tried to reach a wallet. */
+@media (max-width:760px) {
+  .topbar { position:relative; top:auto; }
+  .wallets { grid-template-columns:repeat(auto-fill,minmax(min(100%,320px),1fr)); }
+  .wallet-card,.wallet { min-width:0; }
+  .console .logline { flex-wrap:wrap; }
+  .console .logline .m { flex:1 1 100%; overflow-wrap:anywhere; }
+}
+/* Browser-held addresses after a Render redeploy are real cards, not bare,
+   unstyled text overflowing the panel (the screenshot's clipped buttons). */
+.wallet-card { min-width:0; background:var(--panel); border:1px solid var(--border-hi);
+  border-radius:var(--r-lg); padding:15px; overflow:hidden; }
+.wallet-card .wallet-head { display:flex; justify-content:space-between; flex-wrap:wrap;
+  gap:9px; min-width:0; }
+.wallet-card .wallet-head > div { min-width:0; }
+.wallet-card .wallet-addr { overflow-wrap:anywhere; word-break:break-all; }
+.wallet-card .wallet-note { color:var(--text-dim); font-size:11px;
+  line-height:1.5; overflow-wrap:anywhere; margin:9px 0 12px; }
+.wallet-card .wallet-actions .btn { min-width:0; white-space:normal; }

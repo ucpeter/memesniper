@@ -412,6 +412,7 @@ function upsertScanRow(row) {
   else S.scanFeed[i] = row;
   if (S.scanFeed.length > 200) S.scanFeed.length = 200;
   renderScanFeed();
+  renderWalletFeeds();
 }
 
 function handleWs(msg) {
@@ -452,7 +453,10 @@ function handleWs(msg) {
       mergePositionsFromWallet(msg.data.position);
       break;
     case 'wallet':
-      mergeWallet(msg.data);
+      if (msg.data && typeof msg.data === 'object' && msg.data.id) mergeWallet(msg.data);
+      else api('/api/wallets').then((rows) => {
+        if (Array.isArray(rows)) { S.wallets = rows; renderWallets(); renderOverall(); }
+      }).catch(() => {});
       break;
     case 'status':
       S.status = msg.data; renderChips(); renderStats();
@@ -793,7 +797,7 @@ function upsertPosition(pos) {
 
 async function refreshAll() {
   const [wallets, positions, logs] = await Promise.all([
-    api('/api/wallets').catch(() => []),
+    api('/api/wallets').catch(() => S.wallets || []),
     api('/api/positions').catch(() => []),
     api('/api/logs?limit=200').catch(() => []),
   ]);
@@ -826,19 +830,12 @@ function renderAll() { renderNotices(); renderChips(); renderStats(); renderOver
 
 function renderChips() {
   const running = S.status?.running;
-  $('runChip').className = `run-chip${running ? ' on' : ''}`;
-  $('runText').textContent = running ? 'scanner on' : 'scanner off';
+  $('runChip').className = `run-chip${S.status?.scanner?.connected ? ' on' : ''}`;
+  $('runText').textContent = S.status?.scanner?.connected ? 'SCANNER LIVE' : 'SCANNER CONNECTING';
   // The old label ("Engine on/off") named the implementation, not the job. Two
   // levels of control exist — this one feeds candidates to the wallets, and each
   // wallet decides whether to trade — so the button says the first half out loud.
-  const sb = $('btnStart');
-  sb.textContent = running ? '⏹ Stop scanning' : '▶ Start scanning';
-  sb.title = running
-    ? 'Stops the launch scanner. Open positions are still managed.'
-    : 'Starts the scanner. Each wallet is started separately on its card.';
-  $('runChip').title = running
-    ? 'Scanner running — launches are being evaluated by every armed wallet'
-    : 'Scanner stopped';
+  $('runChip').title = 'Launch stream is independent of each wallet. Start a wallet on its card to trade.';
 
   // Two facts, one line each. Everything else about dry run lives in the mode bar
   // and in the switch itself, which the user can see without hovering anything.
@@ -875,7 +872,7 @@ function paintModeSwitch(dry) {
   if (title) title.textContent = dry ? '🧪 DRY RUN — paper trading' : '🔴 LIVE — real funds';
   if (sub) {
     sub.textContent = dry
-      ? 'Simulated trades on a paper balance. ▶ Start a wallet to watch them open and close below.'
+      ? 'Start a wallet for simulated trades.'
       : 'Real funds. Every trade is a real transaction from your wallets.';
   }
 
@@ -1910,6 +1907,10 @@ function renderStats() {
 }
 
 function renderWallets() {
+  // A WS tick arrives every 2s. Replacing innerHTML while the owner types
+  // destroys the input/keyboard and discards the passphrase on Android.
+  // Do not repaint until the field blurs. The next tick will catch up.
+  if ($('wallets')?.querySelector('input:focus')) return;
   /* The SERVER's list, plus whatever this browser is holding that the server does
    * not have. See browserHeldWallets() — this is the line that makes "No wallets
    * yet" impossible while a sealed key is sitting in localStorage. */
@@ -1965,7 +1966,7 @@ function renderWallets() {
           </div>
           <span class="chip warn" title="This key is sealed in this browser and the server has no record of the wallet — for example after a redeploy threw its disk away. Registering it again takes one tap and does not touch the key.">⚠ not on the server</span>
         </div>
-        <div class="wallet-note">This wallet is safe in this browser, but the bot cannot see it: the server has no record of it, so nothing can trade it or read its balance. Registering it again brings its card back — the key stays sealed here.</div>
+        <div class="wallet-note">The key is sealed here. Register the address to use this wallet; your passphrase stays here.</div>
         <div class="wallet-actions">
           <button class="btn btn-primary btn-sm" data-register="${esc(w.publicKey)}">♻ Register again</button>
           <button class="btn btn-sm btn-danger" data-forget="${esc(w.publicKey)}" title="Remove this wallet from THIS browser. Any funds on its address stay on chain — keep the passphrase and the address if it holds SOL.">Delete here</button>
@@ -2000,7 +2001,7 @@ function renderWallets() {
 
         <div class="wallet-locked-note">
           ${here
-            ? `Its key is sealed in this browser under its own passphrase. Unlock it to trade or withdraw.`
+            ? `Key sealed in this browser. Type its passphrase to trade or withdraw.`
             : inKeystore
               ? `Its key is in your server keystore. Open the keystore to arm this wallet — if the keystore cannot open it, import the key instead.`
               : `No key for this wallet is stored here. Import it to trade this wallet again — <b>anything at the address above stays on chain.</b>`}
@@ -2028,6 +2029,7 @@ function renderWallets() {
               : `<button class="btn btn-sm btn-primary" data-importhere="${esc(w.id)}" title="Paste this wallet's private key and seal it in this browser">📥 Import its key</button>
                  <button class="btn btn-sm btn-danger" data-delrecord="${esc(w.id)}" title="Remove this wallet record. Its funds stay on chain.">🗑 Delete record</button>`}
         </div>
+        <div class="wallet-feed" data-wallet-feed="${esc(w.id)}"></div>
       </div>`;
     }
 
@@ -2110,15 +2112,17 @@ function renderWallets() {
           ? `<button class="btn btn-sm btn-warn" data-stop="${esc(w.id)}" title="Stop new entries for this wallet. Open positions are still managed, so your stops keep working.">⏸ Stop</button>`
           : `<button class="btn btn-sm btn-primary" data-start="${esc(w.id)}" title="Start this wallet${paperMode ? ' — it is in DRY RUN, so its trades will be simulated (paper trades on a paper balance)' : ''}. This also starts the engine if it is stopped.">▶ Start</button>`}
         <button class="btn btn-sm" data-detail="${esc(w.id)}" title="This wallet's open positions, its own trade history, and the launches it saw">📄 Trades</button>
-        <button class="btn btn-sm" data-feed="${esc(w.id)}" title="The launches THIS wallet has seen, and what it did about each one — bought, filtered, or skipped and why">📡 Feed</button>
+
         <button class="btn btn-sm" data-edit="${esc(w.id)}" title="Strategy, limits, exits and filters for this wallet">⚙ Config</button>
         <button class="btn btn-sm" data-withdraw="${esc(w.id)}" title="Move SOL out of this wallet">Withdraw</button>
         ${w.persistent ? `<button class="btn btn-sm" data-unpersist="${esc(w.id)}" title="Remove this wallet's key from the server. The sealed copy in this browser is untouched.">⏏ Remove from bot</button>` : ''}
         <button class="btn btn-sm btn-danger" data-close="${esc(w.id)}" title="Sell everything in this wallet and stop it trading">⛔ Kill all</button>
             ${w.keyArmed === false ? '' : `<button class="btn btn-sm" data-lock="${esc(w.id)}" title="Forget this wallet's key for now. The sealed copy in your browser is untouched.">🔒 Lock</button>`}
       </div>
+      <div class="wallet-feed" data-wallet-feed="${esc(w.id)}"></div>
     </div>`;
   }).join('');
+  renderWalletFeeds();
 }
 
 /**
@@ -2133,18 +2137,38 @@ function renderWallets() {
  * evaluation writes one, including the `filtered` and `skipped` cases — or when
  * that wallet is the one that bought it.
  */
+function renderWalletFeeds() {
+  for (const w of S.wallets || []) {
+    const mount = [...$('wallets').querySelectorAll('[data-wallet-feed]')]
+      .find((el) => el.getAttribute('data-wallet-feed') === w.id);
+    if (!mount) continue;
+    const rows = walletFeed(w);
+    const recent = rows.slice(0, 8);
+    const body = `<div class="wallet-feed-title">📡 ${esc(w.name)} · pump.fun launches
+      <span class="count">${rows.length}</span></div>
+      ${recent.length ? `<div class="tbl-wrap">${walletFeedTable(w, 8)}</div>`
+        : `<div class="wallet-feed-empty">${w.keyLocked
+          ? 'Key locked · open this wallet to evaluate launches.'
+          : w.armed ? 'Watching launches · no evaluation yet.' : 'Start this wallet to evaluate launches.'}</div>`}`;
+    if (mount.innerHTML !== body) mount.innerHTML = body;
+  }
+}
+
 function walletFeed(w) {
   if (!w) return [];
   return (S.scanFeed || []).filter((r) => {
-    if (r.boughtBy && r.boughtBy === w.name) return true;
-    return Array.isArray(r.wallets) && r.wallets.some((x) => x.name === w.name);
+    if (r.boughtById && r.boughtById === w.id) return true;
+    if (!r.boughtById && r.boughtBy === w.name) return true; // old/demo rows
+    return Array.isArray(r.wallets) && r.wallets.some((x) => x.walletId
+      ? x.walletId === w.id : x.name === w.name);
   });
 }
 
 /** What this wallet did about one launch, in its own words. */
 function walletVerdict(row, w) {
-  const mine = Array.isArray(row.wallets) ? row.wallets.find((x) => x.name === w.name) : null;
-  const bought = row.boughtBy === w.name;
+  const mine = Array.isArray(row.wallets) ? row.wallets.find((x) => x.walletId
+    ? x.walletId === w.id : x.name === w.name) : null;
+  const bought = row.boughtById ? row.boughtById === w.id : row.boughtBy === w.name;
   if (bought || (mine && mine.action === 'bought')) return { label: 'BOUGHT', cls: 'won', reason: null };
   if (!mine) return { label: 'not evaluated', cls: 'sim', reason: 'the engine had not reached this launch for this wallet' };
   if (mine.action === 'filtered') return { label: 'filtered', cls: 'sim', reason: mine.reason || 'its filters ruled the token out' };
@@ -2154,8 +2178,8 @@ function walletVerdict(row, w) {
 }
 
 /** The per-wallet launch table, shared by the 📄 Trades dialog and 📡 Feed. */
-function walletFeedTable(w) {
-  const rows = walletFeed(w).slice(0, 40);
+function walletFeedTable(w, limit = 40) {
+  const rows = walletFeed(w).slice(0, limit);
   if (!rows.length) {
     return `<div class="empty" style="padding:18px"><div class="empty-sub">No launch has reached ${esc(w.name)} yet. Press ▶ Start on its card and they will appear here as they are scanned.</div></div>`;
   }
@@ -2437,13 +2461,9 @@ function renderScanFeed() {
     const evaluated = (S.status && S.status.stats && S.status.stats.detected) || 0;
     const feed = S.scanStats || (S.status && S.status.scan) || null;
     const bits = [`<b>${rows.length}</b> launch${rows.length === 1 ? '' : 'es'} in this list`];
-    if (evaluated > rows.length) {
-      bits.push(`the wallets evaluated <b>${evaluated.toLocaleString()}</b> token${evaluated === 1 ? '' : 's'} this session`);
-    } else {
-      bits.push(`the wallets evaluated every one of them`);
-    }
+    if (evaluated) bits.push(`wallets evaluated <b>${evaluated.toLocaleString()}</b> this session`);
     if (feed && feed.dropped) bits.push(`${feed.dropped} older row(s) rolled off (the list keeps the newest 200)`);
-    if (S.status && S.status.running === false) bits.push('the engine is stopped, so nothing new is arriving');
+    if (S.status && !S.status.running) bits.push('wallet trading is idle');
     meta.innerHTML = bits.join(' · ');
   }
 
@@ -2454,23 +2474,20 @@ function renderScanFeed() {
   const dot = $('scanDot');
   const dotText = $('scanDotText');
   if (dot && dotText) {
-    const live = Boolean(sc.connected) && (S.status ? S.status.running !== false : true);
+    const live = Boolean(sc.connected);
     dot.classList.toggle('on', live);
     dot.classList.toggle('off', !live);
-    dotText.textContent = sc.connected ? (S.status && S.status.running === false ? 'scanner stopped' : 'live') : 'offline';
+    dotText.textContent = sc.connected ? 'live' : 'connecting';
     dot.title = sc.connected
       ? `Connected to ${sc.source || 'the launch feed'}. New launches appear here as they are created.`
-      : 'Not connected to the launch feed. Press ▶ Engine to start scanning.';
+      : 'Connecting to the pump.fun launch feed.';
   }
 
   if (!rows.length) {
-    const running = S.status ? S.status.running !== false : false;
     const connected = Boolean(sc.connected);
-    const body = !running
-      ? { title: 'The engine is stopped.', sub: 'Press <b>▶ Start scanning</b> above.' }
-      : connected
-        ? { title: 'Watching pump.fun — no launch has arrived yet.', sub: 'New tokens appear here as they are created.' }
-        : { title: 'The engine is running, but the feed is not connected.', sub: 'That is why this list is empty while the counters move.' };
+    const body = connected
+      ? { title: 'Watching pump.fun — no launch yet.', sub: 'New tokens appear automatically.' }
+      : { title: 'Connecting to pump.fun…', sub: 'No wallet needs to be started to see launches.' };
     mount.innerHTML = `
       <div class="scan-empty">
         <p><b>${body.title}</b></p>
@@ -4121,13 +4138,6 @@ document.addEventListener('click', async (e) => {
 
   const { edit, toggle, close: closeId, exit, resume, start, stop, detail } = t.dataset;
 
-  if (t.id === 'btnStart') {
-    try {
-      const running = S.status?.running;
-      await api(running ? '/api/engine/stop' : '/api/engine/start', { method: 'POST', body: '{}' });
-      toast(running ? 'Engine stopped' : 'Engine started', '');
-    } catch (err) { toast(err.message, 'err'); }
-  }
   if (t.id === 'modeDry' || t.dataset.modeDry) await setTradingMode(false);
   if (t.id === 'modeLive' || t.dataset.modeLive) await setTradingMode(true);
   if (t.id === 'btnConnect' || t.id === 'btnConnect2') openConnectModal();

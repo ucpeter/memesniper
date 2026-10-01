@@ -114,6 +114,26 @@
     .cmp{font-size:13.5px}
     .cmp th,.cmp td{padding:11px 12px}
   }
+
+  /* Read-only launch feed: no wallet settings or trade verdicts. Scrolls INSIDE
+     the panel on phones; the page and the token link stay reachable. */
+  .launch-section { padding:32px 0 45px }
+  .launch-heading { display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap }
+  .launch-heading h2 { margin:0 }
+  .launch-note,.launch-foot { color:var(--mute);font-size:13px;margin:8px 0 16px }
+  .launch-foot { margin:12px 0 0 }
+  .launch-foot a { color:var(--accent) }
+  .launch-table-wrap { overflow:auto;max-height:590px;border:1px solid var(--border);border-radius:14px;background:var(--panel) }
+  .launch-table { width:100%;min-width:570px;border-collapse:collapse;font-size:13px }
+  .launch-table th { position:sticky;top:0;background:var(--panel-2);text-align:left;color:var(--mute);font-size:10px;letter-spacing:.6px;text-transform:uppercase }
+  .launch-table th,.launch-table td { padding:12px 13px;border-bottom:1px solid var(--border);white-space:nowrap }
+  .launch-table tbody tr:hover { background:#171b20 }
+  .launch-table a { text-decoration:none;color:var(--accent);font-weight:700 }
+  .launch-table .minor { display:block;font-size:10px;color:var(--mute) }
+  .risk-high { color:var(--red) } .risk-medium { color:var(--amber) } .risk-low { color:var(--accent) }
+  .short-info { padding:28px 0 40px }
+  .short-info p { max-width:640px;color:var(--dim) }
+  @media(max-width:640px) { .launch-table-wrap { max-height:480px } .launch-section { padding:22px 0 30px } }
 </style>
 </head>
 <body>
@@ -121,12 +141,7 @@
 <nav>
   <div class="wrap nav-in">
     <a class="brand" href="/"><span class="mark"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="26" height="26" role="img" aria-label="Meme Sniper"> <defs> <clipPath id="msLens"> <circle cx="23.5" cy="31.5" r="12.6"/> <circle cx="40.5" cy="31.5" r="12.6"/> </clipPath> </defs> <!-- badge --> <rect width="64" height="64" rx="14" fill="#080f0a"/> <!-- Binocular barrels: a bright filled ring with the glass laid on top, rather than a stroked circle. Strokes with fill="none" are dropped outright by some SVG renderers (ImageMagick, for one), and an app icon has to survive a favicon, a PWA install and a link preview alike. --> <circle cx="23.5" cy="31.5" r="15.6" fill="#00e05c"/> <circle cx="40.5" cy="31.5" r="15.6" fill="#00e05c"/> <circle cx="23.5" cy="31.5" r="12.6" fill="#0c4026"/> <circle cx="40.5" cy="31.5" r="12.6" fill="#0c4026"/> <!-- the meme, seen through the field of view --> <g clip-path="url(#msLens)"> <ellipse cx="24.6" cy="27.6" rx="5.4" ry="6.2" fill="#ffffff"/> <ellipse cx="39.4" cy="27.6" rx="5.4" ry="6.2" fill="#ffffff"/> <circle cx="25.8" cy="28.8" r="2.7" fill="#04140a"/> <circle cx="38.2" cy="28.8" r="2.7" fill="#04140a"/> <circle cx="26.8" cy="27.7" r="0.95" fill="#ffffff"/> <circle cx="39.2" cy="27.7" r="0.95" fill="#ffffff"/> <path d="M21.8 36.6c2.2 5.2 6 7.8 10.2 7.8s8-2.6 10.2-7.8z" fill="#ffffff"/> <path d="M28.8 42.1c0 1.9 1.5 3.4 3.2 3.4s3.2-1.5 3.2-3.4z" fill="#ff6b81"/> </g> <!-- reticle ticks, clear of the glass so they read at favicon size --> <rect x="30.7" y="5.5" width="2.6" height="5.6" rx="1.3" fill="#00ff66"/> <rect x="30.7" y="52.9" width="2.6" height="5.6" rx="1.3" fill="#00ff66"/> <rect x="5.5" y="30.2" width="5.6" height="2.6" rx="1.3" fill="#00ff66"/> <rect x="52.9" y="30.2" width="5.6" height="2.6" rx="1.3" fill="#00ff66"/> </svg></span> MEME SNIPER</a>
-    <div class="nav-links">
-      <a href="#features">Features</a>
-      <a href="#honest">Honest limits</a>
-      <a href="#how">How it works</a>
-      <a href="#faq">FAQ</a>
-    </div>
+    <div class="nav-links"><a href="#launches">Live launches</a></div>
     <div class="spacer"></div>
     <a class="btn btn-primary" href="/terminal">▶ Open Terminal</a>
   </div>
@@ -135,188 +150,42 @@
 <header class="hero">
   <div class="wrap">
     <span class="pill"><span class="dot"></span> Self-hosted · Non-custodial · Dry-run by default</span>
-    <h1>The sniping bot that tells you<br/><em>the truth</em> about your bag.</h1>
-    <p class="lede">
-      Every wallet gets its own strategy — its own take-profit tiers, trailing stop, loss limit and
-      liquidity range. The bot runs on your machine, signs from keys you hold, and can only move funds
-      you deliberately moved into a burner first.
-    </p>
-    <div class="cta">
-      <a class="btn btn-primary btn-lg" href="/terminal">▶ Open Terminal</a>
-      <a class="btn btn-ghost btn-lg" href="#honest">What it does not do</a>
-    </div>
-    <p class="fine">No sign-up. No email. No telemetry. No address of ours to send your SOL to.</p>
+    <h1>Watch pump.fun launches.<br/><em>Trade on your terms.</em></h1>
+    <p class="lede">The public scanner runs automatically. Start each wallet separately to apply its own filters and trade decisions.</p>
+    <div class="cta"><a class="btn btn-primary btn-lg" href="/terminal">Open Terminal</a></div>
+    <p class="fine">Dry run by default. Live trading requires your confirmation.</p>
 
     <!-- Real numbers from THIS instance, or nothing. Never invented. -->
     <div class="live">
       <div class="live-head"><span class="dot" id="liveDot"></span><span id="liveLabel">Checking this instance…</span></div>
       <div class="live-grid">
-        <div class="live-cell"><div class="live-k">Engine</div><div class="live-v" id="lvEngine">—</div></div>
+        <div class="live-cell"><div class="live-k">Wallet trading</div><div class="live-v" id="lvEngine">—</div></div>
         <div class="live-cell"><div class="live-k">Mode</div><div class="live-v" id="lvMode">—</div></div>
         <div class="live-cell"><div class="live-k">Wallets</div><div class="live-v" id="lvWallets">—</div></div>
         <div class="live-cell"><div class="live-k">Keystore</div><div class="live-v" id="lvKeys">—</div></div>
       </div>
     </div>
-  </div>
 </header>
 
-<!-- ============================ FEATURES ============================ -->
-<section id="features">
+<section id="launches" class="launch-section">
   <div class="wrap">
-    <div class="eyebrow">What is actually in the box</div>
-    <h2>Features that exist in the code</h2>
-    <p class="sub">
-      Not a feature list copied from a marketing page — every item below is implemented, tested, and
-      documented in the project README.
-    </p>
-
-    <div class="grid g3">
-      <div class="card"><span class="ico">📉</span><h3>Trailing stop</h3>
-        <p>Activates at a gain you set, then ratchets up with the peak and never loosens. The peak is
-        preserved across a restart, so a long hold keeps the gains it already earned.</p></div>
-
-      <div class="card"><span class="ico">🛡️</span><h3>Hard loss limit</h3>
-        <p>Per trade and per day. Hit the daily number and that wallet stops opening anything new —
-        the circuit breaker is per wallet, not a global panic that takes the others down with it.</p></div>
-
-      <div class="card"><span class="ico">🎯</span><h3>Partial sells</h3>
-        <p>Sell X% at +Y%, in as many tiers as you like, highest threshold first. Sizes are absolute
-        token amounts, so several tiers firing in one tick cannot undersell each other.</p></div>
-
-      <div class="card"><span class="ico">👛</span><h3>A strategy per wallet</h3>
-        <p>Each wallet carries its own sizing, exits, limits, filters and AI settings. One can scalp
-        tight while another holds for a large target. They do not share anything.</p></div>
-
-      <div class="card"><span class="ico">🌊</span><h3>Liquidity range</h3>
-        <p>Snipe tokens whose bonding curve holds between a floor and a ceiling of real SOL. Because
-        that number grows as others buy, it doubles as a timing control: how early you are willing to enter.</p></div>
-
-      <div class="card"><span class="ico">🔬</span><h3>Rug checks before the buy</h3>
-        <p>Mint and freeze authority, top-holder concentration, dev holdings, bonding-curve progress,
-        metadata and socials. Hard fails block the trade; unknown data never does.</p></div>
-
-      <div class="card"><span class="ico">🤖</span><h3>Optional AI veto</h3>
-        <p>Bring your own key (OpenAI, Anthropic, Gemini, xAI) and the model gets a yes/no veto over
-        every candidate. Leave it off and nothing changes. It fails open, and it never moves money.</p></div>
-
-      <div class="card"><span class="ico">💸</span><h3>Fund and withdraw in-app</h3>
-        <p>Connect your own wallet, approve a transfer, and the burner is funded. Withdraw all of it or
-        an amount you type — to your own address, never to one of ours.</p></div>
-
-      <div class="card"><span class="ico">⛔</span><h3>Kill switches that work</h3>
-        <p>Kill one position, kill a wallet (and stop it), or panic everything. They market-sell at any
-        price and report honestly if they could not.</p></div>
+    <div class="launch-heading">
+      <div><div class="eyebrow">PUBLIC FEED · NO WALLET FILTERS</div><h2>Live pump.fun launches</h2></div>
+      <span id="launchState" class="pill">Connecting…</span>
     </div>
+    <p class="launch-note">New tokens appear automatically. Risk is informational, not a trade decision.</p>
+    <div class="launch-table-wrap"><table class="launch-table">
+      <thead><tr><th>Token</th><th>Dev</th><th>Dev hold</th><th>Liquidity (USD)</th><th>Risk</th></tr></thead>
+      <tbody id="launchRows"><tr><td colspan="5">Waiting for the feed…</td></tr></tbody>
+    </table></div>
+    <p class="launch-foot">Open a wallet in the <a href="/terminal">Terminal</a> to see launches filtered by that wallet and what it bought.</p>
   </div>
 </section>
-
-<!-- ======================= HONEST LIMITS ======================= -->
-<section id="honest">
-  <div class="wrap">
-    <div class="eyebrow">The part other bots leave out</div>
-    <h2>What it does <em>not</em> do</h2>
-    <p class="sub">
-      This project started as a source-level audit of a sniping site that turned out to be a wallet
-      drainer wrapped in a fake terminal. It advertised everything and built nothing. So here is the
-      comparison, side by side.
-    </p>
-
-    <table class="cmp">
-      <thead><tr><th>Claim</th><th>The drainer site</th><th>This bot</th></tr></thead>
-      <tbody>
-        <tr><td>Execution speed</td><td class="van">“Sub-10ms, private nodes.”</td><td><span class="no">No claim.</span> Your latency is your RPC. Jito bundles and priority fees are supported and configurable.</td></tr>
-        <tr><td>Rug detection</td><td class="van">“Neural net, 2.4M scams, 99.2% accurate.”</td><td><span class="yes">Real checks</span> on authority, holders, dev, curve, metadata. No invented accuracy figure.</td></tr>
-        <tr><td>Copy trading</td><td class="van">“Mirror top snipers by PnL.”</td><td><span class="no">Not built.</span></td></tr>
-        <tr><td>Multi-chain</td><td class="van">“Base, Blast, L2s coming Q1.”</td><td><span class="no">Solana only.</span></td></tr>
-        <tr><td>Social proof</td><td class="van">“42,000 traders · 4.7 on Trustpilot · CertiK audited.”</td><td><span class="no">None, because it would be a lie.</span> There is no user count to quote.</td></tr>
-        <tr><td>Live profit ticker</td><td class="van">Synthetic handles showing fabricated profits.</td><td><span class="yes">Your own P&amp;L</span> from your own positions. The strip above reports this instance only.</td></tr>
-        <tr><td>Who holds the keys</td><td class="van">18 wallet adapters wired for <span class="mono">signMessage</span> and <span class="mono">signAllTransactions</span>.</td><td><span class="yes">You do.</span> Keys are AES-256-GCM encrypted locally, held in memory only, and the bot locks itself on restart.</td></tr>
-        <tr><td>Recovery from a restart</td><td class="van">“Auto-restart on network glitches.”</td><td><span class="yes">Positions are written down</span> and re-adopted after a restart, verified against the on-chain balance before they are trusted.</td></tr>
-        <tr><td>Profitability</td><td class="van">“Best today +184x.”</td><td><span class="no">No promise.</span> Most memecoin snipes lose money. Size like it.</td></tr>
-      </tbody>
-    </table>
-
-    <div class="note" style="margin-top:18px">
-      <b>Read this before you fund anything.</b> Sniping new launches is close to zero-sum against
-      bots that are faster than you, and the tokens that pump are the minority. This tool gives you
-      discipline and honest accounting — it does not give you an edge you did not have. Start in
-      dry-run, stay small, and never fund a burner with more than you would shrug off.
-    </div>
-  </div>
-</section>
-
-<!-- ========================== HOW IT WORKS ========================== -->
-<section id="how">
-  <div class="wrap">
-    <div class="eyebrow">From nothing to funded</div>
-    <h2>How it works</h2>
-    <p class="sub">Four steps, all inside the Terminal. No account, no KYC, no deposit address.</p>
-
-    <ol class="steps">
-      <li><b>Set a passphrase</b><span>The keystore is created on your machine and encrypted with AES-256-GCM. It locks itself on every restart, by design.</span></li>
-      <li><b>Create a burner wallet</b><span>A throwaway hot wallet the bot generates and holds the key for. Name it. Give it its own strategy: exits, limits, filters.</span></li>
-      <li><b>Fund it from your own wallet</b><span>Connect Phantom, Solflare, Backpack or Magic Eden, type an amount, approve the transfer. There is no address of ours to send to — ever.</span></li>
-      <li><b>Start it and watch</b><span>Press Start on the wallet. Dry-run is on until you deliberately turn it off, twice.</span></li>
-    </ol>
-  </div>
-</section>
-
-<!-- ============================== FAQ ============================== -->
-<section id="faq">
-  <div class="wrap">
-    <div class="eyebrow">Questions worth asking</div>
-    <h2>FAQ</h2>
-    <p class="sub"></p>
-
-    <details><summary>Does closing the browser tab stop the bot?</summary>
-      <p>No. The engine runs as a process on your machine and the browser is only a remote control over
-      a WebSocket. Measured on this build: with the dashboard closed, the scanner kept detecting
-      launches and the price feed stayed healthy. Exits do not need a tab to be open.</p></details>
-
-    <details><summary>What happens if the bot restarts while I hold a 24-hour position?</summary>
-      <p>Open positions are written to <span class="mono">data/positions.json</span>. When the bot comes
-      back and the keystore is unlocked, each one is checked against the wallet's real on-chain balance
-      and re-adopted — with its cost basis and its trailing-stop peak intact. If a balance read fails,
-      the position is kept for the next attempt rather than forgotten, because unknown is not zero.</p></details>
-
-    <details><summary>Why is the keystore locked? I never locked it.</summary>
-      <p>Because it locks itself on every restart. Your keys live in memory only while running and are
-      never written to disk unencrypted, so a fresh boot always starts locked. That is a safety feature,
-      not a fault. Unlock once and it stays unlocked until the next restart.</p></details>
-
-    <details><summary>Can the bot take my main wallet?</summary>
-      <p>No. It never asks for your seed phrase, and the only thing it ever asks your connected wallet to
-      sign is a transfer it authored, which the server verifies instruction-by-instruction before
-      broadcasting: program, source, destination, amount and payer must all match the intent you
-      approved. <span class="mono">signAllTransactions</span> and <span class="mono">signMessage</span>
-      appear nowhere in the codebase.</p></details>
-
-    <details><summary>What do I need to run it?</summary>
-      <p>Node 20 and a Solana RPC endpoint. The public one works but rate-limits hard; a free Helius or
-      QuickNode key makes a large difference. A full deployment guide for running it locally and on
-      Render is in the README.</p></details>
-
-    <details><summary>Is it audited?</summary>
-      <p>No, and anyone who says otherwise about their own bot is selling something. It ships with 99
-      tests, the money-handling paths are covered, and the source is short enough to read. Treat it as
-      a tool you are responsible for, not a product you are insured against.</p></details>
-  </div>
-</section>
-
-<!-- ============================= FINAL CTA ============================= -->
-<section>
-  <div class="wrap" style="text-align:center">
-    <h2>Take it for a spin — with no money in it</h2>
-    <p class="sub" style="margin:0 auto 30px">
-      Dry-run is the default. Positions, P&amp;L, tiers and exits all run exactly as they do live,
-      against a notional balance, so you can watch the logic decide before it costs you anything.
-    </p>
-    <div class="cta" style="justify-content:center">
-      <a class="btn btn-primary btn-lg" href="/terminal">▶ Open Terminal</a>
-    </div>
-    <p class="fine">Wallet setup, funding and strategy configuration all live behind that button.</p>
-  </div>
-</section>
+<section class="short-info"><div class="wrap">
+  <h2>One bot, separate wallets</h2>
+  <p>Each wallet has its own limits, exits and filters. Create a burner, seal its key in this browser, then start that wallet in the Terminal.</p>
+  <p class="fine">No profit guarantees. Do not fund a wallet with more than you can lose.</p>
+</div></section>
 
 <footer>
   <div class="wrap foot-in">
@@ -325,8 +194,7 @@
     <a class="btn btn-ghost" href="/terminal">▶ Open Terminal</a>
   </div>
   <div class="wrap" style="margin-top:18px">
-    MEME SNIPER is self-hosted software for Solana. Not financial advice, not affiliated with pump.fun,
-    Phantom, Jupiter or any of the sites it was written to replace. Nothing on this page is a promise of profit.
+    Self-hosted Solana software · Not affiliated with pump.fun · Not financial advice.
   </div>
 </footer>
 
@@ -347,10 +215,10 @@
     const d = await res.json();
     if (!d || !d.engine) throw new Error('not the bot');
     const e = d.engine;
-    set('lvEngine', e.running ? 'Running' : 'Stopped', e.running ? 'ok' : 'warnc');
+    set('lvEngine', e.running ? 'Active' : 'Idle', e.running ? 'ok' : 'warnc');
     set('lvMode', e.dryRun ? 'Dry run' : 'LIVE', e.dryRun ? 'ok' : 'livec');
     set('lvWallets', String(e.wallets ?? '—'));
-    set('lvKeys', d.keystore?.unlocked ? 'Unlocked' : 'Locked', d.keystore?.unlocked ? 'ok' : 'warnc');
+    set('lvKeys', d.keystore?.unlocked ? 'Open' : 'Locked', d.keystore?.unlocked ? 'ok' : 'warnc');
     if (e.running && !e.dryRun) {
       document.getElementById('liveLabel').textContent = 'Live from this instance · 🔴 REAL FUNDS ARE ACTIVE';
     }
@@ -360,6 +228,61 @@
     ['lvEngine', 'lvMode', 'lvWallets', 'lvKeys'].forEach((k) => set(k, '—'));
     document.getElementById('liveDot').style.background = 'var(--amber)';
   }
+})();
+</script>
+<script>
+(() => {
+  const body = document.getElementById('launchRows');
+  const state = document.getElementById('launchState');
+  const add = (parent, tag, text, cls) => {
+    const node = document.createElement(tag);
+    node.textContent = text;
+    if (cls) node.className = cls;
+    parent.appendChild(node);
+    return node;
+  };
+  async function refreshLaunches() {
+    try {
+      const resp = await fetch('/api/launches', { cache: 'no-store' });
+      if (!resp.ok) throw new Error('feed unavailable');
+      const data = await resp.json();
+      state.textContent = data.connected ? '● Live' : '○ Connecting';
+      state.style.color = data.connected ? 'var(--accent)' : 'var(--amber)';
+      const rows = Array.isArray(data.rows) ? data.rows : [];
+      if (!rows.length) {
+        body.replaceChildren();
+        const tr = body.insertRow(); add(tr.insertCell(), 'span', data.connected
+          ? 'Watching pump.fun — waiting for the next launch.'
+          : 'Connecting to pump.fun…');
+        tr.firstChild.colSpan = 5;
+        return;
+      }
+      body.replaceChildren();
+      for (const row of rows.slice(0, 50)) {
+        const tr = body.insertRow();
+        const token = tr.insertCell();
+        const a = add(token, 'a', row.symbol || 'Unknown');
+        a.href = 'https://pump.fun/coin/' + encodeURIComponent(row.mint || '');
+        a.target = '_blank'; a.rel = 'noopener noreferrer';
+        add(token, 'span', row.mint ? row.mint.slice(0, 5) + '…' + row.mint.slice(-5) : '—', 'minor');
+        add(tr.insertCell(), 'span', row.devWallet ? row.devWallet.slice(0, 5) + '…' + row.devWallet.slice(-4) : '—', 'mono');
+        add(tr.insertCell(), 'span', row.devHoldPct == null ? 'unread' : Number(row.devHoldPct).toFixed(1) + '%');
+        add(tr.insertCell(), 'span', row.liquidityUsd == null ? 'unread' :
+          '$' + Number(row.liquidityUsd).toLocaleString('en-US') + (row.liquidityApprox ? ' ≈' : ''));
+        const risk = row.riskScore;
+        add(tr.insertCell(), 'span', risk == null ? 'unread' : String(risk),
+          risk == null ? '' : risk >= 50 ? 'risk-high' : risk > 0 ? 'risk-medium' : 'risk-low');
+      }
+    } catch {
+      state.textContent = '○ Offline'; state.style.color = 'var(--amber)';
+      if (!body.rows.length) {
+        const tr = body.insertRow(); add(tr.insertCell(), 'span', 'The launch feed is unavailable.');
+        tr.firstChild.colSpan = 5;
+      }
+    }
+  }
+  refreshLaunches();
+  setInterval(refreshLaunches, 2500);
 })();
 </script>
 </body>
