@@ -474,7 +474,12 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
    */
   await test('LOCKED WALLETS: reported with their address while the keystore is closed', async () => {
     const Engine = require('../src/engine/engine');
-    const A = cfg.normaliseWallet(cfg.deepMerge(cfg.defaultWalletConfig('Alpha'), { id: 'w_a', enabled: true }));
+    const A = cfg.normaliseWallet(cfg.deepMerge(cfg.defaultWalletConfig('Alpha'), {
+      id: 'w_a',
+      enabled: true,
+      // Counts a wallet earned in an earlier session, saved with it in config.json.
+      stats: { bought: 6, wins: 3, losses: 2, realisedPnlSol: 0.8, tradesToday: 2 },
+    }));
     A.publicKey = 'Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS';
     const engine = new Engine({
       config: { global: cfg.defaultGlobalConfig(), wallets: [A] },
@@ -495,8 +500,24 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
     assert.strictEqual(locked[0].publicKey, A.publicKey, 'and its on-chain address');
     assert.strictEqual(locked[0].keyLocked, true, 'flagged as locked');
     assert.strictEqual(locked[0].keyMissing, false, 'not as missing — an open keystore may still hold it');
-    assert.strictEqual(locked[0].balanceSol, null, 'balance is unknown, and null says unknown, not zero');
-    assert.strictEqual(locked[0].stats, null, 'and no invented statistics');
+    // The balance IS read for a locked wallet now — the address is public, and
+    // "is my money still there?" is the question this card exists to answer. This
+    // engine has no connection to read it from, so null is still the honest value
+    // here: unknown, which is not the same as zero.
+    assert.strictEqual(locked[0].balanceSol, null, 'balance is unknown without a connection, and null says unknown, not zero');
+    /* Counts the wallet EARNED are kept (they live in config.json next to its name,
+     * and a locked wallet must not lose its record). What is not readable without a
+     * key — what is open right now, today's trades — is null, not zero: "cannot see"
+     * and "nothing" are different answers. */
+    const st = locked[0].stats;
+    if (st) {
+      assert.strictEqual(st.wins, 3, 'the wins it earned are still reported');
+      assert.strictEqual(st.losses, 2, 'and its losses');
+      assert.strictEqual(st.bought, 6, 'and the tokens it bought');
+      assert.strictEqual(st.tradesToday, null, 'but today, which needs the key, is unknown — not zero');
+    } else {
+      assert.strictEqual(st, null, 'a wallet with no saved stats reports none, rather than inventing zeroes');
+    }
     assert.ok(!engine.traders.has('w_a'), 'it must NOT become a trader: no key, no trading');
   });
 

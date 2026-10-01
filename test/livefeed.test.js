@@ -15,7 +15,14 @@ const path = require('node:path');
 
 const ROOT = path.join(__dirname, '..');
 const { LiveFeed, DECISION } = require(path.join(ROOT, 'src/engine/livefeed'));
+const solprice = require(path.join(ROOT, 'src/engine/solprice'));
 const bus = require(path.join(ROOT, 'src/util/events'));
+
+/* A pinned SOL price. Liquidity is expressed in dollars now, and the RISK score is
+ * derived from those dollars, so a suite that let the real rate in would pass or
+ * fail depending on the weather in the crypto market. At $200 a SOL the arithmetic
+ * below is exact, and the thresholds it tests are the code's own defaults. */
+solprice.__setPrice(200, 'test-suite');
 
 let passed = 0;
 let failed = 0;
@@ -74,7 +81,10 @@ const candidate = (n) => ({
       });
       const row = feed.snapshot()[0];
       assert.strictEqual(row.liquiditySol, 12.5, 'liquidity must be shown');
+      assert.strictEqual(row.liquidityUsd, 2500, 'and priced — 12.5 SOL at the pinned $200');
       assert.strictEqual(row.devHoldPct, 3.4, 'dev holdings must be shown');
+      // $2,500 clears the $2,000 floor and 3.4% is well under the 15% ceiling, so
+      // the derived score is 0 and the honeypot read's 0 stands.
       assert.strictEqual(row.riskScore, 0);
     });
   });
@@ -93,7 +103,11 @@ const candidate = (n) => ({
       const row = feed.snapshot()[0];
       assert.strictEqual(row.decision, DECISION.SKIPPED);
       assert.match(row.skipReason, /dev_hold_high/, 'the reason is the whole point of the row');
-      assert.deepStrictEqual(row.riskNotes, ['mint_authority_live']);
+      // 2.1 SOL is $420 at the pinned price: under the floor, so the derived risk
+      // note joins the honeypot one. Both are reasons this launch is dangerous.
+      assert.ok(row.riskNotes.includes('mint_authority_live'), 'the honeypot note survives');
+      assert.ok(row.riskNotes.some((n) => /liquidity \$/.test(n)), 'and the thin liquidity is named too');
+      assert.ok(row.riskScore >= 25, 'the score keeps the worst signal, not the last one');
       assert.strictEqual(row.wallets[0].action, 'skipped');
     });
   });
@@ -204,8 +218,14 @@ const candidate = (n) => ({
   assert.ok(row, 'the row exists');
   assert.strictEqual(row.devHoldPct, 7.25, 'dev hold comes from the recon pass');
   assert.strictEqual(row.liquiditySol, 2.4, 'and so does liquidity');
-  assert.strictEqual(row.riskScore, 25, 'and the risk score');
-  assert.deepStrictEqual(row.riskNotes, ['mint_authority_live']);
+  // The recon pass reports the honeypot risk AND, because $2.4 is not a number
+  // anyone can judge, the derived score now runs over the same facts — 2.4 SOL is
+  // $480 at the pinned price, under the $2,000 floor, so the derived score is
+  // higher than the honeypot's 25 and the worst signal wins.
+  // 2.4 SOL = $480; shortfall (2000-480)/2000 = 0.76 → 12 + 21.3 = 33.
+  assert.strictEqual(row.riskScore, 33, 'the risk score takes the worst known signal');
+  assert.ok(row.riskNotes.includes('mint_authority_live'), 'the honeypot note is kept');
+  assert.ok(row.riskNotes.some((n) => /liquidity \$480/.test(n)), 'and the dollar figure is in the note');
   // It is a fact read, not a verdict: the row must not claim a wallet decided.
   assert.strictEqual(row.decision, 'checking', 'no wallet has decided anything');
   assert.strictEqual(row.wallets.length, 0, 'and no wallet is credited with a verdict');
@@ -276,5 +296,6 @@ test('the row is broadcast so the dashboard can patch it live', () => {
 
   console.log(`\n${'─'.repeat(60)}`);
   console.log(`  ${passed} passed, ${failed} failed\n`);
+  solprice.__reset();
   process.exit(failed === 0 ? 0 : 1);
 })();

@@ -649,6 +649,126 @@ function extractFn(name) {
   });
 
 
+  /* ───────────── the preview's launch rows carry the same facts ───────────── */
+
+  console.log('\nThe preview shows the same scanner facts, in dollars\n');
+
+  await t('preview launches carry dev hold, liquidity in DOLLARS and a risk score', async () => {
+    const realRandom = Math.random;
+    const savedWallets = S.wallets.slice();
+    const savedPositions = S.positions;
+    const savedFeed = S.scanFeed;
+    Math.random = () => 0.9;
+    try {
+      const probe = api.demoNewWallet('Facts', 'balanced');
+      probe.enabled = true; probe.armed = true; probe.stats.paused = false;
+      S.wallets = [probe];
+      S.positions = [];
+      S.scanFeed = [];
+      api.demoTickLaunches();
+      api.demoTickLaunches();
+      api.demoTickLaunches();
+
+      const row = S.scanFeed[0];
+      if (!row) throw new Error('the preview produced no launch row at all');
+      eq(Number.isFinite(row.devHoldPct), true, 'dev hold must be a number, not a dash');
+      eq(Number.isFinite(row.liquidityUsd), true, 'liquidity must be priced in dollars');
+      eq(row.liquidityUsd > 0, true, 'and the dollars must be positive');
+      eq(Number.isFinite(row.riskScore), true, 'and there must be a risk score');
+      eq(row.facts && row.facts.devHold, 'event', 'with the same provenance the real rows use');
+      eq(row.solUsdSource, 'demo', 'and the preview must label its fixed rate rather than imply a live quote');
+      eq(Array.isArray(row.wallets), true, 'and the per-wallet verdicts that power the wallet feed');
+    } finally {
+      Math.random = realRandom;
+      S.wallets = savedWallets;
+      S.positions = savedPositions;
+      S.scanFeed = savedFeed;
+    }
+  });
+
+  await t('the preview reports overall trades / wins / losses for the top card', async () => {
+    const savedWallets = S.wallets.slice();
+    try {
+      const a = api.demoNewWallet('OverallA', 'balanced');
+      const b = api.demoNewWallet('OverallB', 'balanced');
+      a.stats = { wins: 5, losses: 1, realisedPnlSol: 0.8, tradesToday: 2 };
+      b.stats = { wins: 1, losses: 4, realisedPnlSol: -0.3, tradesToday: 1 };
+      S.wallets = [a, b];
+
+      const st = await api.demoApi('/api/status');
+      const o = st.engine.overall;
+      if (!o) throw new Error('the preview status must carry `overall`, like the real one');
+      eq(o.trades, 11, 'closed trades across every wallet');
+      eq(o.wins, 6, 'wins');
+      eq(o.losses, 5, 'losses');
+      eq(Math.round(o.winRatePct), 55, 'and the win rate derived from them');
+      eq(o.wallets.length, 2, 'with one row per wallet');
+    } finally {
+      S.wallets = savedWallets;
+    }
+  });
+
+  await t('a preview wallet BOUGHT row names the buyer, so the wallet feed can list it', async () => {
+    const realRandom = Math.random;
+    const savedWallets = S.wallets.slice();
+    const savedPositions = S.positions;
+    const savedFeed = S.scanFeed;
+    Math.random = () => 0.9;
+    try {
+      const probe = api.demoNewWallet('Buyer', 'balanced');
+      probe.enabled = true; probe.armed = true; probe.stats.paused = false;
+      S.wallets = [probe];
+      S.positions = [];
+      S.scanFeed = [];
+      api.demoTickLaunches(); api.demoTickLaunches(); api.demoTickLaunches();
+      const bought = S.scanFeed.find((r) => r.decision === 'bought');
+      if (!bought) throw new Error('the pinned RNG should have produced at least one buy');
+      eq(bought.boughtBy, 'Buyer', 'the row must say WHICH wallet took it');
+    } finally {
+      Math.random = realRandom;
+      S.wallets = savedWallets;
+      S.positions = savedPositions;
+      S.scanFeed = savedFeed;
+    }
+  });
+
+  await t('the preview mirrors SEND-TO-BOT, and says nothing left the page', async () => {
+    const savedWallets = S.wallets.slice();
+    const savedKeystore = S.keystore;
+    try {
+      const w = api.demoNewWallet('Persistence', 'balanced');
+      S.wallets = [w];
+      S.keystore = { initialised: true, unlocked: false };
+
+      // No keystore passphrase yet: the server's own refusal, mirrored.
+      let refused = false;
+      try { await api.demoApi(`/api/wallets/${w.id}/persist`, { method: 'POST', body: JSON.stringify({ secretKey: 'x' }) }); }
+      catch (err) { refused = /keystore_passphrase_required/.test(err.message); }
+      eq(refused, true, 'the preview must ask for the keystore passphrase, like the real route');
+
+      const ok = await api.demoApi(`/api/wallets/${w.id}/persist`, {
+        method: 'POST',
+        body: JSON.stringify({ secretKey: 'x', keystorePassphrase: 'demo-passphrase' }),
+      });
+      eq(ok.persistent, true, 'the wallet is ON THE BOT');
+      eq(ok.keyHolder, 'server', 'and the bot holds the key');
+      eq(ok.wallet.persistent, true, 'on the card too');
+
+      const back = await api.demoApi(`/api/wallets/${w.id}/unpersist`, { method: 'POST', body: '{}' });
+      eq(back.persistent, false, 'and it can be taken back out again');
+      eq(back.keyHolder, 'browser', 'leaving the key where it belongs');
+    } finally {
+      S.wallets = savedWallets;
+      S.keystore = savedKeystore;
+    }
+  });
+
+  await t('the preview reports a SOL price, so the demo cards can show dollars', async () => {
+    const st = await api.demoApi('/api/status');
+    eq(Number.isFinite(Number(st.engine.solUsd)), true, 'a rate must be present');
+    eq(st.engine.solUsdSource, 'demo', 'labelled as the preview rate, never as a live quote');
+  });
+
   console.log(`\n  ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

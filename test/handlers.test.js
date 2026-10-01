@@ -501,6 +501,7 @@ async function test(name, fn) {
         $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: (id) => opened.push(id),
         keyHere: () => false,
         esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
+        browserHeldWallets: () => [], usdOf: () => '',
       });
       assertScopeIsHonest({
         $, S: state, keystoreState: () => {}, openKeystore: () => {}, openWallet: () => {}, keyHere: () => {}, esc: () => {}, fmtSol: () => {}, cls: () => {}, winRateOf: () => {},
@@ -518,6 +519,88 @@ async function test(name, fn) {
     }
   });
 
+  await test('a wallet the BROWSER holds is on screen even when the server has none', () => {
+    // The reported failure, exactly: two wallets created, the hosted server's disk
+    // wiped, the re-registration POST did not land — and the panel rendered the
+    // server's empty list, "No wallets yet", while two sealed keys sat in
+    // localStorage. Whatever the server knows, the browser's own wallets render.
+    const { $, els } = makeDom();
+    const state = { wallets: [], keystore: { initialised: true, unlocked: true } };
+    const held = [{
+      id: 'browser:So11111111111111111111111111111111111111112',
+      name: 'My Burner',
+      publicKey: 'So11111111111111111111111111111111111111112',
+      localOnly: true, keyLocked: true,
+      stats: { wins: 0, losses: 0, bought: 0, realisedPnlSol: 0 },
+      openPositions: [],
+    }];
+    const renderWallets = build(extractFunction(src, 'renderWallets'), {
+      $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
+      keyHere: () => true,
+      esc: (v) => String(v ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
+      browserHeldWallets: () => held,
+    });
+
+    renderWallets();
+
+    const html = els['wallets'].innerHTML;
+    assert.ok(!/No wallets yet/.test(html), 'the empty state must NOT appear while the browser holds a wallet');
+    assert.match(html, /My Burner/, 'the wallet name is on screen');
+    assert.match(html, /So11111111111111111111111111111111111111112/, 'and its address');
+    assert.match(html, /data-register="/, 'with a one-tap way to put it back on the server');
+    assert.match(html, /data-forget="/, 'and a way to delete it here, with the funds warning attached');
+    assert.strictEqual(els['walletCount'].textContent, 1, 'and it counts');
+  });
+
+  await test('a card renders with REAL dollar values when the bot reports a rate', () => {
+    // The stubbed scopes above use `usdOf: () => ''` so that a template which calls
+    // it cannot crash the suite. This one uses the real helper, because the point is
+    // that the numbers appear.
+    const { $, els } = makeDom();
+    const state = {
+      wallets: [{
+        id: 'w_1', name: 'Alpha', enabled: true, balanceSol: 2, paperTrading: true, paperBalanceSol: 10,
+        publicKey: 'DEMO', persistent: true,
+        stats: { bought: 6, wins: 3, losses: 2, realisedPnlSol: 1.5, tradesToday: 2 },
+        config: { preset: 'balanced', buy: { maxConcurrentPositions: 4 }, exits: { stopLossPct: 25, takeProfitTiers: [{ gainPct: 50, sellPct: 33 }] }, limits: { dailyLossLimitSol: 2 } },
+        openPositions: [],
+      }],
+      keystore: { initialised: true, unlocked: true },
+      status: { solUsd: 200, solUsdSource: 'coingecko', solUsdStale: false },
+    };
+    const usdOf = build(extractFunction(src, 'usdOf'), { S: state });
+    const renderWallets = build(extractFunction(src, 'renderWallets'), {
+      $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
+      keyHere: () => true, usdOf,
+      esc: (v) => String(v ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
+      browserHeldWallets: () => [],
+    });
+
+    renderWallets();
+
+    const html = els['wallets'].innerHTML;
+    assert.match(html, /\$400/, '2 SOL at $200 a SOL is $400, on the balance');
+    assert.match(html, /\$300/, 'and $1.50 realised is $300');
+    assert.match(html, /🖥 on bot/, 'a wallet the bot holds says so on its card');
+    assert.match(html, /data-unpersist/, 'and can be taken back out from there');
+    assert.match(html, /Bought/, 'and its card counts what it bought');
+  });
+
+  await test('the SEND-TO-BOT dialog asks for the wallet passphrase, and the keystore one only when needed', () => {
+    // The reference repo's `persistent-bot/start` — { walletAddress, secretKeyBase64 }
+    // posted once so the bot keeps trading with the tab closed. The wiring is what
+    // this asserts, because that is the part that has been missing twice.
+    const persist = extractFunction(src, 'persistWallet');
+    assert.match(persist, /\/persist`/, 'it posts the wallet key to the persist route');
+    assert.match(persist, /secretToBase58/, 'sending the KEY the store unsealed');
+    assert.match(persist, /keystorePassphrase/, 'and the keystore passphrase, to seal it at rest');
+    assert.match(persist, /needsKeystore/, 'asked for only when the keystore is not already open');
+    assert.match(persist, /pwPass|Passphrase/, 'with an explicit field for the wallet passphrase');
+    assert.match(persist, /secret\.fill\(0\)/, 'and the unsealed bytes are wiped as soon as they are sent');
+    const unpersist = extractFunction(src, 'unpersistWallet');
+    assert.match(unpersist, /unpersist/, 'and there is a way to take the key back out');
+  });
+
   await test('a wallet list renders a card per wallet with its own controls', () => {
     const { $, els } = makeDom();
     const state = {
@@ -532,6 +615,7 @@ async function test(name, fn) {
     const renderWallets = build(extractFunction(src, 'renderWallets'), {
       $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
       esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 50,
+      browserHeldWallets: () => [], usdOf: () => '',
     });
 
     renderWallets();
@@ -618,6 +702,7 @@ async function test(name, fn) {
       $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
       keyHere: () => true,
       esc: (v) => String(v ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
+      browserHeldWallets: () => [], usdOf: () => '',
     });
 
     renderWallets();
@@ -649,6 +734,7 @@ async function test(name, fn) {
       $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
       keyHere: () => false,
       esc: (v) => String(v ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 0,
+      browserHeldWallets: () => [], usdOf: () => '',
     });
 
     renderWallets();

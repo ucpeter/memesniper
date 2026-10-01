@@ -378,6 +378,222 @@ function transferTx({ from, to, lamports, extra = [], feePayer = from }) {
     assert.throws(() => makeExecutor().assertTransferMatches('not base64 at all', intent), /unreadable transaction bytes|no transaction bytes/);
   });
 
+  /* ─────────────────── the BROWSER-signed withdrawal ─────────────────── */
+
+  console.log('\nA withdrawal signed in the browser, and broadcast here\n');
+
+  /** A connection that records what it was asked to broadcast. */
+  function recordingConn({ fail = false } = {}) {
+    const sent = [];
+    return {
+      sent,
+      sendRawTransaction: async (raw) => {
+        if (fail) throw new Error('429 rate limited');
+        sent.push(Buffer.from(raw));
+        return `${'Sig'.padEnd(64, '1')}${sent.length}`.slice(0, 88);
+      },
+      getSignatureStatuses: async () => ({
+        value: [{ confirmationStatus: 'confirmed', err: null }],
+      }),
+      getLatestBlockhash: async () => ({ blockhash: BLOCKHASH, lastValidBlockHeight: 999999 }),
+      getBalance: async () => 2_000_000_000,
+    };
+  }
+
+  /** Exactly what the server hands the browser: an unsigned transfer. */
+  function unsignedFor(from, to, lamports) {
+    const tx = transferTx({ from, to, lamports });
+    return {
+      tx,
+      b64: Buffer.from(tx.serialize({ requireAllSignatures: false, verifySignatures: false })).toString('base64'),
+    };
+  }
+
+  await test('a browser-signed transfer is broadcast, and the bot never sees the key', async () => {
+    const kp = Keypair.generate();
+    const { tx, b64 } = unsignedFor(kp.publicKey, new PublicKey(DEST), 5_000_000);
+    tx.sign(kp); // this is what walletStore.signTransaction does in the tab
+
+    const ex = new Executor(cfg.defaultGlobalConfig(), { getKeypair: () => null, has: () => false });
+    const conn = recordingConn();
+    ex.conn = () => conn;
+
+    const out = await ex.sendSignedTransfer({
+      expectFrom: kp.publicKey.toBase58(),
+      destination: DEST,
+      lamports: 5_000_000,
+      txBase64: Buffer.from(tx.serialize()).toString('base64'),
+    });
+
+    assert.strictEqual(out.ok, true, `must broadcast: ${JSON.stringify(out)}`);
+    assert.strictEqual(out.signedBy, 'browser', 'and say who signed it');
+    assert.strictEqual(conn.sent.length, 1, 'exactly one broadcast');
+    // The keystore in this test answers has() => false for everything: the wallet
+    // was never armed, and the withdrawal still worked. That is the property.
+    assert.strictEqual(out.lamports, '5000000');
+    void b64;
+  });
+
+  await test('a transfer to the WRONG destination is refused, not broadcast', async () => {
+    const kp = Keypair.generate();
+    const { tx } = unsignedFor(kp.publicKey, new PublicKey(OTHER), 5_000_000);
+    tx.sign(kp);
+
+    const ex = new Executor(cfg.defaultGlobalConfig(), { getKeypair: () => null, has: () => false });
+    const conn = recordingConn();
+    ex.conn = () => conn;
+
+    const out = await ex.sendSignedTransfer({
+      expectFrom: kp.publicKey.toBase58(),
+      destination: DEST, // what the user asked for
+      lamports: 5_000_000,
+      txBase64: Buffer.from(tx.serialize()).toString('base64'), // what was signed
+    });
+
+    assert.strictEqual(out.ok, false, 'a different destination must not go out');
+    assert.match(out.error, /destination mismatch|refused/);
+    assert.strictEqual(conn.sent.length, 0, 'and nothing may reach the network');
+  });
+
+  await test('a transfer for a LARGER amount than asked is refused', async () => {
+    const kp = Keypair.generate();
+    const { tx } = unsignedFor(kp.publicKey, new PublicKey(DEST), 999_000_000);
+    tx.sign(kp);
+
+    const ex = new Executor(cfg.defaultGlobalConfig(), { getKeypair: () => null, has: () => false });
+    const conn = recordingConn();
+    ex.conn = () => conn;
+
+    const out = await ex.sendSignedTransfer({
+      expectFrom: kp.publicKey.toBase58(),
+      destination: DEST,
+      lamports: 1_000_000,
+      txBase64: Buffer.from(tx.serialize()).toString('base64'),
+    });
+    assert.strictEqual(out.ok, false, 'the amount shown must be the amount signed');
+    assert.match(out.error, /amount mismatch|refused/);
+    assert.strictEqual(conn.sent.length, 0);
+  });
+
+  await test('a withdrawal that smuggles in a second instruction is refused', async () => {
+    // The drainer pattern: a "withdrawal" that also transfers something else.
+    const kp = Keypair.generate();
+    const { tx } = unsignedFor(kp.publicKey, new PublicKey(DEST), 5_000_000);
+    tx.add(SystemProgram.transfer({ fromPubkey: kp.publicKey, toPubkey: new PublicKey(OTHER), lamports: 1 }));
+    tx.sign(kp);
+
+    const ex = new Executor(cfg.defaultGlobalConfig(), { getKeypair: () => null, has: () => false });
+    const conn = recordingConn();
+    ex.conn = () => conn;
+
+    const out = await ex.sendSignedTransfer({
+      expectFrom: kp.publicKey.toBase58(),
+      destination: DEST,
+      lamports: 5_000_000,
+      txBase64: Buffer.from(tx.serialize()).toString('base64'),
+    });
+    assert.strictEqual(out.ok, false, 'two transfers must never pass as one withdrawal');
+    assert.match(out.error, /refused/);
+    assert.strictEqual(conn.sent.length, 0);
+  });
+
+  await test('an UNSIGNED transaction is refused — there is nothing to broadcast', async () => {
+    const kp = Keypair.generate();
+    const { b64 } = unsignedFor(kp.publicKey, new PublicKey(DEST), 5_000_000);
+    const ex = new Executor(cfg.defaultGlobalConfig(), { getKeypair: () => null, has: () => false });
+    const conn = recordingConn();
+    ex.conn = () => conn;
+
+    const out = await ex.sendSignedTransfer({
+      expectFrom: kp.publicKey.toBase58(),
+      destination: DEST,
+      lamports: 5_000_000,
+      txBase64: b64,
+    });
+    assert.strictEqual(out.ok, false, 'a blank signature slot must be caught here, not on chain');
+    assert.strictEqual(conn.sent.length, 0);
+  });
+
+  await test('a signed transaction whose bytes were TAMPERED with is refused', async () => {
+    const kp = Keypair.generate();
+    const { tx } = unsignedFor(kp.publicKey, new PublicKey(DEST), 5_000_000);
+    tx.sign(kp);
+    const bytes = tx.serialize();
+    bytes[20] ^= 0xff; // flip one bit of the signature
+
+    const ex = new Executor(cfg.defaultGlobalConfig(), { getKeypair: () => null, has: () => false });
+    const conn = recordingConn();
+    ex.conn = () => conn;
+
+    const out = await ex.sendSignedTransfer({
+      expectFrom: kp.publicKey.toBase58(),
+      destination: DEST,
+      lamports: 5_000_000,
+      txBase64: Buffer.from(bytes).toString('base64'),
+    });
+    assert.strictEqual(out.ok, false, 'the signature must be checked, not assumed');
+    assert.match(out.error, /signature_invalid|refused/);
+    assert.strictEqual(conn.sent.length, 0);
+  });
+
+  /* ───────── a failure the user can act on, and a signature spent once ───────── */
+
+  console.log('\nWhen the network says no\n');
+
+  /** A signed transfer, ready to hand to sendSignedTransfer. */
+  function signedFor(fromKp, to, lamports) {
+    const { tx } = unsignedFor(fromKp.publicKey, to, lamports);
+    tx.sign(fromKp);
+    return Buffer.from(tx.serialize()).toString('base64');
+  }
+
+  await test('a wallet with no SOL gets a sentence, not a web3.js dump', async () => {
+    // The raw text of this failure is a simulation dump about a prior credit. It
+    // reached the screen from the live server, and it is the kind of message that
+    // makes a person think the bot is broken rather than the wallet empty.
+    const kp = Keypair.generate();
+    const b64 = signedFor(kp, new PublicKey(DEST), 10_000_000);
+    const ex = new Executor(cfg.defaultGlobalConfig(), { getKeypair: () => null, has: () => false });
+    ex.conn = () => ({
+      sendRawTransaction: async () => {
+        throw new Error('Simulation failed. \nMessage: Transaction simulation failed: Attempt to debit an account but found no record of a prior credit.. \n\nCatch the `SendTransactionError` and call `getLogs()` on it for full details.');
+      },
+    });
+
+    const out = await ex.sendSignedTransfer({ expectFrom: kp.publicKey.toBase58(), destination: DEST, lamports: 10_000_000, txBase64: b64 });
+    assert.strictEqual(out.ok, false, 'the send failed');
+    assert.strictEqual(out.code, 'not_enough_sol', 'and it is identified as the wallet being empty');
+    assert.match(out.error, /does not hold enough SOL/i, 'the message names the cause');
+    assert.ok(!/Simulation failed|getLogs|prior credit/.test(out.error), 'and no raw RPC text leaks into it');
+    assert.strictEqual(out.accepted, true, 'but the signed transaction WAS accepted — the signature is spent');
+  });
+
+  await test('a network failure is reported without claiming anything about the chain', async () => {
+    const kp = Keypair.generate();
+    const b64 = signedFor(kp, new PublicKey(DEST), 10_000_000);
+    const ex = new Executor(cfg.defaultGlobalConfig(), { getKeypair: () => null, has: () => false });
+    ex.conn = () => ({ sendRawTransaction: async () => { throw new Error('fetch failed'); } });
+
+    const out = await ex.sendSignedTransfer({ expectFrom: kp.publicKey.toBase58(), destination: DEST, lamports: 10_000_000, txBase64: b64 });
+    assert.strictEqual(out.code, 'rpc_unreachable');
+    assert.match(out.error, /could not be reached/i);
+    assert.ok(!/fetch failed/.test(out.error), 'the raw text stays in the log');
+    assert.strictEqual(out.accepted, true, 'and the signature is spent, because it was accepted');
+  });
+
+  await test('a REFUSED transaction is not marked accepted', async () => {
+    const kp = Keypair.generate();
+    const b64 = signedFor(kp, new PublicKey(OTHER), 10_000_000);
+    let sends = 0;
+    const ex = new Executor(cfg.defaultGlobalConfig(), { getKeypair: () => null, has: () => false });
+    ex.conn = () => ({ sendRawTransaction: async () => { sends += 1; return 'sig'; } });
+
+    const out = await ex.sendSignedTransfer({ expectFrom: kp.publicKey.toBase58(), destination: DEST, lamports: 10_000_000, txBase64: b64 });
+    assert.strictEqual(out.ok, false, 'a transfer to the wrong address is refused');
+    assert.notStrictEqual(out.accepted, true, 'and nothing is spent, because nothing was accepted');
+    assert.strictEqual(sends, 0, 'and nothing was broadcast');
+  });
+
   console.log(`\n${'─'.repeat(60)}`);
   console.log(`  ${passed} passed, ${failed} failed\n`);
   process.exit(failed === 0 ? 0 : 1);

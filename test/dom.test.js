@@ -49,7 +49,7 @@ async function test(name, fn) {
  * embedded simulator. That is exactly what the preview does, and it exercises the
  * same DOM code: same renderers, same handlers, same modals.
  */
-async function bootDashboard({ wallets = 1, keystoreUnlocked = true } = {}) {
+async function bootDashboard({ wallets = 1, keystoreUnlocked = true, solUsd = null } = {}) {
   const html = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
   const appJs = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
 
@@ -71,6 +71,14 @@ async function bootDashboard({ wallets = 1, keystoreUnlocked = true } = {}) {
 
   // Let boot() settle (it awaits a token fetch that rejects, then starts demo).
   for (let i = 0; i < 30; i += 1) await new Promise((r) => setTimeout(r, 0));
+
+  /* The SOL/USD rate the real server reports in /api/status. Offline there is none,
+   * and a dollar helper that invented one would be worse than one that shows
+   * nothing — so the tests that assert on dollars SET it, and the tests that do not
+   * assert that no dollar sign appears where no rate exists. */
+  if (solUsd !== null) {
+    await window.eval(`S.status = Object.assign({}, S.status || {}, { solUsd: ${Number(solUsd)}, solUsdSource: 'test', solUsdStale: false });`);
+  }
 
   // `const S` at the top level of a classic script lives in the global LEXICAL
   // environment, not on `window`, so window.S is undefined. window.eval runs in
@@ -675,7 +683,203 @@ async function click(window, el) {
     assert.deepStrictEqual(orphans, [], `these card actions have no click handler: ${orphans.join(', ')}`);
   });
 
-  console.log(`\n${'─'.repeat(60)}`);
+  /* ─────────── the launch table, in the form the user asked for ─────────── */
+
+  console.log('\nThe launch table: dollars, and columns that fill\n');
+
+  await test('LIQUIDITY is shown in dollars, with the SOL behind it', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    await window.eval(`
+      S.scanFeed = [{
+        mint: 'Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS', symbol: 'DOLLARS', name: 'Dollars',
+        devWallet: 'DEVADDR', devHoldPct: 3.4, liquiditySol: 12.5, liquidityUsd: 2500,
+        solUsd: 200, solUsdSource: 'coingecko', riskScore: 12, riskNotes: ['dev holds 3.4%'],
+        decision: 'bought', boughtBy: 'Wallet 1', facts: { devHold: 'event', liquidity: 'event', risk: 'derived' },
+        wallets: [{ name: 'Wallet 1', action: 'bought', reason: null }], detectedAt: Date.now(),
+      }];
+      renderScanFeed();
+    `);
+    const feed = $('#scanFeed').textContent;
+    assert.match(feed, /\$2,500/, 'the dollar figure must be the one on screen');
+    assert.match(feed, /12\.50 SOL/, 'with the SOL amount underneath it, not instead of it');
+    assert.match(feed, /Wallet 1/, 'and the wallet that bought it named');
+  });
+
+  await test('a dollar figure converted at a FALLBACK rate is marked', async () => {
+    // The reference bot falls back to a constant when its price API is down and
+    // prints it as if it were a quote. This does not: an approximation is marked
+    // with a ≈ and explained, because a made-up number that looks real is exactly
+    // the failure this whole project exists in reaction to.
+    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    await window.eval(`
+      S.scanFeed = [{
+        mint: 'Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS', symbol: 'APPROX', name: 'Approx',
+        devWallet: 'DEVADDR', devHoldPct: 1, liquiditySol: 5, liquidityUsd: 750,
+        solUsd: 150, solUsdSource: 'fallback', riskScore: 0, riskNotes: [],
+        decision: 'skipped', skipReason: 'liquidity_below_min', facts: {}, wallets: [], detectedAt: Date.now(),
+      }];
+      renderScanFeed();
+    `);
+    const feed = $('#scanFeed').textContent;
+    assert.match(feed, /\$750/, 'the figure is still shown');
+    assert.match(feed, /≈/, 'but marked as approximate');
+  });
+
+  await test('DEV HOLD and RISK fill for a launch that was never read on chain', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    await window.eval(`
+      S.scanFeed = [{
+        mint: 'Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS', symbol: 'FACTS', name: 'Facts',
+        devWallet: 'DEVADDR', devHoldPct: 30, liquiditySol: 12.5, liquidityUsd: 2500,
+        solUsd: 200, solUsdSource: 'coingecko', riskScore: 61,
+        riskNotes: ['dev holds 30.0% (limit 15%)'], decision: 'skipped', skipReason: 'dev_hold_too_high',
+        facts: { devHold: 'event', liquidity: 'event', risk: 'derived' }, wallets: [], detectedAt: Date.now(),
+      }];
+      renderScanFeed();
+    `);
+    const feed = $('#scanFeed').textContent;
+    assert.match(feed, /30\.0%/, 'dev hold must be on screen');
+    assert.match(feed, /61/, 'and a risk score');
+    assert.match(feed, /\*/, 'marked as derived from the launch event rather than read on chain');
+  });
+
+  await test('a cell that really could not be read says so, and never shows a bare dash', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    await window.eval(`
+      S.scanFeed = [{
+        mint: 'Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS', symbol: 'NODATA', name: 'Nodata',
+        devWallet: null, devHoldPct: null, liquiditySol: null, liquidityUsd: null, riskScore: null,
+        riskNotes: [], decision: 'error', skipReason: 'rpc unavailable', facts: {}, wallets: [], detectedAt: Date.now(),
+      }];
+      renderScanFeed();
+    `);
+    const feed = $('#scanFeed').textContent;
+    assert.match(feed, /unread/i, 'the word "unread" is the honest answer, and it is readable');
+  });
+
+  /* ───────────── trades per wallet, and the overall card ───────────── */
+
+  console.log('\nHow many trades, how many wins, how many losses\n');
+
+  await test('every wallet\'s trades, wins and losses are on one card, with the total', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 3, keystoreUnlocked: true });
+    await window.eval(`
+      S.wallets[0].name = 'Alpha'; S.wallets[0].stats = { bought: 12, wins: 7, losses: 3, realisedPnlSol: 1.25, tradesToday: 4 };
+      S.wallets[1].name = 'Beta';  S.wallets[1].stats = { bought: 8, wins: 2, losses: 5, realisedPnlSol: -0.5, tradesToday: 1 };
+      S.wallets[2].name = 'Gamma'; S.wallets[2].stats = { bought: 0, wins: 0, losses: 0, realisedPnlSol: 0, tradesToday: 0 };
+      S.status = Object.assign({}, S.status, { overall: { bought: 20, closed: 17, wins: 9, losses: 8, winRatePct: 52.9, open: 2 } });
+      renderOverall();
+    `);
+    const card = $('#overall');
+    assert.ok(card, 'the card must exist in the dashboard');
+    const text = card.textContent;
+    assert.match(text, /Alpha/, 'each wallet is named');
+    assert.match(text, /Beta/);
+    assert.match(text, /Gamma/);
+    // Alpha: bought 12, closed 10, 7 won, 3 lost; Beta: bought 8, closed 7, 2 won, 5 lost.
+    const alphaRow = [...card.querySelectorAll('tbody tr')].find((tr) => /Alpha/.test(tr.textContent));
+    const cells = [...alphaRow.querySelectorAll('td')].map((td) => td.textContent.trim());
+    assert.strictEqual(cells[1], '12', `Alpha must show the 12 tokens it bought (got ${cells[1]})`);
+    assert.strictEqual(cells[2], '10', `and the 10 trades it closed (got ${cells[2]})`);
+    assert.strictEqual(cells[3], '7', 'seven wins');
+    assert.strictEqual(cells[4], '3', 'three losses');
+    assert.match(cells[5], /70%/, 'and the win rate follows from them');
+    assert.match(text, /All wallets/, 'and there is a totals row');
+    assert.match(text, /17/, 'showing the overall closed count the server reported');
+    assert.match(text, /20/, 'and the overall bought count');
+  });
+
+  await test('the wallet card counts what it BOUGHT, and its wins and losses', async () => {
+    // "Add card to display how many token was bought how many win trade and loss
+    // trade" — a wallet that bought eight tokens, closed ten trades of which four
+    // won and six lost, shows all three numbers. The bought count is not the closed
+    // count: positions that are still open were bought and have not closed.
+    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    await window.eval(`
+      S.wallets[0].name = 'Counter';
+      S.wallets[0].stats = { bought: 8, wins: 4, losses: 6, realisedPnlSol: -0.2, tradesToday: 3 };
+      renderWallets();
+    `);
+    const card = $('.wallet');
+    const bought = [...card.querySelectorAll('.wstat')].find((el) => /Bought/.test(el.textContent));
+    assert.ok(bought, 'the card must carry a Bought figure');
+    assert.match(bought.textContent, /8/, 'the cards bought');
+    assert.match(bought.textContent, /4W/, 'wins so far');
+    assert.match(bought.textContent, /6L/, 'and losses so far');
+  });
+
+  await test('every SOL figure on a card carries its dollar value', async () => {
+    // "all card holding sol to show the equivalent of the sol in dollar"
+    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true, solUsd: 200 });
+    await window.eval(`
+      S.wallets[0].stats = { bought: 2, wins: 2, losses: 1, realisedPnlSol: 1.5, tradesToday: 1 };
+      renderWallets();
+    `);
+    const card = $('.wallet');
+    assert.match(card.textContent, /\$/, 'the realised P&L shows a dollar equivalent');
+    assert.match(card.textContent, /300/, '$1.5 at $200 a SOL is $300');
+  });
+
+  /* ─────────────────── the scanner log, per wallet ─────────────────── */
+
+  console.log('\nEach wallet\'s own launches\n');
+
+  await test('a wallet\'s feed shows what THAT wallet did, and not another wallet\'s rows', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 2, keystoreUnlocked: true });
+    await window.eval(`
+      S.wallets[0].name = 'Alpha'; S.wallets[0].id = 'w_alpha';
+      S.wallets[1].name = 'Beta';  S.wallets[1].id = 'w_beta';
+      S.scanFeed = [
+        { mint: 'A'.repeat(40), symbol: 'ALPHACOIN', devHoldPct: 2, liquiditySol: 10, liquidityUsd: 2000,
+          riskScore: 5, riskNotes: [], decision: 'bought', boughtBy: 'Alpha', detectedAt: Date.now(),
+          wallets: [{ name: 'Alpha', action: 'bought' }, { name: 'Beta', action: 'skipped', reason: 'liquidity_below_min' }] },
+        { mint: 'B'.repeat(40), symbol: 'BETACOIN', devHoldPct: 12, liquiditySol: 4, liquidityUsd: 800,
+          riskScore: 30, riskNotes: [], decision: 'bought', boughtBy: 'Beta', detectedAt: Date.now(),
+          wallets: [{ name: 'Alpha', action: 'filtered', reason: 'dev holds too much' }, { name: 'Beta', action: 'bought' }] },
+      ];
+      renderWallets();
+    `);
+
+    const btn = [...window.document.querySelectorAll('button[data-feed]')].find((b) => b.dataset.feed === 'w_alpha');
+    assert.ok(btn, 'each wallet card must offer its own feed');
+    await click(window, btn);
+
+    const modal = $('#modalRoot').textContent;
+    assert.match(modal, /ALPHACOIN/, 'a launch this wallet bought must be listed');
+    assert.match(modal, /BETACOIN/, 'and a launch it declined must be listed too — that is the interesting one');
+    assert.match(modal, /bought/i, "with this wallet's own verdict");
+    assert.match(modal, /dev holds too much/, 'including the reason it was filtered out');
+    assert.ok(!/skipped\s*liquidity_below_min/.test(modal), "and NOT another wallet's verdict as if it were this one's");
+  });
+
+  /* ────────────── withdrawing: who signs it, in plain words ────────────── */
+
+  console.log('\nWithdrawing — signed here, or signed by the bot\n');
+
+  await test('a wallet whose key is in this browser withdraws with a passphrase here, not a server key', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    await window.eval(`
+      S.wallets[0].name = 'Signer'; S.wallets[0].id = 'w_sign'; S.wallets[0].publicKey = 'ADDR_SIGN';
+      S.wallets[0].balanceSol = 2;
+      window.WalletStore = { PASS_MIN: 8, supported: () => true, record: () => ({ address: 'ADDR_SIGN' }), list: () => [] };
+      openWithdraw('w_sign');
+    `);
+    const modal = $('#modalRoot');
+    assert.ok(modal.querySelector('#wdPass'), 'the dialog must ask for the passphrase that unseals the key HERE');
+    assert.match(modal.textContent, /in this browser/i, 'and say where the signing happens');
+    assert.match(modal.textContent, /never leave this device/i, 'and that the key does not travel');
+
+    await window.eval(`
+      S.wallets[0].name = 'ServerSigner'; S.wallets[0].id = 'w_srv';
+      window.WalletStore = { PASS_MIN: 8, supported: () => true, record: () => null, list: () => [] };
+      closeModal(); openWithdraw('w_srv');
+    `);
+    const second = $('#modalRoot');
+    assert.ok(!second.querySelector('#wdPass'), 'a wallet whose key is NOT here must not be asked for a passphrase it cannot use');
+    assert.match(second.textContent, /session key/i, 'and the dialog must say the bot signs it instead');
+  });
+
+  console.log(`\n  ${passed} passed, ${failed} failed\n`);
   console.log(`  ${passed} passed, ${failed} failed\n`);
   process.exit(failed === 0 ? 0 : 1);
 })();

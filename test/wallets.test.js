@@ -206,6 +206,76 @@ async function test(name, fn) {
     }
   });
 
+  /* ───────── signing a REAL transaction here, in the browser ───────── */
+
+  console.log('\nSigning a transfer the way the reference bot does it\n');
+
+  await test('a transfer signed by the store is a valid Solana signature', async () => {
+    // The withdrawal path depends on this: the tab unseals the key, signs the
+    // transaction the server built, and sends back only the signed bytes. web3.js
+    // is the judge here, not our own code — if this passes, a real cluster will
+    // see a correctly signed transfer.
+    const { Keypair, SystemProgram, Transaction, PublicKey } = require('@solana/web3.js');
+    const made = await WalletStore.create({ passphrase: 'transfer-pass', label: 'Signer' });
+    const secretKey = await WalletStore.unlock(made.address, 'transfer-pass');
+    const kp = Keypair.fromSecretKey(secretKey);
+    assert.strictEqual(kp.publicKey.toBase58(), made.address, 'the derived key really is this wallet');
+
+    const tx = new Transaction().add(SystemProgram.transfer({
+      fromPubkey: kp.publicKey,
+      toPubkey: new PublicKey('9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin'),
+      lamports: 5_000_000,
+    }));
+    tx.feePayer = kp.publicKey;
+    tx.recentBlockhash = '11111111111111111111111111111111';
+    const unsigned = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
+
+    const signed = await WalletStore.signTransaction(new Uint8Array(unsigned), secretKey);
+    const parsed = Transaction.from(Buffer.from(signed));
+    assert.strictEqual(parsed.verifySignatures(), true, 'the signature must verify against the message');
+    assert.ok(signed.slice(1, 65).some((b) => b !== 0), 'and the signature slot must be filled, not blank');
+    assert.strictEqual(parsed.feePayer.toBase58(), made.address, 'the fee payer is this wallet');
+    assert.strictEqual(parsed.instructions.length, 1, 'and the instruction is untouched');
+    // The instruction the server asked for is the instruction that gets sent: a
+    // signer that could rewrite it would be worse than useless.
+    assert.strictEqual(parsed.instructions[0].data.readBigUInt64LE(4), 5_000_000n, 'exactly the amount asked for');
+  });
+
+  await test('a signature produced here fails if the transaction is altered afterwards', async () => {
+    const { Keypair, SystemProgram, Transaction, PublicKey } = require('@solana/web3.js');
+    const made = await WalletStore.create({ passphrase: 'tamper-pass', label: 'Tamper' });
+    const secretKey = await WalletStore.unlock(made.address, 'tamper-pass');
+    const kp = Keypair.fromSecretKey(secretKey);
+    const destination = new PublicKey('9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin');
+    const tx = new Transaction().add(SystemProgram.transfer({ fromPubkey: kp.publicKey, toPubkey: destination, lamports: 5_000_000 }));
+    tx.feePayer = kp.publicKey;
+    tx.recentBlockhash = '11111111111111111111111111111111';
+
+    const signed = await WalletStore.signTransaction(
+      new Uint8Array(tx.serialize({ requireAllSignatures: false, verifySignatures: false })),
+      secretKey,
+    );
+    signed[signed.length - 8] ^= 0xff; // rewrite the amount behind the signature
+    let verified = true;
+    try { verified = Transaction.from(Buffer.from(signed)).verifySignatures(); } catch { verified = false; }
+    assert.strictEqual(verified, false, 'an altered transfer must not verify');
+  });
+
+  await test('the signer refuses bytes that are not a transaction', async () => {
+    const made = await WalletStore.create({ passphrase: 'refuse-pass', label: 'Refuse' });
+    const secretKey = await WalletStore.unlock(made.address, 'refuse-pass');
+    await assert.rejects(
+      () => WalletStore.signTransaction(new Uint8Array(0), secretKey),
+      /too short/i,
+      'empty bytes must be refused rather than signed',
+    );
+    await assert.rejects(
+      () => WalletStore.signTransaction(new Uint8Array([0, 1, 2, 3, 4, 5]), secretKey),
+      /no signature slot/i,
+      'a blob with no signature slot must be refused',
+    );
+  });
+
   console.log(`\n  ${passed} passed, ${failed} failed\n`);
   process.exit(failed === 0 ? 0 : 1);
 })();
