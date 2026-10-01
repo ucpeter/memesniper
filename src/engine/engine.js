@@ -21,6 +21,7 @@ const Scanner = require('./scanner');
 const Trader = require('./trader');
 const Executor = require('./executor');
 const { LiveFeed } = require('./livefeed');
+const solprice = require('./solprice');
 const safety = require('./safety');
 const curve = require('./curve');
 const fs = require('node:fs');
@@ -62,7 +63,12 @@ class Engine {
      * climbed. Attaching it here is what makes the panel and the counters agree:
      * every launch the scanner detects now produces exactly one row.
      */
-    this.liveFeed = new LiveFeed().attach();
+    /* The thresholds are HANDED TO the feed, not defaulted inside it. Without this
+     * the feed scored every launch against an empty config: no liquidity floor, no
+     * dev-hold ceiling, so `deriveRisk` returned 0 for every row on the table. The
+     * column looked alive and meant nothing — which is a worse failure than the
+     * blank cell it replaced, because a blank cell is visibly missing. */
+    this.liveFeed = new LiveFeed({ globalConfig: () => this.config.global }).attach();
     this.priceCache = new Map(); // mint -> { price, virtualSolReserves, virtualTokenReserves, ts, liquidityDropPct, initialLiquiditySol }
     this.running = false;
     this.priceTimer = null;
@@ -77,6 +83,8 @@ class Engine {
     this._persistTimer = null;
     this._persistHooked = false;
     this._resumed = false; // guards persistPositions() against wiping the snapshot
+    // Balances for wallets whose KEY we do not have. Read-only, public data.
+    this._lockedBalances = new Map();
     this._unresolved = {}; // snapshots for wallets whose keys are not loaded yet
     this._persistedAt = 0;
   }
@@ -99,6 +107,11 @@ class Engine {
     this.scanner.start();
     this._startPricePoller();
     this._refreshBalances();
+    this.refreshLockedBalances().catch(() => {});
+    /* Keep a SOL/USD rate warm while the engine runs, so the launch table can price
+     * its rows in dollars the moment they arrive rather than after its first launch.
+     * One request every 60 seconds; failures are the price module's business. */
+    this._startSolPriceWarmup();
 
     log.info(`Engine started · ${this.traders.size} wallet(s) loaded${this.executor.dryRun ? ' · 🧪 DRY RUN' : ' · 🔴 LIVE'}`);
     bus.safeEmit('engine:status', this.status());
@@ -108,9 +121,53 @@ class Engine {
     this.running = false;
     this.scanner.stop();
     if (this.priceTimer) clearInterval(this.priceTimer);
+    if (this._priceTimer) { clearInterval(this._priceTimer); this._priceTimer = null; }
     if (this._onTokenBound) bus.off('token:detected', this._onTokenBound);
     log.info('Engine stopped');
     bus.safeEmit('engine:status', this.status());
+  }
+
+  /**
+   * Read balances for every configured wallet the engine has no key for.
+   *
+   * One batched RPC call, and nothing is done with the result but displayed. This
+   * is what stops a locked wallet's card from saying "locked" where its SOL should
+   * be — the user's own question ("is my money still there?") is answerable from
+   * the address alone, so it is answered.
+   */
+  async refreshLockedBalances() {
+    const pending = this.config.wallets.filter((c) => !this.traders.has(c.id) && c.publicKey);
+    if (!pending.length) return 0;
+    const conn = this.executor.conn();
+    if (!conn || typeof conn.getMultipleAccountsInfo !== 'function') return 0;
+
+    // One unusable address must not silence the whole read: a wallet record with a
+    // malformed address is skipped, and the others are still measured.
+    const { PublicKey } = require('@solana/web3.js');
+    const usable = [];
+    for (const cfg of pending) {
+      try {
+        usable.push({ cfg, key: new PublicKey(cfg.publicKey) });
+      } catch {
+        this._lockedBalances.delete(cfg.id);
+      }
+    }
+    if (!usable.length) return 0;
+
+    let read = 0;
+    try {
+      const infos = await conn.getMultipleAccountsInfo(usable.map((u) => u.key));
+      usable.forEach(({ cfg }, i) => {
+        const info = infos[i];
+        if (!info) return; // no account: the address really holds nothing
+        this._lockedBalances.set(cfg.id, Number(info.lamports) / 1e9);
+        read += 1;
+      });
+    } catch (err) {
+      // A failed read is not a zero balance. Leave what was last read, or null.
+      log.debug(`Locked-wallet balance read failed: ${err.message}`);
+    }
+    return read;
   }
 
   _provider(globalCfg) {
@@ -229,6 +286,20 @@ class Engine {
    * For maximum speed on a paid endpoint, replace this with accountSubscribe
    * on the bonding-curve PDAs — the priceCache interface stays identical.
    */
+  /**
+   * A warm SOL/USD rate, refreshed on a timer.
+   *
+   * Deliberately not awaited and deliberately tolerant: a price API being down must
+   * cost the table a marker (`≈`), never a scan. Stops with the engine.
+   */
+  _startSolPriceWarmup() {
+    if (this._priceTimer) return;
+    const tick = () => { solprice.get().catch(() => {}); };
+    tick();
+    this._priceTimer = setInterval(tick, 60_000);
+    if (this._priceTimer.unref) this._priceTimer.unref();
+  }
+
   _startPricePoller() {
     const tick = async () => {
       if (!this.running) return;
@@ -550,12 +621,35 @@ class Engine {
         // server keystore either, so nothing can arm it except importing the key.
         keyMissing: !this.keystore.has(cfg.id) && this.keystore.isUnlocked(),
         keyArmed: false,
-        balanceSol: null,
+        /* The BALANCE is readable without the key — the address is public, and the
+         * reference bot polls every stored wallet, locked ones included, for
+         * exactly this reason. Showing "locked" where the money is loses the one
+         * fact the user opens the dashboard to check. `_lockedBalances` is filled
+         * by a read; a read that fails leaves null, because unknown is not zero. */
+        balanceSol: this._lockedBalances ? (this._lockedBalances.get(cfg.id) ?? null) : null,
+        // A wallet the bot holds the key for: its key is in keystore.enc, not in
+        // this session, so it survives a restart. The card shows that state.
+        persistent: Boolean(cfg.persistent),
+        keyHolder: cfg.persistent ? 'server' : 'browser',
         paperBalanceSol: 0,
         paperTrading: false,
         exposureSol: 0,
         config: cfg,
-        stats: null, // not persisted anywhere; null is honest, zeroes are not
+        /* The COUNTS are saved with the wallet in config.json (wins, losses, bought,
+         * realised P&L) and they were earned — they belong on the card even while the
+         * key is elsewhere. What is NOT known without a key is the live stuff: open
+         * positions, exposure, today's balance. Those stay null/empty, because zero
+         * would read as "nothing open" rather than "cannot see". */
+        stats: cfg.stats ? {
+          bought: cfg.stats.bought || 0,
+          wins: cfg.stats.wins || 0,
+          losses: cfg.stats.losses || 0,
+          realisedPnlSol: cfg.stats.realisedPnlSol || 0,
+          tradesToday: null,
+          consecutiveLosses: cfg.stats.consecutiveLosses || 0,
+          paused: Boolean(cfg.stats.paused),
+          pauseReason: cfg.stats.pauseReason || null,
+        } : null,
         openPositions: [],
         recentPositions: [],
         lastEntryAt: null,
@@ -593,11 +687,90 @@ class Engine {
     this.traders.delete(id);
   }
 
+  /**
+   * Trades, wins, losses and realised P&L across EVERY wallet — including the
+   * ones whose keys are not loaded right now.
+   *
+   * A locked wallet still has its counts, because they live in config.json next
+   * to its name and address, and they were earned. Deriving the total from live
+   * traders alone would make the numbers shrink whenever a wallet re-locked,
+   * which reads as "my trades disappeared" — the same class of bug as the wallet
+   * list emptying itself.
+   */
+  overallStats() {
+    const live = [...this.traders.values()];
+    const liveIds = new Set(live.map((t) => t.cfg.id));
+
+    let wins = 0;
+    let losses = 0;
+    let bought = 0;
+    let open = 0;
+    let exposureSol = 0;
+    const per = [];
+
+    for (const t of live) {
+      const st = t.stats || {};
+      const openCount = t.openPositions ? t.openPositions().length : 0;
+      wins += st.wins || 0;
+      losses += st.losses || 0;
+      bought += st.bought || 0;
+      open += openCount;
+      exposureSol += Number(t.cfg && t.cfg.exposureSol) || 0;
+      per.push({
+        id: t.cfg.id,
+        name: t.cfg.name,
+        wins: st.wins || 0,
+        losses: st.losses || 0,
+        bought: st.bought || 0,
+        trades: (st.wins || 0) + (st.losses || 0),
+        realisedPnlSol: st.realisedPnlSol || 0,
+        open: openCount,
+        keyArmed: true,
+      });
+    }
+
+    for (const cfg of this.config.wallets) {
+      if (liveIds.has(cfg.id)) continue;
+      const st = cfg.stats || {};
+      wins += st.wins || 0;
+      losses += st.losses || 0;
+      bought += st.bought || 0;
+      per.push({
+        id: cfg.id,
+        name: cfg.name,
+        wins: st.wins || 0,
+        losses: st.losses || 0,
+        bought: st.bought || 0,
+        trades: (st.wins || 0) + (st.losses || 0),
+        realisedPnlSol: st.realisedPnlSol || 0,
+        open: 0, // unknown without a key; the locked card says so rather than showing 0
+        openUnknown: true,
+        keyArmed: false,
+      });
+    }
+
+    const closed = wins + losses;
+    return {
+      trades: closed,
+      closed,
+      bought,
+      wins,
+      losses,
+      winRatePct: closed ? (wins / closed) * 100 : null,
+      open,
+      exposureSol,
+      wallets: per.sort((a, b) => b.trades - a.trades || String(a.name).localeCompare(String(b.name))),
+      realisedPnlSol: per.reduce((a, w) => a + (w.realisedPnlSol || 0), 0),
+    };
+  }
+
   status() {
     return {
       running: this.running,
       dryRun: this.executor.dryRun,
       wallets: this.traders.size,
+      // One card's worth of answers, computed where the counts actually live.
+      overall: this.overallStats(),
       scanner: {
         source: this.config.global.scanner.source,
         connected: Boolean(this.scanner.ws && this.scanner.ws.readyState === 1),
@@ -616,6 +789,11 @@ class Engine {
         errors: this.liveFeed.stats.errors,
         dropped: this.liveFeed.stats.dropped,
       },
+      // The SOL/USD rate the table is using, so EVERY card that shows SOL can show
+      // what it is worth without each one calling a price API.
+      solUsd: solprice.lastKnown().usd,
+      solUsdSource: solprice.lastKnown().source,
+      solUsdStale: solprice.lastKnown().stale,
       priceFeedSize: this.priceCache.size,
       priceFeed: {
         ok: this.priceHealth ? this.priceHealth.ok : true,

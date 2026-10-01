@@ -307,6 +307,10 @@ class Trader {
       this.byMint.set(mint, position.id);
       this.lastEntryAt = Date.now();
       this.stats.tradesToday += 1;
+      /* Tokens BOUGHT, which is not the same number as trades CLOSED: a wallet can
+       * hold four positions and have closed none. The user asked for both, so both
+       * are counted — entries increment here, wins and losses on close. */
+      this.stats.bought = (this.stats.bought || 0) + 1;
 
       log.trade(
         `🟢 BOUGHT ${candidate.symbol || mint.slice(0, 6)} · ${sizeSol.toFixed(3)} SOL · ` +

@@ -366,6 +366,86 @@ class Executor {
   }
 
   /**
+   * Broadcast a transfer the USER'S BROWSER signed.
+   *
+   * This is how the reference bot withdraws, and it is the better shape for a
+   * wallet whose key lives in the browser: the private key never has to be in this
+   * process at all, so a withdrawal works with the wallet locked.
+   *
+   * The server is not the trusted party here — a page could send us anything —
+   * so the signed transaction is CHECKED before it is broadcast, and refused
+   * unless it is exactly the transfer that was asked for:
+   *
+   *   · one signer, and it must be the wallet being withdrawn from;
+   *   · one instruction, SystemProgram transfer;
+   *   · from that wallet, to the destination the user typed;
+   *   · for the amount shown, no more.
+   *
+   * A transaction that fails these checks is not a withdrawal with a typo in it;
+   * it is a different transaction, and broadcasting it would be the drainer
+   * behaviour this whole project exists in reaction to.
+   */
+  async sendSignedTransfer({ expectFrom, destination, lamports, txBase64, label = 'withdraw' }) {
+    const intent = { from: expectFrom, to: destination, lamports: String(lamports) };
+
+    /* The verification is NOT reimplemented here. `assertTransferMatches` is the
+     * same check the funding path runs on bytes that came back from a user's
+     * wallet: one signer, one plain transfer, from this wallet to that address,
+     * for exactly this amount, and nothing else that a token could be drained
+     * through. Two verifiers would drift; one cannot. */
+    try {
+      this.assertTransferMatches(txBase64, intent);
+    } catch (err) {
+      return { ok: false, error: `signed_transaction_refused: ${err.message}` };
+    }
+
+    /* The signature must actually verify. web3.js can check that for a legacy
+     * transaction, which is exactly what our own intent builder produces (and what
+     * `walletStore.signTransaction` signs) — so the check runs on the real thing.
+     *
+     * A VERSIONED transaction is refused rather than accepted unverified: nothing
+     * in this flow builds one, so its only source is a caller sending something
+     * unexpected. Refusing is the safe direction. */
+    let tx;
+    try {
+      tx = Transaction.from(Buffer.from(String(txBase64), 'base64'));
+    } catch (err) {
+      return { ok: false, error: 'signed_transaction_must_be_the_legacy_transaction_we_asked_for' };
+    }
+    let verified = false;
+    try {
+      verified = tx.verifySignatures();
+    } catch {
+      verified = false;
+    }
+    if (!verified) return { ok: false, error: 'signed_transaction_signature_invalid' };
+
+    /* Past this line the bytes are ACCEPTED: they are the transfer we asked for and
+     * they carry a valid signature for it. `accepted: true` is how the caller knows
+     * the signed transaction has been seen — it is what lets a withdrawal be consumed
+     * once and only once, whether or not the network takes it. */
+    try {
+      const signature = await this.conn().sendRawTransaction(tx.serialize(), {
+        skipPreflight: false,
+        maxRetries: 2,
+      });
+      bus.safeEmit('exec:filed', { walletId: null, label, signature, simulated: false, ts: Date.now() });
+
+      const confirmed = await this.confirm(signature, this.config.execution.confirmTimeoutMs);
+      if (!confirmed.ok) {
+        // Still report the signature: the transfer may land, and the user needs to
+        // be able to look rather than guess.
+        return { ok: false, accepted: true, error: confirmed.error, signature, lamports: String(lamports) };
+      }
+      log.trade(`💸 WITHDREW ${(Number(lamports) / 1e9).toFixed(4)} SOL → ${String(destination).slice(0, 8)}… (signed in the browser)`, { wallet: label });
+      return { ok: true, accepted: true, signature, lamports: String(lamports), signedBy: 'browser' };
+    } catch (err) {
+      const friendly = this.friendlySendError(err);
+      return { ok: false, accepted: true, error: friendly.error, code: friendly.code, lamports: String(lamports) };
+    }
+  }
+
+  /**
    * Send SOL out of a bot wallet. Always real, even in dry run.
    * @returns {{ok, signature, lamports, error?}}
    */
@@ -408,8 +488,62 @@ class Executor {
       log.trade(`💸 WITHDREW ${(Number(amount) / 1e9).toFixed(4)} SOL → ${toPk.toBase58().slice(0, 8)}…`, { wallet: walletId });
       return { ok: true, signature, lamports: amount.toString() };
     } catch (err) {
-      return { ok: false, error: err.message };
+      const friendly = this.friendlySendError(err);
+      return { ok: false, error: friendly.error, code: friendly.code };
     }
+  }
+
+  /**
+   * Turn an RPC failure into something a person can act on.
+   *
+   * The raw text is a web3.js/RPC dump — "Simulation failed. Message: Transaction
+   * simulation failed: Attempt to debit an account but found no record of a prior
+   * credit..." — and it went straight into the API response, and from there onto
+   * the screen. It tells the user nothing they can do, and in the no-funds case it
+   * does not even say the one thing that matters. The raw text still goes to the
+   * log, where it is useful; the user gets a sentence with an action in it.
+   *
+   * Nothing here guesses at the outcome: the wording never claims a transfer
+   * failed to land unless the failure happened before the signature existed.
+   */
+  friendlySendError(err, { unsigned = true } = {}) {
+    const raw = String((err && err.message) || err || 'unknown error');
+    const m = raw.toLowerCase();
+
+    let error;
+    let code;
+    if (/no record of a prior credit|insufficient (funds|lamports|sol)|debit an account but found no record|0x1\b/.test(m)) {
+      code = 'not_enough_sol';
+      error = 'This wallet does not hold enough SOL for that amount plus the network fee. Fund it first, or withdraw a smaller amount.';
+    } else if (/blockhash not found|blockhashnotfound|block height exceeded/.test(m)) {
+      code = 'blockhash_expired';
+      error = 'The transaction expired before it could be sent — nothing was sent. Try again.';
+    } else if (/429|too many requests|rate limit/.test(m)) {
+      code = 'rpc_rate_limited';
+      error = 'The RPC is rate-limiting right now — nothing was sent. Try again in a moment.';
+    } else if (/timed out|timeout|etimedout|econnrefused|econnreset|socket hang up|fetch failed|network/.test(m)) {
+      code = 'rpc_unreachable';
+      error = unsigned
+        ? 'The Solana network could not be reached — nothing was sent. Try again.'
+        : 'The Solana network could not be reached. Check the balance before trying again.';
+    } else if (/signature verification failed|invalid signature/.test(m)) {
+      code = 'signature_rejected';
+      error = 'The network rejected the signature — nothing was sent. Try again from this browser.';
+    } else if (/simulation failed|preflight|invalid account data|program failed/.test(m)) {
+      code = 'rejected_before_sending';
+      error = 'The network rejected the transaction before sending it — nothing was sent. Check the wallet has SOL and try again.';
+    } else {
+      code = 'send_failed';
+      error = unsigned
+        ? 'The transfer could not be sent — nothing was sent. Try again.'
+        : 'The transfer could not be sent. Check the wallet balance before trying again.';
+    }
+
+    // Keep the WHOLE message in the log, on one line: for a simulation failure the
+    // reason is on the line after "Simulation failed.", so trimming to the first
+    // line throws away the only part that matters when diagnosing.
+    log.warn(`Send failed (${code}): ${raw.replace(/\s+/g, ' ').slice(0, 300)}`);
+    return { error, code };
   }
 
   /**

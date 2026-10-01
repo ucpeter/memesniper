@@ -227,6 +227,9 @@ async function checkDistribution(conn, mint, curvePda) {
  * If you wire in an indexer (Helius/SolanaTracker), replace this with the real
  * creator balance — this is the weakest check in the file and it is flagged so.
  */
+/** pump.fun supply per launch — the reference bot's constant, same derivation. */
+const PUMP_FUN_TOTAL_SUPPLY = 1_000_000_000;
+
 function estimateDevHold(distribution) {
   if (!distribution || distribution.skipped) return null;
   return distribution.largestHolderPct ?? null;
@@ -395,6 +398,11 @@ async function recon(candidate, ctx = {}) {
     reason: unreachable.length ? unreachable.map((r) => r.reason).join('; ') : null,
     report: {
       liquiditySol: curveReport && curveReport.confidence !== 'INFRA' ? curveReport.liquiditySol ?? null : null,
+      // The dev's own opening buy, straight off the launch event — the same
+      // derivation the reference bot uses. Present even when the RPC is not.
+      devHoldPctFromEvent: Number.isFinite(Number(candidate.initialBuy)) && candidate.initialBuy !== null
+        ? (Number(candidate.initialBuy) / PUMP_FUN_TOTAL_SUPPLY) * 100
+        : null,
       progressPct: curveReport && curveReport.confidence !== 'INFRA' ? curveReport.progressPct ?? null : null,
       devHoldPct: distribution ? estimateDevHold(distribution) : null,
       top10Pct: distribution && distribution.top10Pct !== undefined ? distribution.top10Pct : null,

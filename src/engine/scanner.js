@@ -91,6 +91,18 @@ class Scanner {
           creator: msg.traderPublicKey || null,
           initialBuy: msg.initialBuy ?? null,
           marketCapSol: msg.marketCapSol ?? null,
+          /* The curve, straight off the event.
+           *
+           * PumpPortal's `create` payload already carries the bonding curve state
+           * and the dev's opening buy, so DEV HOLD and LIQUIDITY are known the
+           * instant a launch arrives — with no RPC call at all. The reference bot
+           * this project is measured against derives both from exactly these two
+           * fields (`initialBuy` / `vSolInBondingCurve`). We were discarding them
+           * and then asking an RPC for the same numbers, so on any launch whose
+           * read was rate-limited the cells came out blank. */
+          vTokensInBondingCurve: Number.isFinite(Number(msg.vTokensInBondingCurve)) ? Number(msg.vTokensInBondingCurve) : null,
+          vSolInBondingCurve: Number.isFinite(Number(msg.vSolInBondingCurve)) ? Number(msg.vSolInBondingCurve) : null,
+          solAmount: Number.isFinite(Number(msg.solAmount)) ? Number(msg.solAmount) : null,
           detectedAt: Date.now(),
           source: 'pumpportal',
         };
@@ -164,6 +176,7 @@ class Scanner {
         mint,
         symbol: '', name: '', uri: '',
         creator: null, initialBuy: null, marketCapSol: null,
+        vTokensInBondingCurve: null, vSolInBondingCurve: null,
         detectedAt: Date.now(), source: 'logs', slot: value.slot,
       });
       void keys;
