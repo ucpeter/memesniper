@@ -945,6 +945,50 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
     );
   });
 
+  await test('a STOPPED wallet still manages its open position through manage()', async () => {
+    // The promise on the Stop button is "open positions are still managed, so
+    // your stops keep working". manage() used to return early unless
+    // cfg.enabled, which made that promise false: a stopped wallet's position had
+    // no stop loss. This drives the REAL manage() path, not risk.evaluate().
+    const { trader, executor, priceCache } = makeTrader('balanced', { enabled: false });
+    assert.strictEqual(trader.cfg.enabled, false, 'sanity: the wallet is stopped');
+
+    // An open position it is managing, sized at the default 0.35 SOL entry.
+    const p = new Position({
+      walletId: trader.cfg.id,
+      mint: CANDIDATE.mint,
+      symbol: 'STOPPED',
+      name: 'Stopped bag',
+      entryPrice: 1_000_000n,
+      tokensHeld: 350_000n,
+      solSpent: 350_000_000n,
+      txSignature: 'SIM',
+      meta: {},
+    });
+    p.tiers = trader.cfg.exits.takeProfitTiers.map((t) => ({ ...t, filled: false }));
+    trader.positions.set(p.id, p);
+    trader.byMint.set(p.mint, p.id);
+
+    const fillsBefore = executor.fills.length;
+    await tickAt(trader, priceCache, p.mint, p.entryPrice, -60); // far below any stop
+    assert.ok(
+      executor.fills.length > fillsBefore,
+      'a stopped wallet must still SELL when its stop loss is hit — otherwise Stop strands the bag'
+    );
+  });
+
+  await test('a DISARMED wallet takes nothing, and Start is what fixes it', async () => {
+    const { trader } = makeTrader('balanced', { enabled: false });
+    const blocked = await trader.consider(CANDIDATE, { engine: ENGINE });
+    assert.strictEqual(blocked, 'skip:wallet_disabled', 'the entry gate reads cfg.enabled');
+
+    // What POST /api/wallets/:id/start now does, in order.
+    trader.cfg.enabled = true;
+    trader.resume();
+    const outcome = await trader.consider(CANDIDATE, { engine: ENGINE });
+    assert.strictEqual(outcome, 'bought', 'and then it trades');
+  });
+
   await test('STOP does not touch other wallets (per-wallet, not global)', () => {
     const a = makeTrader('balanced', NO_COOLDOWN);
     const b = makeTrader('aggressive', NO_COOLDOWN);

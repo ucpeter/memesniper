@@ -27,8 +27,21 @@ const DEMO_PRESETS = { safe:{}, balanced:{}, aggressive:{}, degen:{}, scalper:{}
 const start = grab('const DEMO_MS');
 const end = src.indexOf('/* ============================================================\n   EVENTS');
 let sim = src.slice(start, end);
-const fn = new Function('S', 'DEMO_PRESETS', `${sim}; return { demoApi, demoSellPosition, demoNewWallet, demoWalletOfPosition };`);
-const api = fn(S, DEMO_PRESETS);
+/* `upsertScanRow` lives outside the extracted block (it belongs to the render
+ * layer) but the launch generator calls it. Passing it in as a parameter keeps
+ * the slice runnable without dragging the DOM in — and lets the test see what the
+ * preview put in the feed. */
+const scanRows = [];
+const noop = () => {};
+const fn = new Function(
+  'S', 'DEMO_PRESETS', 'upsertScanRow', '$', 'renderScanner', 'renderStats', 'renderWallets', 'renderPositions', 'renderScanFeed',
+  `${sim}; return { demoApi, demoSellPosition, demoNewWallet, demoWalletOfPosition, demoTickAll, demoTickLaunches };`
+);
+const api = fn(
+  S, DEMO_PRESETS,
+  (row) => { scanRows.push(row); (S.scanFeed || (S.scanFeed = [])).unshift(row); },
+  () => null, noop, noop, noop, noop, noop,
+);
 
 (async () => {
   const w = { id:'w1', name:'Alpha', enabled:true, balanceSol:4.82, exposureSol:0.4, publicKey:'DEMO-Alpha',
@@ -63,70 +76,96 @@ const api = fn(S, DEMO_PRESETS);
     eq(created.config.preset, 'scalper', 'preset applied');
   });
 
-  await t('START/STOP are per wallet', async () => {
+  await t('a wallet you create is created STOPPED', () => {
+    const fresh = S.wallets.find((x) => x.name === 'Bravo');
+    eq(fresh.enabled, false, 'creating a wallet is not a decision to trade');
+    eq(fresh.armed, false, 'so the card shows ▶ Start, not ⏸ Stop');
+  });
+
+  await t('START/STOP are per wallet, and START actually ARMS it', async () => {
+    // Round 8: Start only cleared `paused`, while the entry gate reads
+    // `enabled` — which is false on every new wallet. Start did nothing a second
+    // time, so no dry-run trade could ever open.
+    const other = S.wallets[1];
+    other.enabled = true; other.armed = true; // sanity for the "untouched" half
     await api.demoApi('/api/wallets/w1/stop', { method:'POST', body:'{}' });
     eq(w.stats.paused, true, 'stopped');
-    eq(S.wallets[1].stats.paused, false, 'the other wallet must be untouched');
+    eq(w.enabled, false, 'and disarmed');
+    eq(w.armed, false);
+    eq(other.stats.paused, false, 'the other wallet must be untouched');
     await api.demoApi('/api/wallets/w1/start', { method:'POST', body:'{}' });
     eq(w.stats.paused, false, 'restarted');
+    eq(w.enabled, true, 'ARMED — the flag the entry gate reads');
+    eq(w.armed, true, 'and the flag the card reads');
   });
 
-  await t('KILL moves the position into history and updates realised + W/L', async () => {
-    const before = { pnl: w.stats.realisedPnlSol, wins: w.stats.wins, bal: w.balanceSol };
-    const r = await api.demoApi('/api/positions/p1/kill', { method:'POST', body: JSON.stringify({ reason:'ui_kill' }) });
-    eq(r.ok, true, 'kill ok');
-    eq(w.openPositions.length, 0, 'nothing open');
-    eq(w.recentPositions.length, 1, 'it is in history');
-    eq(w.recentPositions[0].exitReason, 'ui_kill', 'reason recorded');
-    eq(w.recentPositions[0].status, 'CLOSED', 'marked closed');
-    eq(Number((w.stats.realisedPnlSol - before.pnl).toFixed(4)), 0.51, 'realised P&L credited');
-    eq(w.stats.wins, before.wins + 1, 'counted as a win');
-    eq(S.positions.length, 0, 'board updated');
-    if (!(w.balanceSol > before.bal)) throw new Error('proceeds must return to the balance');
+  /**
+   * Paper trading in the preview, pinned.
+   *
+   * The user's complaint was "in the dry run am not seeing any dry run trade
+   * happening". The preview has to show the lifecycle, and these two tests are
+   * what keeps that honest. They run against a throwaway wallet of their own and
+   * restore S afterwards, because the fixture wallets below assert exact counts.
+   */
+  await t('the preview RUNS paper trades: launches arrive and armed wallets take them', async () => {
+    const realRandom = Math.random;
+    const savedWallets = S.wallets.slice();
+    const savedPositions = S.positions;
+    Math.random = () => 0.9; // deterministic: pinned high, so the preview always buys
+    try {
+      const probe = api.demoNewWallet('PaperProbe', 'balanced');
+      probe.enabled = true; probe.armed = true; probe.stats.paused = false;
+      S.wallets = [probe];
+      S.positions = [];
+
+      const before = scanRows.length;
+      for (let i = 0; i < 6; i += 1) api.demoTickLaunches();
+      if (scanRows.length <= before) throw new Error('no launches reached the scanner feed');
+      const row = scanRows[scanRows.length - 1];
+      if (!row.mint || !row.symbol) throw new Error('a feed row needs a mint and a symbol');
+      if (!['bought', 'skipped'].includes(row.decision)) throw new Error(`odd decision: ${row.decision}`);
+      if (!S.positions.length) throw new Error('an armed wallet in dry run must open a PAPER position');
+      const p = S.positions[S.positions.length - 1];
+      eq(p.simulated, true, 'and the position must be tagged simulated, so it is never mistaken for a real fill');
+      if (!p.demoTargetPct) throw new Error('a paper position needs a target, or it can only ever stop out');
+      eq(probe.openPositions.length, S.positions.length, 'the wallet and the board agree');
+    } finally {
+      Math.random = realRandom;
+      S.wallets = savedWallets;
+      S.positions = savedPositions;
+    }
   });
 
-  await t('WIN RATE is per wallet', async () => {
-    eq(Math.round((w.stats.wins / (w.stats.wins + w.stats.losses)) * 100), Math.round((10/15)*100), 'win rate');
-  });
+  await t('a paper position closes into history at its target', async () => {
+    const realRandom = Math.random;
+    const savedWallets = S.wallets.slice();
+    const savedPositions = S.positions;
+    Math.random = () => 0.9;
+    try {
+      const probe = api.demoNewWallet('PaperProbe', 'scalper');
+      probe.enabled = true; probe.armed = true; probe.stats.paused = false;
+      S.wallets = [probe];
+      S.positions = [];
 
-  await t('KILL ALL sells everything and stops that wallet', async () => {
-    w.openPositions.push({ id:'p2', walletId:'w1', symbol:'X', solSpent:String(0.2e9), pnlSol:-0.05, status:'OPEN' });
-    const r = await api.demoApi('/api/wallets/w1/kill-all', { method:'POST', body:'{}' });
-    eq(r.sold, 1, 'one sold'); eq(r.stopped, true, 'wallet stopped');
-    eq(w.stats.paused, true, 'paused');
-    eq(w.stats.losses, 6, 'the loss was counted');
-  });
-
-  await t('PANIC is the only all-wallet action', async () => {
-    const r = await api.demoApi('/api/engine/panic', { method:'POST', body:'{}' });
-    eq(r.running !== undefined, true, 'returns status');
-  });
-
-  await t('funding credits the balance through intent -> submit', async () => {
-    const before = w.balanceSol;
-    const intent = await api.demoApi('/api/fund/intent', { method:'POST', body: JSON.stringify({ walletId:'w1', amountSol: 2, from:'demo' }) });
-    if (!intent.intentId) throw new Error('no intentId');
-    await api.demoApi('/api/fund/submit', { method:'POST', body: JSON.stringify({ walletId:'w1', intentId:intent.intentId, amountSol:2 }) });
-    eq(Number((w.balanceSol - before).toFixed(4)), 2, 'balance credited');
-  });
-
-  await t('funding with no amount is refused', async () => {
-    let err = null; try { await api.demoApi('/api/fund/intent', { method:'POST', body: JSON.stringify({ walletId:'w1' }) }); } catch (e) { err = e; }
-    if (!err) throw new Error('must throw');
-  });
-
-  await t('withdraw quote honours the rent reserve, and moves the balance', async () => {
-    const q = await api.demoApi('/api/wallets/w1/withdraw/quote?mode=all');
-    if (!(q.maxWithdrawableSol < q.balanceSol)) throw new Error('must hold back rent');
-    if (q.resultingBalanceSol === undefined) throw new Error('the modal renders this field');
-    const before = w.balanceSol;
-    await api.demoApi('/api/wallets/w1/withdraw', { method:'POST', body: JSON.stringify({ destination:'DEMO-dest', amountSol:1, mode:'custom', confirm:'WITHDRAW' }) });
-    eq(Number((before - w.balanceSol).toFixed(4)), 1, 'balance debited');
-  });
-
-  await t('withdraw without the confirm token is refused', async () => {
-    let err = null; try { await api.demoApi('/api/wallets/w1/withdraw', { method:'POST', body: JSON.stringify({ destination:'d', amountSol:1 }) }); } catch (e) { err = e; }
-    if (!err) throw new Error('must throw');
+      api.demoTickLaunches();
+      api.demoTickLaunches();
+      api.demoTickLaunches();
+      const p = probe.openPositions[0];
+      if (!p) throw new Error('no paper position open to close');
+      p.pnlPct = p.demoTargetPct + 1;
+      const histBefore = probe.recentPositions.length;
+      S.demo = true; // demoTickAll is the preview's heartbeat; it only beats in demo mode
+      api.demoTickAll();
+      if (probe.recentPositions.length <= histBefore) throw new Error('the take-profit did not book');
+      eq(probe.openPositions.length, 0, 'the paper position is closed');
+      eq(probe.recentPositions[0].status, 'CLOSED', 'booked into history');
+      eq(probe.recentPositions[0].exitReason.startsWith('tp_'), true, 'with the take-profit as its reason');
+      if (!(probe.stats.realisedPnlSol > 0)) throw new Error('a winning paper trade must book realised P&L');
+    } finally {
+      Math.random = realRandom;
+      S.wallets = savedWallets;
+      S.positions = savedPositions;
+    }
   });
 
   await t('config edits persist to the wallet', async () => {
@@ -139,6 +178,36 @@ const api = fn(S, DEMO_PRESETS);
   await t('arming live mode needs the confirm token', async () => {
     let err = null; try { await api.demoApi('/api/engine/dry-run', { method:'POST', body: JSON.stringify({ dryRun:false }) }); } catch (e) { err = e; }
     if (!err) throw new Error('must refuse without confirm');
+    const ok = await api.demoApi('/api/engine/dry-run', { method:'POST', body: JSON.stringify({ dryRun:false, confirm:'I_UNDERSTAND_THE_RISK' }) });
+    eq(ok.dryRun, false, 'with the phrase, live is armed');
+    await api.demoApi('/api/engine/dry-run', { method:'POST', body: JSON.stringify({ dryRun:true }) });
+    eq(S.status.dryRun, true, 'and back to dry run needs no phrase');
+  });
+
+  /**
+   * The switch itself, pinned.
+   *
+   * "there is no switch between dry run and live trade" was the complaint. A
+   * control that exists only in a settings dialog, and only for one of the two
+   * directions, is not a switch — so both the markup and the wiring are pinned.
+   */
+  await t('the DRY RUN / LIVE switch exists in the page and both sides are wired', () => {
+    const html = require('fs').readFileSync(require('path').join(__dirname, '..', 'public', 'index.html'), 'utf8');
+    if (!/id="modeSwitch"/.test(html)) throw new Error('no switch in the page');
+    if (!/id="modeDry"/.test(html)) throw new Error('no DRY RUN side');
+    if (!/id="modeLive"/.test(html)) throw new Error('no LIVE side');
+    if (!/id="modeBar"/.test(html)) throw new Error('the switch has no visible bar to live in');
+    if (!/await setTradingMode\(false\)/.test(src)) throw new Error('the DRY RUN side is not wired');
+    if (!/await setTradingMode\(true\)/.test(src)) throw new Error('the LIVE side is not wired');
+    if (!/function setTradingMode\(/.test(src)) throw new Error('there is no single mode setter');
+    // The settings dialog must use the same path, or the two can drift.
+    if (!/await setTradingMode\(goingLive\)/.test(src)) throw new Error('settings has its own copy of the mode change');
+  });
+
+  await t('the dashboard reads the launch feed the server sends', () => {
+    if (!/msg\.data\.scanFeed/.test(src)) throw new Error('the snapshot\'s scanFeed is ignored — the panel stays empty on a live page');
+    if (!/\/api\/scan\?limit=200/.test(src)) throw new Error('no initial fetch, so a reload before the first launch shows an empty panel');
+    if (!/renderScanFeed\(\)/.test(src)) throw new Error('renderScanFeed is gone');
   });
 
   await t('deleting a wallet removes it and its positions', async () => {

@@ -195,6 +195,25 @@ const candidate = (n) => ({
     }
   });
 
+  await test('a launch is one row per WALLET NAME — never the same wallet twice', () => {
+    // Seen on the live deployment: the row listed "PaperProbe: checking" and
+    // "w_99fde369a87a: bought" for the same wallet, because token:analyzed keys by
+    // name and position:opened arrived keyed by id. A wallet is one entry.
+    withFeed((feed) => {
+      const c = candidate(9);
+      bus.safeEmit('token:detected', c);
+      bus.safeEmit('token:analyzed', { wallet: 'PaperProbe', candidate: c, ok: true, report: {} });
+      bus.safeEmit('position:opened', { mint: c.mint, wallet: 'PaperProbe', walletId: 'w_99fde369a87a' });
+
+      const row = feed.snapshot()[0];
+      assert.strictEqual(row.decision, DECISION.BOUGHT);
+      assert.strictEqual(row.wallets.length, 1, `one entry per wallet, got ${JSON.stringify(row.wallets)}`);
+      assert.strictEqual(row.wallets[0].name, 'PaperProbe');
+      assert.strictEqual(row.wallets[0].action, 'bought', 'and the final verdict, not the earlier checking state');
+      assert.strictEqual(row.boughtBy, 'PaperProbe', 'the buyer is named, not keyed by id');
+    });
+  });
+
   await test('garbage in the event stream cannot throw into the engine', () => {
     withFeed((feed) => {
       assert.doesNotThrow(() => feed.note(null));

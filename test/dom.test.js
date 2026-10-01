@@ -108,11 +108,20 @@ async function bootDashboard({ wallets = 1, keystoreUnlocked = true } = {}) {
   };
 }
 
-/** Click something and let the app's async handlers run. */
+/** Click something and let the app's async handlers run.
+ *
+ * The wait matters: in the offline preview every api() call takes DEMO_MS (110ms)
+ * of REAL time, and a handler routinely makes two or three of them in sequence
+ * (act → refreshAll → renderAll). Spinning on setTimeout(0) — twenty macrotasks,
+ * about 20ms — returned long before any of that had happened, so a click looked
+ * like it had done nothing. That is how the round-8 tests first "failed": the
+ * app was fine, the harness was too fast.
+ */
 async function click(window, el) {
   assert.ok(el, 'tried to click an element that does not exist');
   el.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
-  for (let i = 0; i < 20; i += 1) await new Promise((r) => setTimeout(r, 0));
+  for (let i = 0; i < 45; i += 1) await new Promise((r) => setTimeout(r, 10));
+  for (let i = 0; i < 5; i += 1) await new Promise((r) => setTimeout(r, 0));
 }
 
 (async () => {
@@ -383,12 +392,127 @@ async function click(window, el) {
       'and the updated reason must replace the old verdict, in readable words');
   });
 
-  await test('the scanner panel explains itself when nothing has been scanned', async () => {
+  /**
+   * An empty scanner panel has three completely different causes and, before
+   * round 8, one sentence for all of them. The user's complaint — "the pumpfun
+   * lunch scanner is showing nothing and token scanned card is showing number of
+   * token scanned" — is precisely the case where the counter moves and the panel
+   * does not, so the panel has to say which cause it is instead of leaving the
+   * contradiction on screen.
+   */
+  await test('the empty scanner panel names which of the three causes it is', async () => {
     const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
-    await window.eval('S.scanFeed = []; renderScanFeed();');
-    const text = $('#scanFeed').textContent;
-    assert.match(text, /No launches scanned yet/i);
-    assert.match(text, /Start the engine/i, 'an empty panel must say what to do about it');
+
+    await window.eval(`S.status = Object.assign({}, S.status, { running: false, scanner: { source: 'pumpportal', connected: false } });
+      S.scanFeed = []; renderScanFeed();`);
+    assert.match($('#scanFeed').textContent, /engine is stopped/i, 'the engine being off is one cause');
+    assert.match($('#scanFeed').textContent, /▶ Engine/, 'and it must name the control that fixes it');
+
+    await window.eval(`S.status = Object.assign({}, S.status, { running: true, scanner: { source: 'pumpportal', connected: true } });
+      renderScanFeed();`);
+    assert.match($('#scanFeed').textContent, /no launch has arrived yet/i, 'watching and quiet is another');
+
+    await window.eval(`S.status = Object.assign({}, S.status, { running: true, scanner: { source: 'pumpportal', connected: false } });
+      renderScanFeed();`);
+    assert.match($('#scanFeed').textContent, /feed is not connected/i, 'a dead feed is the third — the one that read as the counter lying');
+  });
+
+  await test('the panel counter, the list and the meta line agree', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    await window.eval(`S.status = Object.assign({}, S.status, { running: true,
+      scanner: { source: 'pumpportal', connected: true },
+      stats: { detected: 101, bought: 0, skipped: 101 } });
+      S.scanFeed = [];
+      upsertScanRow({ mint: 'M1', symbol: 'AAA', decision: 'skipped', skipReason: 'liquidity_below_min(0.4)' });
+      upsertScanRow({ mint: 'M2', symbol: 'BBB', decision: 'checking' });
+      renderScanFeed();`);
+    assert.strictEqual($('#scanCount').textContent, '2', 'the panel counter is the number of rows in the list');
+    assert.strictEqual($('#scanFeed').querySelectorAll('tbody tr').length, 2);
+    const meta = $('#scanMeta').textContent;
+    assert.match(meta, /2 launches in this list/, 'and the meta line says what the list holds');
+    assert.match(meta, /101/, 'while reconciling it with the tokens-scanned counter instead of contradicting it');
+  });
+
+  /* ── the DRY RUN ⇄ LIVE switch ───────────────────────────────────────── */
+
+  await test('the DRY RUN ⇄ LIVE switch is on the page, outside any dialog', async () => {
+    const { $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    assert.ok($('#modeSwitch'), 'the switch must exist');
+    assert.ok($('#modeDry'), 'DRY RUN side');
+    assert.ok($('#modeLive'), 'LIVE side');
+    assert.strictEqual($('#modeSwitch').closest('.modal-bg'), null, 'the switch must not be hidden inside a dialog');
+    assert.strictEqual($('#modeBar').closest('.modal-bg'), null);
+  });
+
+  await test('the switch shows which mode is active, and flips it', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    await window.eval('S.status.dryRun = true; renderChips();');
+    assert.ok($('#modeDry').classList.contains('on'), 'dry run is the active side');
+    assert.strictEqual($('#modeDry').getAttribute('aria-pressed'), 'true');
+    assert.strictEqual($('#modeLive').getAttribute('aria-pressed'), 'false');
+    assert.match($('#modeBarTitle').textContent, /DRY RUN/);
+
+    // Arming live asks for the typed phrase first.
+    window.prompt = () => 'nope';
+    await click(window, $('#modeLive'));
+    assert.strictEqual(window.eval('S.status.dryRun'), true, 'a wrong phrase must NOT arm live');
+
+    window.prompt = () => 'I_UNDERSTAND_THE_RISK';
+    await click(window, $('#modeLive'));
+    assert.strictEqual(window.eval('S.status.dryRun'), false, 'the right phrase arms live');
+    assert.ok($('#modeLive').classList.contains('on'), 'and the switch repaints');
+    assert.match($('#modeBarTitle').textContent, /LIVE/);
+
+    // …and going back to dry run is free: no phrase, and no prompt at all.
+    window.prompt = () => { throw new Error('returning to dry run must never prompt'); };
+    await click(window, $('#modeDry'));
+    assert.strictEqual(window.eval('S.status.dryRun'), true, 'back to dry run');
+    assert.match($('#modeBarTitle').textContent, /DRY RUN/);
+  });
+
+  /* ── a wallet you create is not a wallet that is trading ─────────────── */
+
+  await test('a newly created wallet shows ▶ Start, not ⏸ Stop', async () => {
+    const { window, $, $$ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    await window.eval(`S.wallets.push(demoNewWallet('Fresh', 'balanced')); renderAll();`);
+    assert.ok($$('[data-start]').length >= 2, 'the fresh wallet and the un-armed seed both offer ▶ Start');
+    assert.match($('#wallets').textContent, /not started/i, 'and the card says the wallet is not trading yet');
+    // The seed wallet in the harness is un-armed too, so no ⏸ Stop anywhere.
+    assert.strictEqual($$('[data-stop]').length, 0, 'nothing may look like it is already trading');
+  });
+
+  await test('pressing ▶ Start arms the wallet, and then it trades', async () => {
+    const { window, $, $$ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    await window.eval(`S.wallets.push(demoNewWallet('Fresh', 'balanced')); renderAll();`);
+    const btn = $$('[data-start]')[0];
+    assert.ok(btn, 'a Start button');
+    const id = btn.dataset.start;
+    await click(window, btn);
+    assert.strictEqual(window.eval(`S.wallets.find((w) => w.id === '${id}').enabled`), true, 'the wallet is armed');
+    assert.strictEqual(window.eval(`S.wallets.find((w) => w.id === '${id}').armed`), true);
+    assert.ok($$('[data-stop]').length > 0, 'and its card now offers Stop');
+  });
+
+  /* ── paper trades are visibly paper ──────────────────────────────────── */
+
+  await test('dry-run positions and history rows are labelled SIM', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    await window.eval(`S.status.dryRun = true;
+      const w = S.wallets[0];
+      w.openPositions.push({ id: 'pz', walletId: w.id, wallet: w.name, symbol: 'PAPERCOIN', mint: 'PZ',
+        status: 'OPEN', openedAt: Date.now(), solSpent: String(0.2e9), tokensHeld: '0', originalTokens: '0',
+        pnlSol: 0.01, pnlPct: 5, priceGainPct: 5, peakGainPct: 7, stopLevelPct: -25, tiers: [], simulated: true });
+      w.recentPositions.push({ id: 'cz', walletId: w.id, wallet: w.name, symbol: 'CLOSEDPAPER', mint: 'CZ',
+        status: 'CLOSED', openedAt: Date.now() - 60000, closedAt: Date.now(), solSpent: String(0.2e9),
+        realisedSol: String(0.24e9), pnlSol: 0.04, pnlPct: 20, exitReason: 'tp_20pct', simulated: true });
+      S.positions = S.wallets.flatMap((x) => x.openPositions || []);
+      S.history = S.wallets.flatMap((x) => x.recentPositions || []);
+      renderAll();`);
+    assert.match($('#positions').textContent, /PAPERCOIN/);
+    assert.match($('#positions').textContent, /SIM/, 'an open paper position says so');
+    assert.match($('#history').textContent, /CLOSEDPAPER/);
+    assert.match($('#history').textContent, /SIM/, 'a closed paper trade says so');
+    assert.match($('#stats').textContent, /paper/i, 'and the headline P&L says it is paper');
   });
 
   await test('the feed dot distinguishes "scanner stopped" from "feed offline"', async () => {
