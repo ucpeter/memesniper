@@ -202,6 +202,10 @@ const api = fn(
     if (!/function setTradingMode\(/.test(src)) throw new Error('there is no single mode setter');
     // The settings dialog must use the same path, or the two can drift.
     if (!/await setTradingMode\(goingLive\)/.test(src)) throw new Error('settings has its own copy of the mode change');
+    // …and neither of them may reach for window.prompt(), which is what made the
+    // switch look broken on a phone.
+    if (/prompt\(\s*['"`]LIVE MODE/.test(src)) throw new Error('the browser prompt is back in the LIVE path');
+    if (!/function openLiveConfirm\(/.test(src)) throw new Error('the in-page confirmation is gone');
   });
 
   await t('the dashboard reads the launch feed the server sends', () => {
@@ -352,6 +356,9 @@ const api = fn(
     if (!/Nothing here yet — no wallets, and no passphrase set/.test(src)) {
       throw new Error('no first-run wording for the empty panel');
     }
+    if (!/The keystore locks on every restart/.test(src)) {
+      throw new Error('the empty panel no longer says why a passphrase is being asked for');
+    }
     if (!/No wallet is missing/.test(src)) {
       throw new Error('the restart case does not reassure that no wallet is missing');
     }
@@ -445,11 +452,14 @@ const api = fn(
   });
 
   await t("the create form says out loud that the passphrase is not the new wallet's", () => {
-    if (!/not a password for the wallet you are creating/i.test(src)) {
+    // Round 9 shortened this line; the FACT it exists to prevent is unchanged —
+    // someone reading "passphrase" while creating a wallet and thinking it is
+    // that wallet's own password.
+    if (!/not a password for this new wallet/i.test(src)) {
       throw new Error('the form must rule out the wrong reading of the passphrase field');
     }
-    if (!/Wallets do not have their own passphrases/i.test(src)) {
-      throw new Error('and say that wallets have no passphrase of their own');
+    if (!/One passphrase, one <b>keystore<\/b> file, for every wallet/i.test(src)) {
+      throw new Error('and say that there is one passphrase for all wallets');
     }
     if (!/id="edPassErr"/.test(src)) {
       throw new Error('the wrong-passphrase error needs somewhere to appear next to the field');

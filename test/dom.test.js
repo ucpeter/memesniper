@@ -260,11 +260,20 @@ async function click(window, el) {
     const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
     const notices = $('#notices').textContent;
 
-    assert.match(notices, /nothing here is buying or selling/i, 'the top strip must say so plainly');
-    assert.match(notices, /simulated/i, 'and use the word for the simulated trades');
+    // The user asked for short notes, twice: "I don't need a long note to
+    // understand what a feature does". So this pins the two FACTS — trades are
+    // simulated; funding and withdrawing are real — and not a word count of
+    // prose. Anything longer than a line or two belongs in the README.
+    assert.match(notices, /trades are simulated/i, 'the top strip must say what dry run does');
     assert.match(notices, /are real/i, 'and warn that funding and withdrawing are real regardless');
+    const dryNotice = [...window.document.querySelectorAll('#notices .notice')]
+      .find((el) => /trades are simulated/i.test(el.textContent));
+    assert.ok(dryNotice, 'the dry-run notice must render');
+    const len = dryNotice.textContent.replace(/\s+/g, ' ').trim().length;
+    assert.ok(len < 90, `the dry-run notice is a note, not an essay (${len} chars)`);
     assert.match($('#modeText').textContent, /DRY RUN/i, 'the header chip as well');
-    assert.match($('#modeChip').title || '', /funding a wallet/i, 'and its tooltip must cover the same two facts');
+    assert.match($('#modeChip').title || '', /simulated/i, 'and its tooltip must cover the same two facts');
+    assert.match($('#modeBarSub').textContent, /simulated/i, 'and the mode bar, which is always on screen');
   });
 
   await test('a host that will wipe its disk warns BEFORE it does', async () => {
@@ -406,7 +415,7 @@ async function click(window, el) {
     await window.eval(`S.status = Object.assign({}, S.status, { running: false, scanner: { source: 'pumpportal', connected: false } });
       S.scanFeed = []; renderScanFeed();`);
     assert.match($('#scanFeed').textContent, /engine is stopped/i, 'the engine being off is one cause');
-    assert.match($('#scanFeed').textContent, /▶ Engine/, 'and it must name the control that fixes it');
+    assert.match($('#scanFeed').textContent, /▶ Start scanning/, 'and it must name the control that fixes it');
 
     await window.eval(`S.status = Object.assign({}, S.status, { running: true, scanner: { source: 'pumpportal', connected: true } });
       renderScanFeed();`);
@@ -452,22 +461,45 @@ async function click(window, el) {
     assert.strictEqual($('#modeLive').getAttribute('aria-pressed'), 'false');
     assert.match($('#modeBarTitle').textContent, /DRY RUN/);
 
-    // Arming live asks for the typed phrase first.
-    window.prompt = () => 'nope';
+    // Arming live asks in a DIALOG DRAWN BY THE PAGE.
+    //
+    // It used to call window.prompt(). On a real phone the prompt was dismissed
+    // and the app refused silently, so the user pressed LIVE and saw "Cancelled —
+    // still in dry run" with nothing else: "what I get when I hit the live
+    // button". A page-owned dialog cannot be swallowed by the browser.
+    window.prompt = () => { throw new Error('window.prompt must not be used for this'); };
     await click(window, $('#modeLive'));
-    assert.strictEqual(window.eval('S.status.dryRun'), true, 'a wrong phrase must NOT arm live');
+    const dialog = $('#modal') || window.document.querySelector('.modal-bg');
+    assert.ok(dialog, 'tapping LIVE must open a confirmation dialog in the page');
+    assert.strictEqual(window.eval('S.status.dryRun'), true, 'and it must not arm anything by itself');
 
-    window.prompt = () => 'I_UNDERSTAND_THE_RISK';
-    await click(window, $('#modeLive'));
-    assert.strictEqual(window.eval('S.status.dryRun'), false, 'the right phrase arms live');
+    const word = window.document.querySelector('#lvWord');
+    const arm = window.document.querySelector('#lvGo');
+    assert.ok(word && arm, 'the dialog needs the word field and the arm button');
+    assert.strictEqual(arm.disabled, true, 'the arm button starts disabled');
+
+    word.value = 'no';
+    word.dispatchEvent(new window.Event('input', { bubbles: true }));
+    assert.strictEqual(arm.disabled, true, 'a wrong word keeps it disabled');
+    await click(window, arm);
+    assert.strictEqual(window.eval('S.status.dryRun'), true, 'and arming is refused');
+
+    word.value = 'live';
+    word.dispatchEvent(new window.Event('input', { bubbles: true }));
+    assert.strictEqual(arm.disabled, false, 'the word LIVE — any case — unlocks the button');
+    await click(window, arm);
+    assert.strictEqual(window.eval('S.status.dryRun'), false, 'LIVE is armed');
     assert.ok($('#modeLive').classList.contains('on'), 'and the switch repaints');
     assert.match($('#modeBarTitle').textContent, /LIVE/);
+    assert.match($('#modeText').textContent, /LIVE/i, 'and so does the header chip — it must not still say DRY RUN');
+    assert.strictEqual(window.document.querySelector('.modal-bg'), null, 'the dialog closes itself');
 
-    // …and going back to dry run is free: no phrase, and no prompt at all.
-    window.prompt = () => { throw new Error('returning to dry run must never prompt'); };
+    // …and going back to dry run is free: no dialog, no prompt, nothing to type.
+    window.prompt = () => { throw new Error('returning to dry run must never ask'); };
     await click(window, $('#modeDry'));
     assert.strictEqual(window.eval('S.status.dryRun'), true, 'back to dry run');
     assert.match($('#modeBarTitle').textContent, /DRY RUN/);
+    assert.strictEqual(window.document.querySelector('.modal-bg'), null, 'and it did not open a dialog');
   });
 
   /* ── a wallet you create is not a wallet that is trading ─────────────── */
@@ -528,6 +560,37 @@ async function click(window, el) {
 
     await window.eval("S.status = Object.assign({}, S.status, { running: true, scanner: { source: 'pumpportal', connected: false } }); renderScanFeed();");
     assert.strictEqual($('#scanDotText').textContent, 'offline');
+  });
+
+  /**
+   * The notes diet, pinned.
+   *
+   * "all the notes across the app saying what a feature does and does not ...
+   * I don't need a long note to understand what a feature does".
+   *
+   * A CSS-selector rule for this would be brittle; what actually annoyed the user
+   * was PARAGRAPHS on the dashboard, so this caps the visible notes there. Help
+   * text the user deliberately opened (a settings field, a dialog) is not what
+   * this measures.
+   */
+  await test('the notes on the dashboard are notes, not paragraphs', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 2, keystoreUnlocked: true });
+    // Empty the lists first, so what is measured is the NOTE each panel shows and
+    // not the table that replaces it once there is something to look at.
+    await window.eval(`S.positions = []; S.history = []; S.scanFeed = []; renderPositions(); renderHistory(); renderScanFeed();`);
+    for (const sel of ['#notices', '#modeBarSub', '#positions', '#history', '#scanFeed']) {
+      const el = $(sel);
+      if (!el) continue;
+      const text = el.textContent.replace(/\s+/g, ' ').trim();
+      assert.ok(
+        text.length < 260,
+        `${sel} carries ${text.length} characters of explanation — too long: "${text.slice(0, 120)}…"`,
+      );
+    }
+    // And the two paragraphs the complaint started from are gone for good.
+    const src = window.document.documentElement.innerHTML;
+    assert.ok(!/because a settings flag must never be able to trap your money/.test(src), 'the withdraw essay is back');
+    assert.ok(!/it does that every time/.test(src), 'the keystore-restart lecture is back');
   });
 
   await test('every Close and Cancel button in the app has a real handler', () => {

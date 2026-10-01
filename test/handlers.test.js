@@ -545,7 +545,7 @@ async function test(name, fn) {
     assert.match(html, /passphrase you chose when you created your first wallet/i,
       'the label must say WHICH passphrase is wanted');
     assert.match(html, /keystore/i, 'and name the file it belongs to');
-    assert.match(html, /not a password for the wallet/i,
+    assert.match(html, /not a password for this new wallet/i,
       'and say out loud that it is not this wallet\'s own password');
     assert.ok(!/vault/i.test(html), 'never "vault"');
     assert.ok(!/unlock/i.test(html), 'and never tells anyone to unlock a wallet');
@@ -665,8 +665,22 @@ async function test(name, fn) {
     renderNotices();
 
     const html = notices.join('');
-    assert.match(html, /1 wallet is locked right now/, 'one recoverable wallet, not two');
-    assert.match(html, /not gone/i, 'and it must say the wallets are not gone');
+    // Shorter copy (round 9: "I don't need a long note to understand what a
+    // feature does"), same two facts: HOW MANY are locked, and that opening the
+    // keystore is the fix. The "not lost" reassurance lives on the wallet card,
+    // where the user is actually looking when they wonder about one wallet.
+    assert.match(html, /1 wallet is locked/, 'one recoverable wallet, not two');
+    assert.match(html, /keystore locks on every restart/i, 'and say why it is locked at all');
+    // Measure the LOCKED banner alone — the strip may legitimately carry other
+    // one-line notices beside it.
+    // The strip renders as one block, so pick out the LOCKED banner itself — the
+    // dry-run notice legitimately sits beside it.
+    const lockedHtml = notices
+      .flatMap((strip) => String(strip).split('<div class="notice'))
+      .filter((piece) => /wallet is locked|wallets are locked/.test(piece))
+      .join('');
+    const bannerText = lockedHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    assert.ok(bannerText.length < 130, `the locked-wallet banner reads ${bannerText.length} characters — too long for a note`);
     assert.match(html, /data-keystore/, 'with a button to open the keystore');
   });
 
