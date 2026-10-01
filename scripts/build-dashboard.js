@@ -23,16 +23,21 @@ const read = (p) => fs.readFileSync(path.join(ROOT, p), 'utf8');
 let html = read('public/index.html');
 const css = read('public/styles.css');
 const app = read('public/app.js');
+// The wallet store must be inlined BEFORE app.js: it is where the wallets live,
+// and a single-file dashboard without it has no wallets at all.
+const wallets = read('public/wallets.js');
 
 const styleTag = /<link[^>]+href="\.\/styles\.css"[^>]*>/;
 const scriptTag = /<script[^>]+src="\.\/app\.js"[^>]*><\/script>/;
 
 if (!styleTag.test(html)) throw new Error('index.html: no ./styles.css link to inline');
 if (!scriptTag.test(html)) throw new Error('index.html: no ./app.js script to inline');
+const walletsTag = /<script\s+src=["']\.\/wallets\.js["']\s*><\/script>/;
 
 // `</script>` inside a string literal would end the tag early; escape it.
 const safeJs = app.replace(/<\/script>/gi, '<\\/script>');
 
+html = html.replace(walletsTag, () => `<script>${wallets}</script>`);
 html = html
   .replace(styleTag, `<style>\n${css}\n</style>`)
   .replace(scriptTag, `<script>\n${safeJs}\n</script>`);
