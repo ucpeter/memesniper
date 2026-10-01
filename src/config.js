@@ -171,6 +171,13 @@ function defaultGlobalConfig() {
       dailyLossLimitSol: 10,
       pauseOnDailyLoss: true,
     },
+    /* What "risky" means in the launch table, before any wallet's own filters are
+     * involved. Deliberately global: the number is shown to a human, so it must
+     * not change depending on which wallet happens to be enabled. */
+    risk: {
+      maxDevHoldPct: 15,     // dev's opening buy, % of the 1e9 supply
+      minLiquidityUsd: 2000, // curve liquidity floor, in dollars
+    },
   };
 }
 

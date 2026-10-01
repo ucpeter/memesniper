@@ -361,6 +361,105 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     });
   });
 
+  /**
+   * Step 1 of a browser-signed withdrawal: build the UNSIGNED transfer.
+   *
+   * Deliberately does NOT need the wallet's key — reading a balance and building a
+   * transfer both work from the public address alone, which is what makes a
+   * withdrawal possible with the wallet locked. This is the reference bot's
+   * `withdraw()` split in two: it signs with the keypair it holds in the tab; we
+   * hand the unsigned bytes to the tab and take the signed ones back.
+   */
+  app.post('/api/wallets/:id/withdraw/intent', requireToken, async (req, res) => {
+    const g = getFull();
+    const w = g.wallets.find((x) => x.id === req.params.id);
+    if (!w) return res.status(404).json({ error: 'wallet_not_found' });
+    if (!w.publicKey) return res.status(400).json({ error: 'wallet_has_no_address' });
+
+    const destination = String(req.body.destination || '').trim();
+    if (!destination) return res.status(400).json({ error: 'destination_required' });
+    let toPk;
+    try {
+      toPk = new (require('@solana/web3.js').PublicKey)(destination);
+    } catch {
+      return res.status(400).json({ error: 'invalid_destination' });
+    }
+
+    const executor = engine.executor;
+    const mode = req.body.mode === 'all' ? 'all' : 'custom';
+    let lamports;
+    try {
+      const balanceSol = await executor.getBalanceSol(w.publicKey);
+      const balance = BigInt(Math.round(balanceSol * 1e9));
+      const RENT = require('./engine/executor').RENT_EXEMPT_MIN_LAMPORTS;
+      lamports = mode === 'all'
+        ? balance - 5000n - RENT
+        : BigInt(Math.round(Number(req.body.amountSol || 0) * 1e9));
+    } catch (err) {
+      return res.status(400).json({ error: `balance_read_failed: ${err.message}` });
+    }
+    if (lamports <= 0n) return res.status(400).json({ error: 'nothing_to_withdraw' });
+
+    let built;
+    try {
+      built = await executor.buildTransfer({ from: w.publicKey, to: toPk, lamports });
+    } catch (err) {
+      return res.status(400).json({ error: `build_failed: ${err.message}` });
+    }
+
+    const id = `wi_${crypto.randomBytes(8).toString('hex')}`;
+    withdrawIntents.set(id, { id, walletId: w.id, from: w.publicKey, to: destination, lamports, ts: Date.now() });
+    for (const [k, v] of withdrawIntents) if (Date.now() - v.ts > 180_000) withdrawIntents.delete(k);
+
+    res.json({
+      ok: true,
+      intentId: id,
+      wallet: w.id,
+      from: w.publicKey,
+      to: destination,
+      amountSol: Number(lamports) / 1e9,
+      lamports: lamports.toString(),
+      txBase64: Buffer.from(built.tx.serialize({ requireAllSignatures: false, verifySignatures: false })).toString('base64'),
+      blockhash: built.blockhash,
+      lastValidBlockHeight: built.lastValidBlockHeight,
+      note: 'Sign this in your browser with the wallet key, then send the signed bytes back to /submit.',
+    });
+  });
+
+  /** Step 2: broadcast the transfer the BROWSER signed. No key needed here. */
+  app.post('/api/wallets/:id/withdraw/submit', requireToken, async (req, res) => {
+    const intent = withdrawIntents.get(req.body.intentId);
+    if (!intent) return res.status(400).json({ error: 'unknown_or_expired_intent' });
+    if (Date.now() - intent.ts > 180_000) {
+      withdrawIntents.delete(intent.id);
+      return res.status(400).json({ error: 'intent_expired' });
+    }
+    if (intent.walletId !== req.params.id) {
+      return res.status(400).json({ error: 'intent_wallet_mismatch' });
+    }
+    if (!req.body.txBase64) return res.status(400).json({ error: 'signed_transaction_required' });
+
+    // The intent's own numbers are what the signed bytes are checked against, NOT
+    // whatever the caller says now.
+    const out = await engine.executor.sendSignedTransfer({
+      expectFrom: intent.from,
+      destination: intent.to,
+      lamports: intent.lamports,
+      txBase64: req.body.txBase64,
+    });
+    /* A signed transaction is consumed the moment it is ACCEPTED — the intent is
+     * spent whether the network takes it or not, so the same signed bytes can never
+     * be relayed twice through this server. If the send failed, the dialog re-signs
+     * a fresh one on the next press. */
+    if (out.accepted) withdrawIntents.delete(intent.id);
+    if (!out.ok) return res.status(400).json(out);
+
+    const trader = engine.traders.get(intent.walletId);
+    if (trader) trader.refreshBalance().catch(() => {});
+    bus.safeEmit('wallet:updated', intent.walletId);
+    res.json({ ok: true, signature: out.signature, amountSol: Number(intent.lamports) / 1e9, destination: intent.to, signedBy: 'browser' });
+  });
+
   app.post('/api/wallets/:id/withdraw', requireToken, async (req, res) => {
     const g = getFull();
     const w = g.wallets.find((x) => x.id === req.params.id);
@@ -417,7 +516,11 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
    * codebase: those are the two calls a drainer needs, and this project exists
    * because of a site that used them.
    */
-  const fundIntents = new Map(); // id -> intent (short-lived, single use)
+  const fundIntents = new Map();
+  /* Withdrawals the browser is about to sign. Same shape and lifetime as the
+   * funding intents: an intent is a promise about WHAT will be broadcast, and the
+   * signed bytes are checked against it rather than against the request body. */
+  const withdrawIntents = new Map(); // id -> intent (short-lived, single use)
 
   app.post('/api/fund/intent', requireToken, async (req, res) => {
     const g = getFull();
@@ -502,12 +605,17 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
   });
 
   app.get('/api/wallets', (req, res) => {
+    /* `persistent` travels with every wallet: it is how a card knows the BOT holds
+     * the key (so it survives a restart) rather than this session alone. The key
+     * itself is in the vault, never here. */
+    const persisted = new Set(getFull().wallets.filter((w) => w.persistent).map((w) => w.id));
     const live = [...engine.traders.values()].map((t) => ({
       ...t.toJSON(),
       // Armed = this process holds the key for the session. Distinct from
       // `armed`, which the engine uses for "enabled and not paused".
       keyArmed: keystore.armed(t.cfg.id),
-      keyHolder: 'session',
+      keyHolder: persisted.has(t.cfg.id) ? 'server' : 'session',
+      persistent: persisted.has(t.cfg.id),
     }));
     // A wallet whose key is not loaded is still a wallet the user created. Show
     // it, flagged, instead of an empty list — the name and the on-chain address
@@ -759,6 +867,140 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
       note: 'Key loaded for this session. It is held in memory only and is gone when the bot restarts — the sealed copy in your browser is untouched.',
       wallet: t ? t.toJSON() : null,
     });
+  });
+
+  /**
+   * SEND THE KEY TO THE BOT — the reference repo's `persistent-bot/start`.
+   *
+   * The repo's browser wallet is sealed in localStorage, and its `start()` posts
+   * `{ walletAddress, secretKeyBase64 }` over HTTPS so the server can trade with the
+   * tab CLOSED and keep going across a reload. That is the function being asked for
+   * here, and this is it.
+   *
+   * Where it deliberately differs from the repo: the repo keeps the key in process
+   * memory, so a restart or a redeploy loses every wallet and every position it was
+   * managing. This seals it into `keystore.enc` — AES-256-GCM under the keystore
+   * passphrase — so the bot comes back after a restart, and so the key sitting on
+   * the server's disk is not readable by anyone who gets a copy of that disk.
+   *
+   * It is OPT-IN, PER WALLET. A wallet the user never sends stays exactly where it
+   * was: sealed in the browser, unusable by the server.
+   */
+  app.post('/api/wallets/:id/persist', requireToken, async (req, res) => {
+    const g = getFull();
+    const stored = g.wallets.find((w) => w.id === req.params.id);
+    if (!stored) return res.status(404).json({ error: 'wallet_not_found' });
+    if (!req.body.secretKey) return res.status(400).json({ error: 'secret_key_required' });
+
+    /* The vault has to be open to write into it. Already open, closed and needs its
+     * passphrase, or not created yet — and in the last two the SAME field opens it,
+     * which is why this stays a single dialog. */
+    if (!keystore.isUnlocked()) {
+      const pass = String(req.body.keystorePassphrase || '');
+      if (pass.length < 8) {
+        return res.status(400).json({
+          error: 'keystore_passphrase_required',
+          hint: keystore.isInitialised()
+            ? 'Send the keystore passphrase (at least 8 characters) so the bot can store this key safely.'
+            : 'Choose a keystore passphrase (at least 8 characters) — the bot needs it to encrypt every key it holds, and you will be asked for it when the bot restarts.',
+        });
+      }
+      try {
+        if (keystore.isInitialised()) keystore.unlock(pass);
+        else keystore.init(pass);
+      } catch (err) {
+        return res.status(400).json({ error: 'keystore_open_failed', hint: err.message });
+      }
+    }
+
+    let address;
+    try {
+      address = keystore.importKey(stored.id, req.body.secretKey);
+    } catch (err) {
+      return res.status(400).json({ error: 'key_refused', hint: err.message });
+    }
+    // The key must control the address this wallet claims, or SOL sent to that
+    // address would be unreachable with it.
+    if (stored.publicKey && stored.publicKey !== address) {
+      keystore.remove(stored.id);
+      return res.status(400).json({
+        error: 'key_address_mismatch',
+        hint: 'That key does not control this wallet address. Nothing was stored.',
+      });
+    }
+    if (!stored.publicKey) stored.publicKey = address;
+
+    stored.keyHolder = 'server';
+    stored.persistent = true;
+
+    /* Arm it for THIS session too, so the button does what it says immediately:
+     * the bot can trade with this wallet before the tab is even closed. */
+    try { keystore.arm(stored.id, stored.publicKey, req.body.secretKey); } catch { /* it is in the vault either way */ }
+    engine.hydrate();
+    try { await engine.resume(); } catch { /* a wallet with no history */ }
+    try { engine.refreshLockedBalances(); } catch { /* best effort */ }
+    saveConfig();
+
+    const t = engine.traders.get(stored.id);
+    if (t) bus.safeEmit('wallet:stats', t.toJSON());
+    bus.safeEmit('wallet:updated', stored.id);
+    log.warn(`🖥 ${stored.name} sent to the bot — key sealed in keystore.enc; the bot can trade with the tab closed.`, { wallet: stored.name });
+    res.json({
+      ok: true,
+      persistent: true,
+      keyHolder: 'server',
+      walletId: stored.id,
+      publicKey: address,
+      note: 'The bot now holds this key, encrypted, so it can trade while this tab is closed and after a restart. You can remove it again at any time — the sealed copy in your browser is untouched.',
+      wallet: t ? t.toJSON() : null,
+    });
+  });
+
+  /** Take the key back out of the bot. The browser keeps its sealed copy. */
+  app.post('/api/wallets/:id/unpersist', requireToken, (req, res) => {
+    const g = getFull();
+    const stored = g.wallets.find((w) => w.id === req.params.id);
+    if (!stored) return res.status(404).json({ error: 'wallet_not_found' });
+
+    /* Deleting the key from the ENCRYPTED FILE needs the vault open — a locked
+     * vault cannot rewrite its own contents. Without this the route threw a 500 and,
+     * worse, the key stayed on disk: a button labelled "Remove from bot" that leaves
+     * the key there is exactly the kind of quiet lie this project cannot afford. So
+     * the passphrase is asked for, and nothing is claimed until it is done. */
+    if (!keystore.isUnlocked()) {
+      const pass = String(req.body.keystorePassphrase || '');
+      if (keystore.isInitialised() && pass.length < 8) {
+        return res.status(400).json({
+          error: 'keystore_passphrase_required',
+          hint: 'Open the keystore to delete this key from it — send the keystore passphrase (at least 8 characters).',
+        });
+      }
+      if (keystore.isInitialised()) {
+        try {
+          keystore.unlock(pass);
+        } catch (err) {
+          return res.status(400).json({ error: 'keystore_open_failed', hint: err.message });
+        }
+      }
+    }
+
+    try {
+      keystore.lockOne(stored.id);
+      keystore.remove(stored.id);
+    } catch (err) {
+      // Nothing stored under this id is not a failure — the goal is a key that is
+      // not here, and that is already true.
+      log.debug(`unpersist: no key to remove for ${stored.name} (${err.message})`);
+    }
+    stored.persistent = false;
+    stored.keyHolder = 'browser';
+    stored.enabled = false;
+    if (stored.stats) stored.stats.paused = false;
+    engine.removeWallet(stored.id);
+    saveConfig();
+    bus.safeEmit('wallet:updated', stored.id);
+    log.warn(`🖥 ${stored.name} removed from the bot — the key is gone from this server.`, { wallet: stored.name });
+    res.json({ ok: true, persistent: false, keyHolder: 'browser', note: 'The server no longer holds this key. The sealed copy in your browser is untouched.' });
   });
 
   /** Lock one wallet: forget its key now. The browser's sealed copy is untouched. */

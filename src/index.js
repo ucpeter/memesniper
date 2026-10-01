@@ -20,6 +20,10 @@ const log = require('./util/logger');
 
 const config = cfg.load();
 const engine = new Engine({ config, keystore });
+/* Start the SOL/USD rate NOW, not when the engine is started: the dashboard shows
+ * dollar values on every wallet card, and a person opening the page before pressing
+ * ▶ Start should not see blank ones. One request, then one every 60 seconds. */
+engine._startSolPriceWarmup();
 
 // Recover open positions from a previous run. At boot the keystore is locked,
 // so this usually cannot verify anything yet — it is called again after unlock
