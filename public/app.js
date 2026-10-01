@@ -499,22 +499,20 @@ function renderChips() {
   const sb = $('btnStart');
   sb.textContent = running ? '⏹ Stop scanning' : '▶ Start scanning';
   sb.title = running
-    ? 'Stops the launch scanner. All wallets stop receiving new candidates; open positions are still managed.'
-    : 'Starts the launch scanner that feeds every wallet. Each wallet must also be ▶ Started on its card.';
+    ? 'Stops the launch scanner. Open positions are still managed.'
+    : 'Starts the scanner. Each wallet is started separately on its card.';
   $('runChip').title = running
-    ? 'Scanner running — new launches are being evaluated by every armed wallet'
-    : 'Scanner stopped — nothing new is being evaluated';
+    ? 'Scanner running — launches are being evaluated by every armed wallet'
+    : 'Scanner stopped';
 
-  // The chip used to say "dry run" and leave the user to guess what that governed.
-  // It now states, in the tooltip, exactly what is simulated and what is not — the
-  // two things people actually need to know are that no trades are broadcast, and
-  // that funding and withdrawals are real regardless.
+  // Two facts, one line each. Everything else about dry run lives in the mode bar
+  // and in the switch itself, which the user can see without hovering anything.
   const dry = S.status?.dryRun !== false;
   $('modeChip').className = `mode-chip ${dry ? 'dry' : 'live'}`;
   $('modeText').textContent = dry ? 'DRY RUN — no real trades' : 'LIVE — real funds';
   $('modeChip').title = dry
-    ? 'DRY RUN: the bot hunts, scores and tracks positions exactly as it would live, but it does NOT buy or sell anything — every trade is simulated against a paper balance.\n\nWhat is real even in dry run: funding a wallet, and withdrawing from it. Those move actual SOL from the wallet you connected.'
-    : 'LIVE: every buy and sell is a real, signed transaction spending real SOL from your wallets.';
+    ? 'DRY RUN: trades are simulated. Funding and withdrawing are real.'
+    : 'LIVE: every trade spends real SOL.';
   paintModeSwitch(dry);
 
   const c = $('connChip');
@@ -542,8 +540,8 @@ function paintModeSwitch(dry) {
   if (title) title.textContent = dry ? '🧪 DRY RUN — paper trading' : '🔴 LIVE — real funds';
   if (sub) {
     sub.textContent = dry
-      ? 'Trades are simulated against a paper balance. Nothing is broadcast and no real SOL is spent. Press ▶ Start on a wallet card to watch paper trades open, hit their targets and close into history below.'
-      : 'Every buy and sell is a real, signed transaction spending real SOL from your wallets. Funding and withdrawing were always real; now the trades are too.';
+      ? 'Simulated trades on a paper balance. ▶ Start a wallet to watch them open and close below.'
+      : 'Real funds. Every trade is a real transaction from your wallets.';
   }
 
   const dryBtn = $('modeDry');
@@ -559,12 +557,18 @@ function paintModeSwitch(dry) {
 }
 
 /**
- * Change the trading mode. The ONLY path that does — the header switch, the
- * settings dialog and the dry-run banner all call this.
+ * Change the trading mode. The ONLY path that does — the switch, the settings
+ * dialog and the dry-run banner all call this.
  *
- * Arming live is irreversible in the sense that matters (it can spend money), so
- * it keeps the typed confirmation. Returning to dry run is free and immediate:
- * making someone type a phrase to STOP risking money would be perverse.
+ * Going LIVE asks for confirmation in the page, not in a window.prompt(). That
+ * mattered for a real user on a phone: the browser prompt was dismissed (or its
+ * answer never came back), the app correctly refused to arm, and what the person
+ * saw was "I pressed LIVE and nothing happened". A dialog drawn by the page
+ * cannot be swallowed by the browser, and it can put the input and the button in
+ * the same view.
+ *
+ * Returning to dry run is free and immediate: making someone type a phrase to
+ * STOP risking money would be perverse.
  */
 async function setTradingMode(goLive) {
   const dry = !goLive;
@@ -573,32 +577,74 @@ async function setTradingMode(goLive) {
     toast(dry ? 'Already in dry run — nothing here spends real SOL.' : 'Already live.', '');
     return;
   }
+  if (goLive) return openLiveConfirm();
+  return applyTradingMode(true);
+}
 
-  let confirmWord;
-  if (goLive) {
-    const typed = prompt(
-      'LIVE MODE\n\n' +
-      'From here on, every buy and sell is a real transaction signed by your wallets.\n' +
-      'Your stop loss and kill switches still work, but a bad fill costs real SOL.\n\n' +
-      'Type exactly: I_UNDERSTAND_THE_RISK',
-    );
-    if (typed !== 'I_UNDERSTAND_THE_RISK') { toast('Cancelled — still in dry run', ''); return; }
-    confirmWord = typed;
-  }
-
+/** The one place the mode is actually changed. */
+async function applyTradingMode(dry) {
   try {
     await api('/api/engine/dry-run', {
       method: 'POST',
-      body: JSON.stringify({ dryRun: dry, confirm: confirmWord }),
+      body: JSON.stringify({ dryRun: dry, confirm: dry ? undefined : 'I_UNDERSTAND_THE_RISK' }),
     });
-    const st = await api('/api/status');
-    S.status = st.engine; S.config = st.global;
-    renderAll();
+    // Repaint the chip from the state the server just confirmed, not from the
+    // renderAll() above: renderAll does not repaint the header chips, so the chip
+    // could still read "DRY RUN" while the app was already live. Found while
+    // probing the new confirmation dialog.
+    renderChips();
     toast(
-      dry ? '🧪 Back to DRY RUN — trades are simulated again' : '🔴 LIVE armed — real funds from here',
+      dry ? '🧪 DRY RUN — trades are simulated again' : '🔴 LIVE — real funds from here',
       dry ? '' : 'err',
     );
   } catch (err) { toast(err.message, 'err'); }
+}
+
+/**
+ * Confirm going live, in the page.
+ *
+ * The word to type is short because it has to be typed on a phone keyboard; the
+ * consequence is stated once, plainly, above it. The old full phrase is still
+ * accepted.
+ */
+function openLiveConfirm() {
+  openModal(`
+    <div class="modal" style="max-width:460px">
+      <div class="modal-head"><span class="modal-title">🔴 Turn on LIVE trading?</span></div>
+      <div class="modal-body">
+        <div class="notice danger" style="margin:0 0 14px">
+          <span class="ico">⚠</span>
+          <div><b>Real funds from here.</b> Every buy and sell is a real transaction from your wallets.</div>
+        </div>
+        <div class="field">
+          <label>Type LIVE to confirm</label>
+          <input type="text" id="lvWord" class="inp" placeholder="LIVE" autocapitalize="characters" autocomplete="off"/>
+          <div class="hint">Stops, kill buttons and the loss limit still apply.</div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn" data-close-modal="1">Stay in dry run</button>
+        <button class="btn btn-danger" id="lvGo" disabled>Arm LIVE</button>
+      </div>
+    </div>`, (root) => {
+    const q = (sel) => root.querySelector(sel);
+    const input = q('#lvWord');
+    const go = q('#lvGo');
+    const ok = () => {
+      const v = String(input.value || '').trim();
+      return v.toUpperCase() === 'LIVE' || v === 'I_UNDERSTAND_THE_RISK';
+    };
+    input.oninput = () => { go.disabled = !ok(); };
+    input.onkeydown = (e) => { if (e.key === 'Enter' && ok()) go.click(); };
+    go.onclick = async () => {
+      if (!ok()) return;
+      go.disabled = true;
+      go.textContent = 'Arming…';
+      closeModal();
+      await applyTradingMode(false);
+    };
+    input.focus();
+  });
 }
 
 /* ------------------------------------------------------------------ *
@@ -808,10 +854,7 @@ function openOfflineNotice(what) {
         <button class="btn btn-ghost btn-sm" data-close-modal="1" title="Close this dialog (Esc also works)">Close</button></div>
       <div class="modal-body">
         <div class="notice warn"><span class="ico">⚠</span><div>
-          <b>There is no bot behind this page.</b>
-          This copy of the dashboard is a static file, so nothing you submit here can reach a
-          keystore or a wallet. That is also why actions fail with an HTTP error — the request is
-          being answered by a file server, not by MEME SNIPER.
+          <b>There is no bot behind this page.</b> It is a static file — nothing here reaches a wallet.
         </div></div>
         <div class="section-label">To actually ${esc(what)}</div>
         <div class="hint" style="line-height:1.9">
@@ -822,8 +865,7 @@ function openOfflineNotice(what) {
           3 · Open the keystore in that tab, then ${esc(what)}.
         </div>
         <div class="notice info" style="margin-top:14px"><span class="ico">ℹ</span><div>
-          The numbers on this page are <b>sample data</b>, not your wallets. Nothing here can
-          spend or hold funds.
+          Every figure on this page is <b>sample data</b>.
         </div></div>
       </div>
       <div class="modal-foot"><button class="btn btn-block" data-close-modal="1">Close</button></div>
@@ -1134,8 +1176,8 @@ function openWithdraw(walletId) {
         <button class="btn btn-ghost btn-sm" data-close-modal="1" title="Close this dialog (Esc also works)">Close</button></div>
       <div class="modal-body">
         <p class="muted">${demo
-          ? 'Preview — this is a simulated withdrawal, so you can see the flow. When you run it for real, withdrawals are <b>never</b> simulated by dry run, because a settings flag must never be able to trap your money.'
-          : 'Move SOL out of this trading wallet. This signs for real — <b>withdrawals are not simulated by dry run</b>, because a settings flag must never be able to trap your money.'}</p>
+          ? 'Preview — simulated. Real withdrawals are never simulated by dry run.'
+          : 'Move SOL out of this wallet. Real, and <b>not</b> simulated by dry run.'}</p>
 
         <label class="fl-label">Send to</label>
         <div class="row-flex">
@@ -1244,30 +1286,24 @@ function renderNotices() {
   const out = [];
   if (S.demo) {
     out.push(`<div class="notice warn"><span class="ico">⚠</span><div>
-      <b>Demo mode — this is not a real bot, and these are not real wallets.</b>
-      No backend was detected, so every figure below is sample data and each address is an
-      unusable placeholder. <b>Never send funds to a demo address.</b>
-      Run <code class="mono">npm start</code> and open <code class="mono">http://localhost:8787/terminal</code> for the real thing.
+      <b>Demo mode.</b> Sample data, placeholder addresses — never send funds to them.
+      Run <code class="mono">npm start</code> for the real bot.
     </div></div>`);
   }
   if (S.status && S.status.dryRun === false) {
-    out.push(`<div class="notice danger"><span class="ico">⚠</span><div><b>LIVE TRADING.</b> The engine is armed and will spend real funds. Every wallet below trades with its own independent config.</div></div>`);
+    out.push(`<div class="notice danger"><span class="ico">⚠</span><div><b>LIVE — real funds.</b> Every buy and sell is a real transaction.</div></div>`);
   }
   const imported = (S.wallets || []).filter((w) => w.imported);
   if (imported.length) {
     out.push(`<div class="notice warn"><span class="ico">⚠</span><div>
       <b>${imported.length} wallet(s) use a key you imported:</b>
-      ${imported.map((w) => esc(w.name)).join(', ')}.
-      Imported keys are still hot keys on this machine. If any of these is your main wallet,
-      move your savings to a different wallet — a burner is meant to hold only what you can lose.
+      ${imported.map((w) => esc(w.name)).join(', ')}. Keep only what you can lose on them.
     </div></div>`);
   }
   const recovered = S.status?.recoveredPositions || 0;
   if (recovered) {
     out.push(`<div class="notice info"><span class="ico">♻</span><div>
-      <b>${recovered} position${recovered === 1 ? '' : 's'} resumed after a restart.</b>
-      ${recovered === 1 ? 'It was' : 'They were'} found still in the wallet, verified against the on-chain
-      balance, and handed back to your normal exit rules — targets and trailing stops included.
+      <b>${recovered} position${recovered === 1 ? '' : 's'} resumed after a restart.</b> Your normal exits manage them again.
     </div></div>`);
   }
 
@@ -1280,8 +1316,7 @@ function renderNotices() {
   const st = S.status && S.status.storage;
   if (st && st.ephemeral) {
     out.push(`<div class="notice danger"><span class="ico">⚠</span><div>
-      <b>This host deletes your wallets when it sleeps.</b>
-      ${esc(st.reason)}
+      <b>This host deletes your wallets when it sleeps.</b> ${esc(st.reason)}
       <div class="row-flex" style="margin-top:10px;gap:8px;flex-wrap:wrap">
         <button class="btn btn-sm" data-backup="1">⬇ Download a backup now</button>
         <button class="btn btn-sm" data-restore="1">⬆ Restore from a backup</button>
@@ -1289,30 +1324,20 @@ function renderNotices() {
     </div></div>`);
   }
 
-  // Plain words for the thing the user could not make head or tail of: what is
-  // simulated, what is real, and which number on a wallet card is which.
+  // The facts, in two sentences. The mode bar above already names the mode and
+  // carries the switch; this line exists for the one thing that surprises people —
+  // that funding and withdrawing are real even here.
   if (S.status && S.status.dryRun !== false) {
     out.push(`<div class="notice info"><span class="ico">i</span><div>
-      <b>Dry run is on: nothing here is buying or selling.</b> The bot hunts and scores launches,
-      and every trade it takes is <b>simulated</b>. Each wallet shows two numbers:
-      <b>Real bal.</b> is the SOL that wallet actually holds on Solana, and
-      <b>Sim. balance</b> is the pretend money the simulation trades with.
-      Funding a wallet and withdrawing from it <b>are real</b> and move actual SOL either way —
-      that is the only thing dry run does not cover.
-      <div style="margin-top:6px">Watch a paper trade happen: press <b>▶ Start</b> on a wallet card.
-      The switch between this and real money is the <b>DRY RUN / LIVE</b> control at the top of the page
-      (<a href="#" data-mode-live="1" style="color:var(--accent)">switch to LIVE</a> when you are ready).</div>
+      <b>Dry run: trades are simulated.</b> Funding and withdrawing <b>are real</b>.
     </div></div>`);
   }
 
   const lockedNow = (S.wallets || []).filter((w) => w.keyLocked && !w.keyMissing);
   if (lockedNow.length) {
     out.push(`<div class="notice warn"><span class="ico">🔒</span><div>
-      <b>${lockedNow.length} wallet${lockedNow.length === 1 ? ' is' : 's are'} locked right now.</b>
-      The bot keeps every wallet's private key in one encrypted file (the keystore) and locks it when it
-      restarts — that is what stops a stolen copy of the file, or this server, from spending your funds.
-      Your wallets are not gone: they are named and listed below. Open the keystore once this session and
-      they trade again.
+      <b>${lockedNow.length} wallet${lockedNow.length === 1 ? ' is' : 's are'} locked.</b>
+      The keystore locks on every restart. Open it to trade them again.
       <br/><br/><button class="btn btn-sm btn-primary" data-keystore="1">🔐 Open keystore</button>
     </div></div>`);
   }
@@ -1383,18 +1408,18 @@ function renderWallets() {
       ? {
           icon: '◈',
           title: 'No wallets yet',
-          sub: `Nothing here yet — no wallets, and no passphrase set.<br/><br/>A wallet is a Solana keypair the bot trades with. Your wallets' keys are kept in one encrypted file on this machine, called the keystore, protected by a passphrase you choose. Pick it and your first wallet is created in the same step.`,
+          sub: `Nothing here yet — no wallets, and no passphrase set. A wallet is a keypair the bot trades with; its key goes in one encrypted file on this machine, the keystore, and you choose the passphrase for it here.`,
         }
       : ks.locked
         ? {
             icon: '🔒',
             title: 'No wallet is missing',
-            sub: `You have no wallets yet, and the bot closed the keystore when it restarted.<br/><br/>Your wallets' keys are kept in one encrypted file on this machine, called the keystore, opened by the passphrase you chose the first time you used this bot. Creating your first wallet asks for it once, in the same form.`,
+            sub: `The keystore locks on every restart. Your wallets' keys are kept in it, so creating one asks for your passphrase once.`,
           }
         : {
             icon: '◈',
             title: 'No wallets yet',
-            sub: `Add a wallet to give it its own strategy, limits and exit rules.<br/>Each wallet trades independently with a separate config.`,
+            sub: `Add a wallet to give it its own strategy, limits and exit rules. Each wallet trades with its own config.`,
           };
     $('wallets').innerHTML = `<div class="empty" style="grid-column:1/-1">
         <div class="empty-icon">${empty.icon}</div>
@@ -1433,14 +1458,10 @@ function renderWallets() {
 
         <div class="wallet-locked-note">
           ${missing
-            ? `The keystore is open, and this key is <b>not in it</b>. That happens after a keystore
-               reset: the wallet record survives, the key does not. The bot cannot trade or withdraw it.
-               <b>Anything still at the address above stays on chain</b> — it needs this wallet's private
-               key to move, which only the archived keystore file holds. Delete the record if you do not
-               need it.`
-            : `<b>This wallet is not lost.</b> Its name and address live in the bot's config; its private
-               key is inside the keystore file, which the bot locked when it restarted. Open the keystore
-               once this session and this wallet trades again, with the same strategy and balance.`}
+            ? `<b>This key is not in the keystore</b> — a keystore reset archived it. The bot cannot trade or
+               withdraw this wallet. <b>Anything at the address above stays on chain.</b>`
+            : `<b>This wallet is not lost.</b> Its key is in the keystore, which locks on every restart.
+               Open it once this session and this wallet trades again.`}
         </div>
 
         <div class="wallet-actions">
@@ -1659,8 +1680,8 @@ function renderPositions() {
   if (!ps.length) {
     $('positions').innerHTML = `<div class="empty"><div class="empty-icon">◎</div>
       <div class="empty-title">No open positions</div>
-      <div class="empty-sub">The engine is watching for new launches. Positions appear here the moment a wallet fills${
-        dry ? ' — in dry run these are <b>paper</b> positions, opened and closed by exactly the same rules, with no transaction sent.' : '.'}</div></div>`;
+      <div class="empty-sub">Positions appear here the moment a wallet fills${
+        dry ? ' — paper positions in dry run' : ''}.</div></div>`;
     return;
   }
 
@@ -1717,8 +1738,7 @@ function renderHistory() {
   if (!h.length) {
     const dry = S.status ? S.status.dryRun !== false : true;
     $('history').innerHTML = `<div class="empty" style="padding:26px"><div class="empty-sub">Nothing closed yet.
-      Every exit — take-profit tier, trailing stop, loss limit, kill — lands here with its reason.${
-      dry ? '<br/><br/>You are in <b>DRY RUN</b>: these will be <b>paper</b> trades, opened and closed by the real rules against a paper balance. Press <b>▶ Start</b> on a wallet card to make some happen.' : ''}</div></div>`;
+      Exits land here with their reason.${dry ? ' In dry run these are paper trades.' : ''}</div></div>`;
     return;
   }
   $('history').innerHTML = `<table>
@@ -1787,21 +1807,10 @@ function renderScanFeed() {
     const running = S.status ? S.status.running !== false : false;
     const connected = Boolean(sc.connected);
     const body = !running
-      ? {
-          title: 'The engine is stopped, so nothing is being scanned.',
-          sub: 'Press <b>▶ Engine</b> in the top bar (or <b>▶ Start</b> on a wallet card — that starts it too). '
-             + 'Launches start filling this list within seconds, each with what the checks found and what every wallet decided about it.',
-        }
+      ? { title: 'The engine is stopped.', sub: 'Press <b>▶ Start scanning</b> above.' }
       : connected
-        ? {
-            title: 'Watching pump.fun now — no launch has arrived yet.',
-            sub: 'The feed is connected. New tokens appear here the moment they are created, usually several a minute. '
-               + 'Nothing else is needed from you.',
-          }
-        : {
-            title: 'The engine is running, but the launch feed is not connected.',
-            sub: 'That is why this list is empty while the counters move — check the dot above, then your RPC endpoint or your network.',
-          };
+        ? { title: 'Watching pump.fun — no launch has arrived yet.', sub: 'New tokens appear here as they are created.' }
+        : { title: 'The engine is running, but the feed is not connected.', sub: 'That is why this list is empty while the counters move.' };
     mount.innerHTML = `
       <div class="scan-empty">
         <p><b>${body.title}</b></p>
@@ -1917,11 +1926,9 @@ function openKeystore() {
       <div class="modal-head"><span class="modal-title">🔐 Your keystore — where your wallets' keys are kept</span></div>
       <div class="modal-body">
         <div class="notice info"><span class="ico">ℹ</span><div>
-          One encrypted file holds the keys to all your wallets. It is encrypted with
-          <b>AES-256-GCM</b> (scrypt-derived key) and stored at <code class="mono">data/keystore.enc</code>.
-          It never leaves this machine and is never returned by any API endpoint.
-          Think of it as a password manager for this bot's wallets — there is one keystore, not one
-          per wallet, and the bots' keys are only readable while it is open.
+          One encrypted file at <code class="mono">data/keystore.enc</code> holds the keys to all your wallets —
+          a password manager for this bot's wallets. It never leaves this machine, and the keys are readable
+          only while it is open.
         </div></div>
         <div class="field">
           <label>${ks.initialised ? 'Keystore passphrase' : 'Choose a passphrase'}</label>
@@ -1999,11 +2006,8 @@ function openWallet(walletId, opts = {}) {
       <div class="modal-body">
         ${justCreated ? `
           <div class="notice info" style="margin-bottom:16px"><span class="ico">✓</span><div>
-            <b>Wallet created.</b> It is a fresh burner with no funds yet, and it has its own
-            strategy: use the tabs below for <b>Exits</b> (take-profit, stop loss, trailing),
-            <b>Limits</b> (daily loss limit, max trades, exposure) and <b>Filters</b>
-            (liquidity range, holders, authorities). Fund it whenever you are ready — it will not
-            trade until the engine runs.
+            <b>Wallet created — stopped.</b> Set its <b>Exits</b>, <b>Limits</b> and <b>Filters</b> here,
+            fund it when you like, then press <b>▶ Start</b> on its card to trade it.
           </div></div>` : ''}
         ${isNew ? `
           <div class="burner-intro">
@@ -2011,9 +2015,8 @@ function openWallet(walletId, opts = {}) {
             <div>
               <div class="burner-title">This creates a burner wallet</div>
               <div class="burner-sub">
-                A fresh, throwaway hot wallet that this bot holds the key for. You never put your
-                real wallet's key in here — you <b>fund this burner from your own wallet</b> and
-                withdraw back to it whenever you like.
+                A throwaway hot wallet this bot holds the key for. You never put your real wallet's key
+                in here: you <b>fund this burner from your own wallet</b> and withdraw back to it.
               </div>
             </div>
           </div>
@@ -2025,8 +2028,9 @@ function openWallet(walletId, opts = {}) {
               <input type="password" id="edPass" placeholder="${ks.exists ? 'Your keystore passphrase' : 'At least 8 characters'}" autocomplete="current-password"/>
               <div class="hint">
                 ${ks.exists
-                  ? `${lockedCount ? `<b>${lockedCount} wallet${lockedCount === 1 ? '' : 's'} you already have live in this file, and this new one will live in it too.</b><br/><br/>` : ''}Your wallets' private keys are kept in one encrypted file on this machine, called the <b>keystore</b>. The bot locked that file when it restarted — it does that every time — so adding a wallet needs it opened first, because the new key is written into it.<br/><br/><b>This is not a password for the wallet you are creating.</b> Wallets do not have their own passphrases. There is one keystore, one passphrase, for all of them.`
-                  : `Your wallets' private keys will live in one encrypted file on this machine, called the <b>keystore</b>, protected by this passphrase. It is the only passphrase there is — every wallet you create from now on uses this same one, and you type it once per session.<br/><br/><b>Choose it carefully: there is no recovery.</b> If you forget it, the file cannot be decrypted by anyone, including this bot. Put it in a password manager now.`}
+                  ? `One passphrase, one <b>keystore</b> file, for every wallet — not a password for this new wallet. The keystore locks on every restart, so your passphrase opens it again.`
+                  : `Your wallets' keys go in one encrypted file on this machine, the <b>keystore</b>, protected by this passphrase. The same one for every wallet you ever create.`}
+                <br/><b>There is no recovery</b> — keep it in a password manager.
               </div>
               <div id="edPassErr" class="pass-err"></div>
               ${ks.exists ? `<button class="btn btn-sm" type="button" id="edPassForgot">Forgot your passphrase?</button>` : ''}
@@ -2052,10 +2056,8 @@ function openWallet(walletId, opts = {}) {
             <div class="notice danger" style="margin:10px 0">
               <span class="ico">⚠</span>
               <div>
-                <b>Do not paste your main wallet's key.</b> Anything you import here is held by this
-                bot as a hot key on this machine, and the bot will trade from it. That is fine for a
-                purpose-made burner you already control — and dangerous for the wallet that holds
-                your savings.
+                <b>Do not paste your main wallet's key.</b> It is held here as a hot key and traded from.
+                Fine for a burner you control; dangerous for your savings.
               </div>
             </div>
             <label class="fl-label">Private key — base58 or Phantom JSON array</label>
@@ -2196,8 +2198,7 @@ function renderEditorPanes(root) {
   /* ------------------------------ EXITS ------------------------------ */
   root.querySelector('#paneExits').innerHTML = `
     <div class="notice warn"><span class="ico">◎</span><div>
-      <b>Partial take-profits.</b> Each tier sells a share of your <b>original</b> position once the token is up that much.
-      Tiers are evaluated highest-first, so a price that gaps through several fills them all correctly.
+      <b>Partial take-profits.</b> Each tier sells a share of the <b>original</b> position at that gain.
     </div></div>
     <div class="section-label">Take-profit tiers</div>
     <div id="tierList"></div>
@@ -2459,7 +2460,7 @@ function wireEditor(root) {
             if (pe) {
               pe.innerHTML = `<b>${esc(err.message)}</b><br/>` + (ksIsNew
                 ? 'That is the passphrase this keystore was created with.'
-                : 'That is not the passphrase for your keystore. It is the one you chose when you created your first wallet — creating another wallet does not change it. If you cannot remember it, use <b>Forgot your passphrase?</b> below.');
+                : 'That is the passphrase you chose for this keystore. Forgotten it? Use <b>Forgot your passphrase?</b> below.');
             }
             throw err;
             }
@@ -2502,7 +2503,7 @@ function openSettings() {
         <div class="field"><label>Mode</label>
           <div class="notice ${g.dryRun ? 'warn' : 'danger'}" style="margin:0">
             <span class="ico">${g.dryRun ? '🧪' : '🔴'}</span>
-            <div><b>${g.dryRun ? 'Dry run' : 'LIVE'}</b> — full strategy logic runs and positions are tracked, but ${g.dryRun ? 'no transactions are broadcast' : 'real funds are spent'}.</div>
+            <div><b>${g.dryRun ? 'Dry run — trades are simulated' : 'LIVE — real funds'}</b>. The switch is under the header.</div>
           </div>
           <button class="btn ${g.dryRun ? 'btn-danger' : 'btn-primary'}" id="g_toggle" style="margin-top:10px">
             ${g.dryRun ? '⚠ Arm live trading' : '← Return to dry run'}
