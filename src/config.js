@@ -235,8 +235,10 @@ function defaultWalletConfig(name) {
       maxBuyTaxPct: 10,
       maxSellTaxPct: 10,
       // ── distribution ──────────────────────────────────────────────
-      minLiquiditySol: p.filters.minLiquiditySol,
-      maxLiquiditySol: p.filters.maxLiquiditySol,
+      minLiquiditySol: p.filters.minLiquiditySol, // legacy only
+      maxLiquiditySol: p.filters.maxLiquiditySol, // legacy only
+      minLiquidityUsd: Math.round(p.filters.minLiquiditySol * 150),
+      maxLiquidityUsd: p.filters.maxLiquiditySol ? Math.round(p.filters.maxLiquiditySol * 150) : 0,
       maxTop10HoldersPct: p.filters.maxTop10HoldersPct,
       minHolders: p.filters.minHolders,
       // ── metadata ──────────────────────────────────────────────────
@@ -447,6 +449,12 @@ const clamp = (v, lo, hi, fallback) => {
 function normaliseWallet(cfg) {
   const d = defaultWalletConfig(cfg.name);
   const w = deepMerge(d, cfg);
+  // Pre-dollar configs are left in their original SOL units until the owner
+  // edits them. Never quietly reinterpret 1 SOL as $1, or rewrite existing
+  // strategies during a deployment. New wallets and explicitly saved dollar
+  // settings carry minLiquidityUsd/maxLiquidityUsd as the authority.
+  if (cfg.filters && !Object.hasOwn(cfg.filters, 'minLiquidityUsd')) delete w.filters.minLiquidityUsd;
+  if (cfg.filters && !Object.hasOwn(cfg.filters, 'maxLiquidityUsd')) delete w.filters.maxLiquidityUsd;
 
   /* A wallet object is FLAT: buy/exits/limits/filters/ai sit at the top level.
    * The API serialises them into a `config` key for readability, and a client
@@ -503,6 +511,15 @@ function normaliseWallet(cfg) {
   if (w.filters.maxLiquiditySol > 0 && w.filters.maxLiquiditySol < w.filters.minLiquiditySol) {
     w.filters.maxLiquiditySol = w.filters.minLiquiditySol;
   }
+  if (w.filters.minLiquidityUsd !== undefined) {
+    w.filters.minLiquidityUsd = clamp(w.filters.minLiquidityUsd, 0, 1000000000, 150);
+  }
+  if (w.filters.maxLiquidityUsd !== undefined) {
+    w.filters.maxLiquidityUsd = clamp(w.filters.maxLiquidityUsd, 0, 1000000000, 0);
+    if (w.filters.maxLiquidityUsd > 0 && w.filters.maxLiquidityUsd < (w.filters.minLiquidityUsd || 0)) {
+      w.filters.maxLiquidityUsd = w.filters.minLiquidityUsd;
+    }
+  }
 
   return w;
 }
@@ -518,7 +535,11 @@ function applyPreset(walletCfg, presetName) {
       stopLossPct: p.exits.stopLossPct,
       trailing: { ...p.exits.trailing, stepPct: 0 },
     },
-    filters: p.filters,
+    filters: {
+      ...p.filters,
+      minLiquidityUsd: Math.round(p.filters.minLiquiditySol * 150),
+      maxLiquidityUsd: p.filters.maxLiquiditySol ? Math.round(p.filters.maxLiquiditySol * 150) : 0,
+    },
   });
   return normaliseWallet(merged);
 }

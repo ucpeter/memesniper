@@ -139,6 +139,10 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
   });
 
   app.post('/api/keystore/lock', requireToken, (req, res) => {
+    if ([...engine.traders.values()].some((t) => t.openPositions().length || t.cfg.enabled)) {
+      return res.status(409).json({ error: 'wallet_active',
+        hint: 'Stop wallets and close positions before closing the server keystore. Lock the browser view to keep ongoing trades managed.' });
+    }
     keystore.lock();
     res.json({ ok: true });
   });
@@ -271,6 +275,9 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
    * exactly where it is).
    */
   app.post('/api/keystore/reset', requireToken, (req, res) => {
+    if ([...engine.traders.values()].some((t) => t.openPositions().length || t.cfg.enabled)) {
+      return res.status(409).json({ error: 'wallet_active', hint: 'Stop wallets and close open positions before resetting the keystore.' });
+    }
     if (req.body.confirm !== 'RESET') {
       return res.status(400).json({
         error: 'confirmation_required',
@@ -774,6 +781,10 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
   });
 
   app.delete('/api/wallets/:id', requireToken, (req, res) => {
+    const trader = engine.traders.get(req.params.id);
+    if (trader && (trader.openPositions().length || trader.cfg.enabled)) {
+      return res.status(409).json({ error: 'wallet_active', hint: 'Stop new entries and close open positions before deleting this wallet.' });
+    }
     const g = getFull();
     g.wallets = g.wallets.filter((w) => w.id !== req.params.id);
     saveConfig();
@@ -969,13 +980,17 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
       keyHolder: 'server',
       walletId: stored.id,
       publicKey: address,
-      note: 'The bot now holds this key, encrypted, so it can trade while this tab is closed and after a restart. You can remove it again at any time — the sealed copy in your browser is untouched.',
+      note: 'Optional encrypted key copy stored on this server. Reopen the keystore after a restart to resume trading and exit management. Removal requires stopping the wallet and closing open positions.',
       wallet: t ? t.toJSON() : null,
     });
   });
 
   /** Take the key back out of the bot. The browser keeps its sealed copy. */
   app.post('/api/wallets/:id/unpersist', requireToken, (req, res) => {
+    const trader = engine.traders.get(req.params.id);
+    if (trader && (trader.openPositions().length || trader.cfg.enabled)) {
+      return res.status(409).json({ error: 'wallet_active', hint: 'Stop new entries and close open positions before removing the server key.' });
+    }
     const g = getFull();
     const stored = g.wallets.find((w) => w.id === req.params.id);
     if (!stored) return res.status(404).json({ error: 'wallet_not_found' });
@@ -1027,8 +1042,13 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     const stored = g.wallets.find((w) => w.id === req.params.id);
     if (!stored) return res.status(404).json({ error: 'wallet_not_found' });
 
+    const trader = engine.traders.get(stored.id);
+    if (trader && (trader.openPositions().length || stored.enabled)) {
+      return res.status(409).json({ error: 'wallet_active',
+        hint: 'Stop new entries and close open positions before removing the bot signing key. Lock the browser view instead to keep trades managed.' });
+    }
     keystore.lockOne(stored.id);
-    engine.removeWallet(stored.id); // no trader without a key
+    engine.removeWallet(stored.id); // no key and no open positions
     stored.enabled = false;
     if (stored.stats) stored.stats.paused = false;
     saveConfig();
@@ -1077,22 +1097,6 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
       note: 'Key loaded for this session. It is held in memory only and is gone when the bot restarts — the sealed copy in your browser is untouched.',
       wallet: t ? t.toJSON() : null,
     });
-  });
-
-  /** Lock one wallet: forget its key now. The browser's sealed copy is untouched. */
-  app.post('/api/wallets/:id/lock', requireToken, (req, res) => {
-    const g = getFull();
-    const stored = g.wallets.find((w) => w.id === req.params.id);
-    if (!stored) return res.status(404).json({ error: 'wallet_not_found' });
-
-    keystore.lockOne(stored.id);
-    engine.removeWallet(stored.id); // no trader without a key
-    stored.enabled = false;
-    if (stored.stats) stored.stats.paused = false;
-    saveConfig();
-    bus.safeEmit('wallet:updated', stored.id);
-    log.warn(`🔒 ${stored.name} locked — its key is out of this process's memory.`, { wallet: stored.name });
-    res.json({ ok: true, armed: false, keyArmed: false, walletId: stored.id, note: 'Locked. The sealed copy in your browser is untouched — unlock it again with its passphrase.' });
   });
 
   app.post('/api/wallets/:id/start', requireToken, async (req, res) => {
