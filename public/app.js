@@ -22,6 +22,7 @@ const S = {
   presets: {},
   editing: null,
   activeTab: 'strategy',
+  browserUnlocked: new Set(), // deliberately gone on refresh; server trading is NOT
 };
 
 const $ = (id) => document.getElementById(id);
@@ -411,7 +412,6 @@ function upsertScanRow(row) {
   if (i === -1) S.scanFeed.unshift(row);
   else S.scanFeed[i] = row;
   if (S.scanFeed.length > 200) S.scanFeed.length = 200;
-  renderScanFeed();
   renderWalletFeeds();
 }
 
@@ -571,10 +571,9 @@ async function forgetBrowserWallet(address) {
  * The user's question was exact: "in the repo the wallet is in browser — didn't you
  * see a function to move it to the server?" There is one, and this is it. The repo's
  * `useBurnerWallet.start()` posts `{ walletAddress, secretKeyBase64 }` once over
- * HTTPS so the bot can keep trading with the tab closed; this does the same, with
- * two differences that only help: the key is checked against the wallet's address
- * before it is stored, and it is sealed with AES-256-GCM in the server's keystore so
- * a restart brings the bot back instead of losing every wallet with it.
+ * HTTPS. Here the bot already trades with a session key when the browser closes.
+ * This optional action stores an additional encrypted copy on the SAME server;
+ * it must be reopened with the keystore passphrase after a server restart.
  *
  * The two passphrases are explained in the dialog rather than assumed: the wallet's
  * own passphrase unseals the key HERE, and the keystore passphrase is what the bot
@@ -588,14 +587,13 @@ async function persistWallet(id) {
 
   const needsKeystore = !(S.keystore && S.keystore.unlocked);
   openModal(`
-    <div class="modal-head"><span class="modal-title">🖥 Send ${esc(w.name)} to the bot</span></div>
+    <div class="modal-head"><span class="modal-title">🔐 Store ${esc(w.name)}'s key on this server</span></div>
     <div class="modal-body">
       <div class="notice info"><span class="ico">ℹ</span><div>
-        The bot will hold this wallet's key — <b>encrypted</b> — so it keeps trading when this tab is
-        closed and comes back after a restart. Until now the key only existed in this browser, which
-        is why the bot could not touch this wallet while you were away.
-        <br/><br/>You can take it back at any time with <b>Remove from bot</b>; the sealed copy in this
-        browser is never touched either way.
+        The <b>same bot</b> already trades this wallet with the tab closed while its process is running.
+        This optional setting stores an <b>encrypted key copy on this server</b>. It still needs the
+        keystore passphrase after a server restart; Render needs a persistent disk or the file vanishes.
+        Your sealed copy in this browser is unchanged.
       </div></div>
       <div class="field">
         <label>${esc(w.name)}'s passphrase</label>
@@ -612,7 +610,7 @@ async function persistWallet(id) {
     </div>
     <div class="modal-foot">
       <button class="btn" data-close-modal="1">Cancel</button>
-      <button class="btn btn-primary" id="pwGo">🖥 Send to bot</button>
+      <button class="btn btn-primary" id="pwGo">Store key here</button>
     </div>`, (root) => {
     root.querySelector('#pwGo').onclick = async () => {
       const pass = root.querySelector('#pwPass').value;
@@ -627,7 +625,7 @@ async function persistWallet(id) {
         secret.fill(0); // the sealed copy in this browser is untouched
         closeModal();
         await refreshAll(); renderAll();
-        toast(`🖥 ${w.name} is on the bot — it trades with the tab closed now`, '');
+        toast(`🔐 Key saved on this server · reopen the keystore after a restart`, '');
       } catch (err) { toast(err.message, 'err'); }
     };
   });
@@ -638,8 +636,8 @@ async function unpersistWallet(id) {
   const w = (S.wallets || []).find((x) => x.id === id);
   if (!confirm(
     `Remove ${w ? w.name : 'this wallet'} from the bot?\n\n` +
-    'The server will delete its copy of the key, so the bot can no longer trade this wallet while ' +
-    'this tab is closed. The sealed copy in this browser stays exactly where it is.'
+    'Stop the wallet and close its open positions first. The server will delete its encrypted key copy ' +
+    'and disarm this wallet; the sealed browser copy stays where it is.'
   )) return;
 
   // Deleting the key from the encrypted file needs the keystore open. Ask for the
@@ -671,7 +669,7 @@ async function unpersistWallet(id) {
     </div>
     <div class="modal-foot">
       <button class="btn" data-close-modal="1">Cancel</button>
-      <button class="btn btn-primary" id="upGo">Remove from bot</button>
+      <button class="btn btn-primary" id="upGo">Remove server copy</button>
     </div>`, (root) => {
     root.querySelector('#upGo').onclick = () => {
       const pass = root.querySelector('#upPass').value;
@@ -768,12 +766,37 @@ async function unlockWallet(id, passphrase) {
       method: 'POST',
       body: JSON.stringify({ secretKey: s.secretToBase58(secret) }),
     });
+    secret.fill(0);
+    S.browserUnlocked.add(id);
     await refreshAll(); renderAll();
-    toast(`🔓 ${w.name} unlocked — the bot can trade it this session`, '');
+    toast(`🔓 ${w.name} ready here — the bot can trade it this session`, '');
   } catch (err) {
     toast(err.message, 'err');
     throw err;
   }
+}
+
+/** Lock only this BROWSER view. The bot retains the session key so ongoing
+ * positions are still watched and sold by their exits. Reload does the same. */
+function lockBrowserWallet(id) {
+  S.browserUnlocked.delete(id);
+  renderWallets();
+  toast('Browser view locked · bot trading continues', '');
+}
+
+async function openBrowserWallet(id, passphrase) {
+  const w = (S.wallets || []).find((x) => x.id === id);
+  const store = walletStore();
+  if (!w || !store || !keyHere(w.publicKey)) {
+    toast('The sealed key is not in this browser', 'warn'); return;
+  }
+  try {
+    const key = await store.unlock(w.publicKey, passphrase);
+    key.fill(0); // confirm the passphrase; the bot already holds its session key
+    S.browserUnlocked.add(id);
+    renderWallets();
+    toast(`${w.name} opened in this browser · bot trading was never stopped`, '');
+  } catch (err) { toast(err.message, 'err'); }
 }
 
 function mergeWallet(w) {
@@ -826,7 +849,7 @@ const logLine = (r) => {
 /* ============================================================
    RENDER
    ============================================================ */
-function renderAll() { renderNotices(); renderChips(); renderStats(); renderOverall(); renderWallets(); renderPositions(); renderHistory(); renderScanFeed(); renderScanner(); renderLog(); }
+function renderAll() { renderNotices(); renderChips(); renderStats(); renderOverall(); renderWallets(); renderPositions(); renderHistory(); renderLog(); }
 
 function renderChips() {
   const running = S.status?.running;
@@ -1895,7 +1918,7 @@ function renderStats() {
     ['Exposure', `${fmtSol(exposure, 2)} SOL`,
       [usdOf(exposure), dry ? 'of ' + fmtSol(balance, 2) + ' paper balance' : 'of ' + fmtSol(balance, 2) + ' balance'].filter(Boolean).join(' · '), 'dim', 'amber'],
     ['Tokens scanned', detected.toLocaleString(),
-      `${bought} bought · ${detected ? ((bought / detected) * 100).toFixed(1) : '0'}% hit · ${feedRows} in the feed below`, 'dim', ''],
+      `${bought} bought · ${detected ? ((bought / detected) * 100).toFixed(1) : '0'}% hit · ${feedRows} launches scanned`, 'dim', ''],
   ];
 
   $('stats').innerHTML = cards.map(([label, value, sub, vcls, accent]) => `
@@ -2013,13 +2036,13 @@ function renderWallets() {
             <button class="btn btn-primary btn-sm" data-arm="${esc(w.id)}" title="Unseal this wallet's key in the browser and load it into the bot for this session">🔓 Unlock</button>
           </div>
           <div class="arm-row" style="margin-top:6px">
-            <button class="btn btn-sm" data-persist="${esc(w.id)}" title="Send this wallet's key to the bot once, encrypted, so it can trade while this tab is closed and after a restart. You can take it back at any time.">🖥 Send to bot (trades with the tab closed)</button>
+            <button class="btn btn-sm" data-persist="${esc(w.id)}" title="Optional encrypted server copy. The bot already trades with the tab closed until its process restarts. Reopen the keystore after a restart.">🔐 Store key on server (optional)</button>
           </div>` : ''}
 
         <div class="wallet-actions">
-          <span class="badge sim" style="align-self:center">${w.persistent ? '🖥 on bot' : here ? '🔒 locked' : inKeystore ? '🔐 keystore' : 'no key'}</span>
+          <span class="badge sim" style="align-self:center">${w.persistent ? '🔐 key saved on server' : here ? '🔒 locked' : inKeystore ? '🔐 keystore' : 'no key'}</span>
           <div style="flex:1"></div>
-          ${w.persistent ? `<button class="btn btn-sm" data-unpersist="${esc(w.id)}" title="Remove this wallet's key from the server. The sealed copy in this browser is untouched.">⏏ Remove from bot</button>` : ''}
+          ${w.persistent ? `<button class="btn btn-sm" data-unpersist="${esc(w.id)}" title="Remove this wallet's key from the server. The sealed copy in this browser is untouched.">⏏ Remove server copy</button>` : ''}
           ${here
             ? `<button class="btn btn-sm" data-edit="${esc(w.id)}" title="Strategy, limits, exits and filters for this wallet">⚙ Config</button>
                <button class="btn btn-sm btn-danger" data-delrecord="${esc(w.id)}" title="Remove this wallet from the bot and this browser. Its funds stay on chain.">🗑 Delete</button>`
@@ -2034,6 +2057,7 @@ function renderWallets() {
     }
 
     const st = w.stats || {};
+    const browserLocked = keyHere(w.publicKey) && !S.browserUnlocked?.has(w.id);
     const cfg = w.config || {};
     const pnl = st.realisedPnlSol || 0;
     const tiers = cfg.exits?.takeProfitTiers || [];
@@ -2104,20 +2128,25 @@ function renderWallets() {
         <span>limit ${fmtSol(cfg.limits?.dailyLossLimitSol, 2)}</span>
       </div>
 
+      ${browserLocked ? `<div class="arm-row browser-only-lock">
+        <span class="badge sim">🔒 Browser locked${armed ? ' · bot trading continues' : ''}</span>
+        <input type="password" id="localpass-${esc(w.id)}" placeholder="Passphrase for ${esc(w.name)}" autocomplete="current-password"/>
+        <button class="btn btn-sm" data-browser-open="${esc(w.id)}">Open here</button>
+      </div>` : ''}
       <div class="wallet-actions">
         <span class="badge ${armed ? 'won' : st.paused ? 'lost' : 'sim'}" style="align-self:center">${stateLabel}</span>
-        ${w.persistent ? '<span class="badge sim" style="align-self:center" title="The bot holds this wallet\'s key, encrypted, so it trades while this tab is closed.">🖥 on bot</span>' : ''}
+        ${w.persistent ? '<span class="badge sim" style="align-self:center" title="The bot holds this wallet\'s key, encrypted, so it trades while this tab is closed.">🔐 key saved on server</span>' : ''}
         <div style="flex:1"></div>
-        ${armed
+        ${browserLocked ? (armed ? `<button class="btn btn-sm btn-warn" data-stop="${esc(w.id)}">⏸ Stop</button>` : '') : (armed
           ? `<button class="btn btn-sm btn-warn" data-stop="${esc(w.id)}" title="Stop new entries for this wallet. Open positions are still managed, so your stops keep working.">⏸ Stop</button>`
-          : `<button class="btn btn-sm btn-primary" data-start="${esc(w.id)}" title="Start this wallet${paperMode ? ' — it is in DRY RUN, so its trades will be simulated (paper trades on a paper balance)' : ''}. This also starts the engine if it is stopped.">▶ Start</button>`}
+          : `<button class="btn btn-sm btn-primary" data-start="${esc(w.id)}" title="Start this wallet${paperMode ? ' — it is in DRY RUN, so its trades will be simulated (paper trades on a paper balance)' : ''}. This also starts the engine if it is stopped.">▶ Start</button>`)}
         <button class="btn btn-sm" data-detail="${esc(w.id)}" title="This wallet's open positions, its own trade history, and the launches it saw">📄 Trades</button>
 
-        <button class="btn btn-sm" data-edit="${esc(w.id)}" title="Strategy, limits, exits and filters for this wallet">⚙ Config</button>
+        ${browserLocked ? '' : `<button class="btn btn-sm" data-edit="${esc(w.id)}" title="Strategy, limits, exits and filters for this wallet">⚙ Config</button>
         <button class="btn btn-sm" data-withdraw="${esc(w.id)}" title="Move SOL out of this wallet">Withdraw</button>
-        ${w.persistent ? `<button class="btn btn-sm" data-unpersist="${esc(w.id)}" title="Remove this wallet's key from the server. The sealed copy in this browser is untouched.">⏏ Remove from bot</button>` : ''}
+        ${w.persistent ? `<button class="btn btn-sm" data-unpersist="${esc(w.id)}" title="Remove this wallet's key from the server. The sealed copy in this browser is untouched.">⏏ Remove server copy</button>` : ''}`}
         <button class="btn btn-sm btn-danger" data-close="${esc(w.id)}" title="Sell everything in this wallet and stop it trading">⛔ Kill all</button>
-            ${w.keyArmed === false ? '' : `<button class="btn btn-sm" data-lock="${esc(w.id)}" title="Forget this wallet's key for now. The sealed copy in your browser is untouched.">🔒 Lock</button>`}
+            ${keyHere(w.publicKey) && !browserLocked ? `<button class="btn btn-sm" data-browser-lock="${esc(w.id)}" title="Lock this browser view only. Your running bot and open trades continue.">🔒 Lock view</button>` : ''}
       </div>
       <div class="wallet-feed" data-wallet-feed="${esc(w.id)}"></div>
     </div>`;
@@ -2172,7 +2201,7 @@ function walletVerdict(row, w) {
   if (bought || (mine && mine.action === 'bought')) return { label: 'BOUGHT', cls: 'won', reason: null };
   if (!mine) return { label: 'not evaluated', cls: 'sim', reason: 'the engine had not reached this launch for this wallet' };
   if (mine.action === 'filtered') return { label: 'filtered', cls: 'sim', reason: mine.reason || 'its filters ruled the token out' };
-  if (mine.action === 'rpc_error') return { label: 'rpc error', cls: 'lost', reason: mine.reason || 'the RPC did not answer — infrastructure, not the token' };
+  if (mine.action === 'rpc_error') return { label: 'RPC unavailable', cls: 'lost', reason: 'Connection/rate limit — token not checked. Check RPC settings.' };
   if (mine.action === 'checking') return { label: 'evaluating…', cls: 'paper', reason: null };
   return { label: 'skipped', cls: 'sim', reason: mine.reason || row.skipReason || 'declined' };
 }
@@ -2439,140 +2468,6 @@ function renderHistory() {
     </tr>`).join('')}</tbody></table>`;
 }
 
-/**
- * The live pump.fun launch scanner.
- *
- * Each row is one launch: what it is, who deployed it, how much the dev holds,
- * what liquidity it has, its honeypot risk, and what the bot decided — with the
- * reason, so a wall of "skipped" is explainable instead of mysterious.
- */
-function renderScanFeed() {
-  const mount = $('scanFeed');
-  if (!mount) return;
-  const rows = S.scanFeed || [];
-  const count = $('scanCount');
-  // The number in this panel is the number of launches IN THIS LIST. It used to
-  // be able to disagree with the "tokens scanned" card by 100 rows with nothing
-  // on screen to explain it, which is what the user reported.
-  if (count) count.textContent = String(rows.length);
-
-  const meta = $('scanMeta');
-  if (meta) {
-    const evaluated = (S.status && S.status.stats && S.status.stats.detected) || 0;
-    const feed = S.scanStats || (S.status && S.status.scan) || null;
-    const bits = [`<b>${rows.length}</b> launch${rows.length === 1 ? '' : 'es'} in this list`];
-    if (evaluated) bits.push(`wallets evaluated <b>${evaluated.toLocaleString()}</b> this session`);
-    if (feed && feed.dropped) bits.push(`${feed.dropped} older row(s) rolled off (the list keeps the newest 200)`);
-    if (S.status && !S.status.running) bits.push('wallet trading is idle');
-    meta.innerHTML = bits.join(' · ');
-  }
-
-  // The dot reports the FEED, not the engine: a connected socket with the scanner
-  // stopped is a different state from a dead socket, and they look the same if you
-  // only render a boolean.
-  const sc = (S.status && S.status.scanner) || {};
-  const dot = $('scanDot');
-  const dotText = $('scanDotText');
-  if (dot && dotText) {
-    const live = Boolean(sc.connected);
-    dot.classList.toggle('on', live);
-    dot.classList.toggle('off', !live);
-    dotText.textContent = sc.connected ? 'live' : 'connecting';
-    dot.title = sc.connected
-      ? `Connected to ${sc.source || 'the launch feed'}. New launches appear here as they are created.`
-      : 'Connecting to the pump.fun launch feed.';
-  }
-
-  if (!rows.length) {
-    const connected = Boolean(sc.connected);
-    const body = connected
-      ? { title: 'Watching pump.fun — no launch yet.', sub: 'New tokens appear automatically.' }
-      : { title: 'Connecting to pump.fun…', sub: 'No wallet needs to be started to see launches.' };
-    mount.innerHTML = `
-      <div class="scan-empty">
-        <p><b>${body.title}</b></p>
-        <p class="muted">${body.sub}</p>
-      </div>`;
-    return;
-  }
-
-  const decisionClass = {
-    bought: 'won', skipped: 'sim', checking: 'paper', error: 'lost',
-  };
-  const decisionLabel = {
-    bought: 'BOUGHT', skipped: 'skipped', checking: 'checking…', error: 'infra error',
-  };
-
-  mount.innerHTML = `
-    <div class="scan-scroll">
-      <table class="scan-tbl">
-        <thead>
-          <tr>
-            <th>Token</th><th>Dev</th>
-            <th class="num" title="The dev's own opening buy as a share of the 1,000,000,000 supply. Comes from the launch itself, so it is filled on every row; an on-chain holder read refines it when one succeeds.">Dev hold</th>
-            <th class="num" title="SOL in the bonding curve, priced in dollars. A figure marked ≈ was converted at a fallback rate because no price provider answered.">Liquidity</th>
-            <th class="num" title="0–100, higher is more dangerous. Scored from the dev hold and the liquidity above; a row marked * has not been checked on chain yet.">Risk</th>
-            <th>Decision</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rows.map((r) => {
-            const risk = r.riskScore === null || r.riskScore === undefined ? null : Number(r.riskScore);
-            const riskCls = risk === null ? 'mute' : risk >= 50 ? 'neg' : risk > 0 ? 'warn' : 'pos';
-            const liqSol = r.liquiditySol === null || r.liquiditySol === undefined ? null : Number(r.liquiditySol);
-            const liqUsd = r.liquidityUsd === null || r.liquidityUsd === undefined ? null : Number(r.liquidityUsd);
-            /* LIQUIDITY is shown in dollars, because a SOL figure cannot be judged:
-             * "0.98 SOL" means nothing to a person deciding whether to buy. The
-             * reference bot shows USD here for the same reason.
-             *
-             * When the dollar figure had to be converted at a last-resort price
-             * (every price API unreachable), it is marked — a guessed number
-             * presented as a quote is exactly the kind of dishonesty this project
-             * exists to not do. */
-            const liqApprox = liqUsd !== null && (r.solUsdSource === 'fallback' || r.solUsdStale);
-            const liqTitle = liqSol === null ? 'No curve reading for this launch.' :
-              `${liqSol.toFixed(3)} SOL in the curve` +
-              (liqUsd === null ? '' : ` · $${liqUsd.toLocaleString('en-US')} at ${r.solUsd ? `$${r.solUsd.toFixed(0)}/SOL` : 'the last known SOL price'}`) +
-              (liqApprox ? ' · SOL price unavailable, converted at a fallback rate' : '');
-            return `<tr>
-              <td>
-                <div class="scan-sym">${esc(r.symbol || 'unknown')}</div>
-                <a class="scan-mint mono" href="https://pump.fun/coin/${esc(r.mint)}" target="_blank" rel="noopener noreferrer"
-                   title="Open ${esc(r.mint)} on pump.fun">${esc(short(r.mint, 4))}</a>
-                ${r.name && r.name !== r.symbol ? `<div class="scan-name">${esc(r.name)}</div>` : ''}
-              </td>
-              <td class="mono mute">${r.devWallet ? esc(short(r.devWallet, 4)) : '—'}</td>
-              <td class="num ${r.devHoldPct === null || r.devHoldPct === undefined ? 'mute' : r.devHoldPct > 20 ? 'neg' : ''}"
-                  title="${esc(r.devHoldPct === null || r.devHoldPct === undefined
-                    ? 'The launch event carried no opening buy for this token, and the on-chain holder read did not finish.'
-                    : `Dev's opening buy: ${Number(r.devHoldPct).toFixed(2)}% of the 1,000,000,000 supply (${(r.facts || {}).devHold === 'event' ? 'from the launch event' : 'read on chain'})`)}">
-                ${r.devHoldPct === null || r.devHoldPct === undefined ? 'unread' : `${Number(r.devHoldPct).toFixed(1)}%`}
-              </td>
-              <td class="num" title="${esc(liqTitle)}">
-                ${liqUsd === null
-                  ? (liqSol === null ? '<span class="mute">unread</span>' : `<span class="mute">${liqSol.toFixed(2)} SOL</span>`)
-                  : `$${liqUsd.toLocaleString('en-US')}${liqApprox ? '<span class="approx" title="SOL price unavailable — converted at a fallback rate">≈</span>' : ''}
-                     <div class="mute" style="font-size:10px">${liqSol.toFixed(2)} SOL</div>`}
-              </td>
-              <td class="num ${riskCls}">
-                ${risk === null
-                  ? '<span class="mute" title="Neither the launch event nor the on-chain read produced anything to score this token on.">unread</span>'
-                  : `${risk}${(r.facts || {}).risk === 'derived' ? '<span class="approx" title="Scored from the dev hold and liquidity in the launch event; no on-chain read yet.">*</span>' : ''}`}
-                ${r.riskNotes && r.riskNotes.length ? `<span class="scan-risk-note" title="${esc(r.riskNotes.join(' · '))}">ⓘ</span>` : ''}
-              </td>
-              <td>
-                <span class="badge ${decisionClass[r.decision] || 'sim'}" style="padding:1px 7px;font-size:9.5px">${esc(decisionLabel[r.decision] || r.decision)}</span>
-                ${r.skipReason ? `<div class="scan-reason" title="${esc(r.skipReason)}">${esc(shortReason(r.skipReason))}</div>` : ''}
-                ${r.boughtBy ? `<div class="scan-buyer">🔥 bought by <b>${esc(r.boughtBy)}</b></div>` : ''}
-                ${r.wallets && r.wallets.length ? `<div class="scan-wallets">${esc(r.wallets.map((w) => `${w.name}: ${w.action === 'bought' ? 'bought' : (w.reason || w.action)}`).join(' · '))}</div>` : ''}
-              </td>
-            </tr>`;
-          }).join('')}
-        </tbody>
-      </table>
-    </div>`;
-}
-
 /** Filter reasons are machine-shaped ("liquidity_below_min(0.42)"); make them readable. */
 function shortReason(reason) {
   const s = String(reason || '');
@@ -2580,25 +2475,6 @@ function shortReason(reason) {
   if (!m) return s.replace(/_/g, ' ');
   const words = m[1].replace(/_/g, ' ');
   return `${words} (${m[2]})`;
-}
-
-function renderScanner() {
-  const s = S.status?.scanner || {};
-  const st = S.status?.stats || {};
-  const rows = [
-    ['Source', s.source || '—', s.connected ? 'pos' : 'neg', s.connected ? 'connected' : 'offline'],
-    ['Detected', (st.detected || 0).toLocaleString(), '', 'tokens this session'],
-    ['Evaluated', (st.evaluated || 0).toLocaleString(), '', 'passed concurrency gate'],
-    ['Bought', (st.bought || 0).toLocaleString(), (st.bought ? 'pos' : 'dim'), 'fills'],
-    ['Filtered', (st.skipped || 0).toLocaleString(), '', 'rejected by rules'],
-    ['Price feed', (S.status?.priceFeedSize || 0).toString(), '', 'tracked mints'],
-  ];
-  $('scanner').innerHTML = rows.map(([k, v, c, sub]) => `
-    <div class="between" style="padding:6px 0;border-bottom:1px solid rgba(30,36,45,.5)">
-      <span class="dim" style="font-size:11.5px">${esc(k)}</span>
-      <span class="mono ${c}" style="font-size:12.5px;font-weight:600">${esc(v)}</span>
-    </div>
-    <div class="mute" style="font-size:10px;padding-bottom:5px">${esc(sub)}</div>`).join('');
 }
 
 function renderLog() {
@@ -2675,8 +2551,11 @@ function openKeystore() {
     if (forgot) forgot.onclick = () => { closeModal(); openKeystoreForgot(); };
     const lock = root.querySelector('#ksLock');
     if (lock) lock.onclick = async () => {
-      await api('/api/keystore/lock', { method: 'POST' });
-      toast('Keystore closed — passphrase required again next session', 'warn'); closeModal();
+      try {
+        await api('/api/keystore/lock', { method: 'POST' });
+        toast('Keystore closed — passphrase required next session', 'warn'); closeModal();
+        await refreshAll(); renderAll();
+      } catch (err) { toast(err.message, 'warn'); }
     };
   });
 }
@@ -2697,6 +2576,9 @@ function openWallet(walletId, opts = {}) {
   // INSIDE the dialog's mount handler — and the user sees a Config button that
   // does nothing at all. One merge makes that impossible.
   const cfg = withDefaultCfg(existing?.config);
+  const rate = Number(S.status?.solUsd) || 150;
+  if (cfg.filters.minLiquidityUsd == null) cfg.filters.minLiquidityUsd = Math.round((cfg.filters.minLiquiditySol || 0) * rate);
+  if (cfg.filters.maxLiquidityUsd == null) cfg.filters.maxLiquidityUsd = Math.round((cfg.filters.maxLiquiditySol || 0) * rate);
   S.editing = { id: walletId || null, cfg: JSON.parse(JSON.stringify(cfg)), isNew, name: existing?.name || '', pk: existing?.publicKey };
   S.activeTab = 'strategy';
 
@@ -2821,7 +2703,7 @@ function openWallet(walletId, opts = {}) {
 function withDefaultCfg(partial) {
   const d = defaultCfg();
   const p = partial || {};
-  return {
+  const merged = {
     ...d,
     ...p,
     buy: { ...d.buy, ...(p.buy || {}) },
@@ -2830,6 +2712,9 @@ function withDefaultCfg(partial) {
     filters: { ...d.filters, ...(p.filters || {}) },
     ai: { ...d.ai, ...(p.ai || {}) },
   };
+  if (p.filters && !Object.hasOwn(p.filters, 'minLiquidityUsd')) delete merged.filters.minLiquidityUsd;
+  if (p.filters && !Object.hasOwn(p.filters, 'maxLiquidityUsd')) delete merged.filters.maxLiquidityUsd;
+  return merged;
 }
 
 function defaultCfg() {
@@ -2844,7 +2729,7 @@ function defaultCfg() {
     limits: { dailyLossLimitSol: 2, dailyProfitTargetSol: 0, maxTradesPerDay: 100, maxExposureSol: 3, stopAfterConsecutiveLosses: 5 },
     filters: {
       maxDevHoldPct: 20, requireMintAuthorityRevoked: true, requireFreezeAuthorityRevoked: true, maxBuyTaxPct: 10, maxSellTaxPct: 10,
-      minLiquiditySol: 1, maxLiquiditySol: 0, maxTop10HoldersPct: 35, minHolders: 8, requireSocial: false, minNameLength: 2, blockCopycatNames: true,
+      minLiquiditySol: 1, maxLiquiditySol: 0, minLiquidityUsd: 150, maxLiquidityUsd: 0, maxTop10HoldersPct: 35, minHolders: 8, requireSocial: false, minNameLength: 2, blockCopycatNames: true,
       maxAgeMs: 120000, maxBondingCurvePct: 60, devBlacklist: [], mintBlacklist: [],
     },
     ai: { enabled: false, overrideProvider: '', minConfidence: 0 },
@@ -2972,20 +2857,14 @@ function renderEditorPanes(root) {
       <div class="field"><label>Max dev hold (%)</label><input type="number" id="f_devhold" value="${c.filters.maxDevHoldPct}"/></div>
       <div class="field"><label>Max top-10 holders (%)</label><input type="number" id="f_top10" value="${c.filters.maxTop10HoldersPct}"/>
         <div class="hint">Measured excluding the bonding curve itself.</div></div>
-      <div class="field"><label>Liquidity range (SOL in curve)</label>
+      <div class="field"><label>Liquidity range (USD)</label>
         <div class="range-row">
-          <input type="number" step="0.1" min="0" id="f_minliq" value="${c.filters.minLiquiditySol}" placeholder="min" aria-label="Minimum liquidity"/>
+          <input type="number" step="1" min="0" id="f_minliq" value="${c.filters.minLiquidityUsd}" placeholder="min $" aria-label="Minimum liquidity in dollars"/>
           <span class="range-sep">to</span>
-          <input type="number" step="0.1" min="0" id="f_maxliq" value="${(c.filters.maxLiquiditySol ?? 0) || ''}" placeholder="no max" aria-label="Maximum liquidity"/>
+          <input type="number" step="1" min="0" id="f_maxliq" value="${(c.filters.maxLiquidityUsd ?? 0) || ''}" placeholder="no max" aria-label="Maximum liquidity in dollars"/>
         </div>
-        <div class="hint">
-          Only snipe tokens whose curve holds between these amounts of <strong>real SOL</strong>.
-          Leave the max empty for no ceiling.
-          <br/><br/>
-          Real SOL is <strong>~0 at launch</strong> and grows as other people buy — so this range is
-          also a <em>timing</em> control. A low max keeps you to genuinely fresh launches; a high min
-          means you are waiting for proven demand.
-        </div>
+        <div class="hint">Fixed dollar thresholds. Leave max blank for no ceiling.
+          ${S.status?.solUsdSource === 'fallback' || S.status?.solUsdStale ? '≈ Rate unavailable; check converted legacy amounts before saving.' : ''}</div>
       </div>
     </div>
     <div class="section-label">Metadata</div>
@@ -3102,10 +2981,10 @@ function wireEditor(root) {
   num('#f_buytax', (v) => { c().filters.maxBuyTaxPct = v; });
   num('#f_devhold', (v) => { c().filters.maxDevHoldPct = v; });
   num('#f_top10', (v) => { c().filters.maxTop10HoldersPct = v; });
-  num('#f_minliq', (v) => { c().filters.minLiquiditySol = v; });
+  num('#f_minliq', (v) => { c().filters.minLiquidityUsd = v; });
   // An empty max means "no ceiling", stored as 0 so the engine has one
   // unambiguous representation rather than null-vs-0 ambiguity.
-  num('#f_maxliq', (v) => { c().filters.maxLiquiditySol = v || 0; });
+  num('#f_maxliq', (v) => { c().filters.maxLiquidityUsd = v || 0; });
   chk('#f_resume', (v) => { c().resumeAfterRestart = v; });
   chk('#f_social', (v) => { c().filters.requireSocial = v; });
   chk('#f_copycat', (v) => { c().filters.blockCopycatNames = v; });
@@ -3197,7 +3076,8 @@ function wireEditor(root) {
         }
         btn.disabled = false;
         btn.textContent = label2;
-        toast(`Burner "${name}" created — unlocked for this session`, '');
+        if (created?.wallet) S.browserUnlocked.add(created.wallet);
+        toast(`Burner "${name}" created — opened here for this session`, '');
         closeModal();
         await refreshAll(); renderAll();
         // Land in the wallet's own config, NOT straight in the funding modal.
@@ -3439,8 +3319,7 @@ function demoTickAll() {
   }
   S.status.stats.detected += Math.floor(Math.random() * 3);
   if (S.status.running) demoTickLaunches();
-  $('scanner') && renderScanner();
-  renderStats(); renderWallets(); renderPositions(); renderScanFeed();
+  renderStats(); renderWallets(); renderPositions();
 }
 /** Book a simulated full exit: move the position into that wallet's history. */
 function demoSellPosition(w, p, reason) {
@@ -4189,6 +4068,13 @@ document.addEventListener('click', async (e) => {
     } finally {
       t.disabled = false; t.textContent = label;
     }
+    return;
+  }
+  if (t.dataset.browserLock) { lockBrowserWallet(t.dataset.browserLock); return; }
+  if (t.dataset.browserOpen) {
+    const field = $(`localpass-${t.dataset.browserOpen}`);
+    if (!field || !field.value) { toast('Type this wallet’s passphrase', 'warn'); field?.focus(); return; }
+    await openBrowserWallet(t.dataset.browserOpen, field.value);
     return;
   }
   if (t.dataset.lock) { await lockWallet(t.dataset.lock); return; }

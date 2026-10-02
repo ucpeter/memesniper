@@ -888,3 +888,8 @@ html, body { max-width: 100%; overflow-x: hidden; }
 .wallet-card .wallet-note { color:var(--text-dim); font-size:11px;
   line-height:1.5; overflow-wrap:anywhere; margin:9px 0 12px; }
 .wallet-card .wallet-actions .btn { min-width:0; white-space:normal; }
+
+/* Locking the browser view does not disarm the trader managing open exits. */
+.browser-only-lock { flex-wrap:wrap; border:1px solid var(--border-hi);border-radius:9px;padding:8px;margin-bottom:12px; }
+.browser-only-lock .badge { flex:1 1 100%; }
+.browser-only-lock input { flex:1 1 140px;min-width:0; }
