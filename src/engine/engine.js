@@ -190,8 +190,11 @@ class Engine {
 
   /* ------------------------------- entry --------------------------------- */
   _onToken(candidate) {
-    // Independent public feed, even with no wallets or no trading enabled.
-    this._recon(candidate);
+    // Most pump.fun creates already include BOTH facts needed by the public
+    // feed. Sending two RPC requests for every launch saturated public nodes,
+    // and duplicated the wallet evaluation's own on-chain reads. Recon only
+    // when the event actually omitted a fact; never hide a missing read as 0.
+    if (candidate.initialBuy == null || candidate.vSolInBondingCurve == null) this._recon(candidate);
     if (!this.running) return;
 
     // Fill in what the launch actually IS before anything can decide whether to
@@ -254,10 +257,9 @@ class Engine {
    * Read the token's own facts — liquidity, dev hold, honeypot risk — for the
    * scanner table.
    *
-   * Once per mint, best-effort, bounded, and completely independent of entry:
-   * it runs no filters and cannot buy or refuse anything. It shares the per-mint
-   * report cache with the wallets' evaluations, so on a launch that any wallet
-   * also inspects this costs nothing extra.
+   * Once per mint only if the create event omitted dev/liquidity facts,
+   * best-effort and bounded. It cannot buy or refuse anything. It shares the
+   * per-mint report cache with wallet evaluations.
    */
   _recon(candidate) {
     if (!candidate || !candidate.mint) return;

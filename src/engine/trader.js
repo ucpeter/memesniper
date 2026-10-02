@@ -14,6 +14,7 @@
  */
 const { PublicKey } = require('@solana/web3.js');
 const bus = require('../util/events');
+const solprice = require('./solprice');
 const log = require('../util/logger');
 const Position = require('./position');
 const risk = require('./risk');
@@ -137,7 +138,39 @@ class Trader {
     const globalGate = risk.globalGuardrails(ctx.engine, g);
     if (!globalGate.ok) return `skip:${globalGate.reason}`;
 
-    /* 3 — deterministic safety filters */
+    /* 3 — reject obvious per-wallet failures FROM THE LAUNCH EVENT before
+     * making on-chain reads. This is the reference bot's dev/liquidity pre-gate:
+     * when the event itself says $11 under a $2,000 floor, two mint/curve RPC
+     * calls can only be wasted. A candidate that PASSES this gate STILL gets all
+     * the existing authoritative safety checks. No RPC failure is treated as a
+     * safe token. Reduces 429s; does not hide an outage on eligible launches. */
+    const f = this.cfg.filters || {};
+    const reasonsFromEvent = [];
+    if (candidate.initialBuy != null && Number.isFinite(Number(candidate.initialBuy))) {
+      const pct = (Number(candidate.initialBuy) / 1_000_000_000) * 100;
+      if (pct > f.maxDevHoldPct) reasonsFromEvent.push(`dev_hold_high(${pct.toFixed(1)}%>${f.maxDevHoldPct}%)`);
+    }
+    if (candidate.vSolInBondingCurve != null && Number.isFinite(Number(candidate.vSolInBondingCurve))) {
+      const liq = Number(candidate.vSolInBondingCurve);
+      const price = solprice.lastKnown();
+      const usd = liq * (price.usd || solprice.FALLBACK_USD);
+      if (f.minLiquidityUsd != null && usd < f.minLiquidityUsd)
+        reasonsFromEvent.push(`liquidity_below_min_usd($${usd.toFixed(0)}<$${f.minLiquidityUsd})`);
+      else if (f.minLiquidityUsd == null && liq < (f.minLiquiditySol || 0))
+        reasonsFromEvent.push(`liquidity_below_min(${liq.toFixed(2)})`);
+      if (f.maxLiquidityUsd > 0 && usd > f.maxLiquidityUsd)
+        reasonsFromEvent.push(`liquidity_above_max_usd($${usd.toFixed(0)}>$${f.maxLiquidityUsd})`);
+      else if (f.maxLiquidityUsd == null && f.maxLiquiditySol > 0 && liq > f.maxLiquiditySol)
+        reasonsFromEvent.push(`liquidity_above_max(${liq.toFixed(2)}>${f.maxLiquiditySol})`);
+    }
+    if (reasonsFromEvent.length) {
+      bus.safeEmit('token:analyzed', { walletId: this.cfg.id, wallet: this.cfg.name,
+        candidate, ok: false, reasons: reasonsFromEvent, report: {} });
+      bus.safeEmit('token:skipped', { walletId: this.cfg.id, wallet: this.cfg.name,
+        candidate, reasons: reasonsFromEvent, hard: true });
+      this.stats.skipped = (this.stats.skipped || 0) + 1;
+      return `skip:${reasonsFromEvent[0]}`;
+    }
     const verdict = await safety.evaluate(candidate, this.cfg, { conn: this.executor.conn(), config: g });
     // Publish what the checks actually found, pass or fail. The live scanner view
     // shows dev holdings, liquidity and honeypot risk per launch; without this a row

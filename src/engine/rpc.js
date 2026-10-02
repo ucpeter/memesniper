@@ -16,7 +16,7 @@
  *     scam before.
  *
  * WHAT THIS DOES
- * Every call gets a timeout, and on a timeout, a network error or a non-2xx it
+ * Every call gets a timeout, and on a timeout, a network error, a 429 or a 5xx it
  * retries the SAME call against the next endpoint in the chain — primary, then an
  * optional configured fallback, then the public RPC. This is the shape the reference
  * sniper uses (a fetch wrapper handed to Connection), and it is the right shape
@@ -62,9 +62,21 @@ function resilientRpcFetch(chain = endpointChain()) {
     for (const url of chain) {
       try {
         const res = await fetch(url, { ...init, signal: AbortSignal.timeout(ATTEMPT_TIMEOUT_MS) });
-        if (res.ok) return res;
-        // A 429 or a 5xx is precisely the case worth failing over for.
-        lastError = new Error(`${url} responded HTTP ${res.status}`);
+        if (res.ok) {
+          let body;
+          try { body = await res.clone().json(); } catch { /* non-JSON response */ }
+          const err = body && body.error;
+          const message = String(err && err.message || '');
+          const busy = err && (err.code === 429 || err.code === -32005 ||
+            /rate limit|too many requests|node is behind|block not available/i.test(message));
+          if (!busy) return res; // legitimate JSON-RPC error belongs to caller
+          lastError = new Error(`RPC rate limited (${err.code || message})`);
+          continue;
+        }
+        // 401/403/invalid request are NOT outages; returning preserves the
+        // real error instead of silently sending traffic to a different node.
+        if (res.status !== 429 && res.status < 500) return res;
+        lastError = new Error(`RPC responded HTTP ${res.status}`);
       } catch (err) {
         lastError = err;
       }

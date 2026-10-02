@@ -13,6 +13,7 @@
  */
 const { PublicKey } = require('@solana/web3.js');
 const { bondingCurvePct, lamportsToSol } = require('./curve');
+const solprice = require('./solprice');
 
 const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
@@ -78,6 +79,10 @@ function isTransportError(err) {
   const m = String((err && err.message) || err || '').toLowerCase();
   return (
     m.includes('429') ||
+    m.includes('401') || m.includes('403') ||
+    m.includes('500') || m.includes('520') || m.includes('-32005') ||
+    m.includes('unauthorized') || m.includes('forbidden') ||
+    m.includes('service unavailable') ||
     m.includes('rate limit') ||
     m.includes('too many requests') ||
     m.includes('timeout') ||
@@ -468,11 +473,21 @@ async function evaluate(candidate, cfg, ctx) {
   }
 
   const liquiditySol = curveReport.liquiditySol;
-  if (liquiditySol < f.minLiquiditySol) hardFails.push(`liquidity_below_min(${liquiditySol.toFixed(2)})`);
-  // Upper bound: 0 means no ceiling. Lets you skip launches that are already
-  // crowded — by the time a curve holds a lot of SOL the easy multiple is gone
-  // and you are buying someone else's exit.
-  if (f.maxLiquiditySol > 0 && liquiditySol > f.maxLiquiditySol) {
+  // User-configured dollar thresholds are FIXED dollars, not SOL numbers
+  // labelled "$". Use the same live SOL/USD module as the launch feed; if all
+  // providers fail, the documented $150 fallback is used, never an invented
+  // "real" price. Legacy records with only SOL settings keep their semantics.
+  const quote = solprice.lastKnown();
+  const solUsd = quote.usd && !quote.stale ? quote.usd : (quote.usd || solprice.FALLBACK_USD);
+  const liquidityUsd = liquiditySol * solUsd;
+  if (f.minLiquidityUsd !== undefined && f.minLiquidityUsd !== null) {
+    if (liquidityUsd < f.minLiquidityUsd) hardFails.push(`liquidity_below_min_usd($${liquidityUsd.toFixed(0)}<$${f.minLiquidityUsd})`);
+  } else if (liquiditySol < f.minLiquiditySol) {
+    hardFails.push(`liquidity_below_min(${liquiditySol.toFixed(2)})`);
+  }
+  if (f.maxLiquidityUsd !== undefined && f.maxLiquidityUsd !== null) {
+    if (f.maxLiquidityUsd > 0 && liquidityUsd > f.maxLiquidityUsd) hardFails.push(`liquidity_above_max_usd($${liquidityUsd.toFixed(0)}>$${f.maxLiquidityUsd})`);
+  } else if (f.maxLiquiditySol > 0 && liquiditySol > f.maxLiquiditySol) {
     hardFails.push(`liquidity_above_max(${liquiditySol.toFixed(2)}>${f.maxLiquiditySol})`);
   }
   if (curveReport.progressPct > f.maxBondingCurvePct) hardFails.push(`curve_already_ran(${curveReport.progressPct}%)`);
