@@ -34,13 +34,13 @@ let sim = src.slice(start, end);
 const scanRows = [];
 const noop = () => {};
 const fn = new Function(
-  'S', 'DEMO_PRESETS', 'upsertScanRow', '$', 'renderScanner', 'renderStats', 'renderWallets', 'renderPositions', 'renderScanFeed',
+  'S', 'DEMO_PRESETS', 'upsertScanRow', '$', 'renderStats', 'renderWallets', 'renderPositions',
   `${sim}; return { demoApi, demoSellPosition, demoNewWallet, demoWalletOfPosition, demoTickAll, demoTickLaunches };`
 );
 const api = fn(
   S, DEMO_PRESETS,
   (row) => { scanRows.push(row); (S.scanFeed || (S.scanFeed = [])).unshift(row); },
-  () => null, noop, noop, noop, noop, noop,
+  () => null, noop, noop, noop,
 );
 
 /**
@@ -271,7 +271,8 @@ function extractFn(name) {
   await t('the dashboard reads the launch feed the server sends', () => {
     if (!/msg\.data\.scanFeed/.test(src)) throw new Error('the snapshot\'s scanFeed is ignored — the panel stays empty on a live page');
     if (!/\/api\/scan\?limit=200/.test(src)) throw new Error('no initial fetch, so a reload before the first launch shows an empty panel');
-    if (!/renderScanFeed\(\)/.test(src)) throw new Error('renderScanFeed is gone');
+    if (!/function renderWalletFeeds\(\)/.test(src)) throw new Error('per-wallet feed renderer is gone');
+    if (/function renderScanFeed\(\)/.test(src)) throw new Error('terminal-wide table renderer must stay removed');
   });
 
   await t('deleting a wallet removes it and its positions', async () => {

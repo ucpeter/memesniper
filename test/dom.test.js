@@ -422,91 +422,9 @@ async function click(window, el) {
     assert.match($('#wallets').textContent, /Restored/, 'and the wallet must be back on the page');
   });
 
-  await test('the live launch scanner renders each launch with its verdict and reason', async () => {
-    // The user asked for this twice: a live pump.fun launch scanner display. The
-    // panel must show rows, and a skipped row must say WHY it was skipped.
-    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
-    const panel = $('#scanFeed');
 
-    assert.ok(panel, 'the launch scanner panel must exist on the dashboard');
-    const rows = window.eval('S.scanFeed.length');
-    assert.ok(rows >= 4, `expected the preview feed to carry rows, got ${rows}`);
 
-    const text = panel.textContent;
-    assert.match(text, /bought/i, 'a bought launch must be shown');
-    assert.match(text, /skipped/i, 'so must a filtered one');
-    assert.match(text, /dev hold/i, 'the filters must be intelligible on the row');
-    assert.match(text, /liquidity/i, 'including the liquidity figure');
-    assert.match(text, /infra error/i, 'and an RPC failure must be labelled as infrastructure');
 
-    // The column headers are what make the numbers mean anything.
-    for (const col of ['Token', 'Dev', 'Dev hold', 'Liquidity', 'Risk', 'Decision']) {
-      assert.ok(panel.textContent.includes(col), `the table must have a "${col}" column`);
-    }
-  });
-
-  await test('a live row patches in place instead of re-rendering the table', async () => {
-    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
-    const before = $('#scanFeed').querySelectorAll('tbody tr').length;
-
-    await window.eval(`handleWs({ type: 'scan', data: {
-      mint: 'BRANDNEWmintxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', symbol: 'NEWBIE', name: 'just launched',
-      devWallet: 'Dev-not-real', devHoldPct: 1.5, liquiditySol: 5.5, riskScore: 0, riskNotes: [],
-      decision: 'bought', skipReason: null, detectedAt: Date.now(), wallets: [{ name: 'Alpha', action: 'bought' }],
-    } })`);
-
-    const after = $('#scanFeed').querySelectorAll('tbody tr').length;
-    assert.strictEqual(after, before + 1, 'a new launch must add exactly one row');
-    assert.match($('#scanFeed').textContent, /NEWBIE/, 'and it must be on screen');
-
-    // The same mint again is an UPDATE, not a second row — three wallets evaluating
-    // one launch must not produce three identical lines.
-    await window.eval(`handleWs({ type: 'scan', data: {
-      mint: 'BRANDNEWmintxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', symbol: 'NEWBIE', name: 'just launched',
-      devWallet: 'Dev-not-real', devHoldPct: 1.5, liquiditySol: 5.5, riskScore: 0, riskNotes: [],
-      decision: 'skipped', skipReason: 'top10_concentrated(41.2%)', detectedAt: Date.now(), wallets: [],
-    } })`);
-    assert.strictEqual($('#scanFeed').querySelectorAll('tbody tr').length, before + 1, 'the same mint must not add a row');
-    assert.match($('#scanFeed').textContent, /top10 concentrated/i,
-      'and the updated reason must replace the old verdict, in readable words');
-  });
-
-  /**
-   * An empty scanner panel has three completely different causes and, before
-   * round 8, one sentence for all of them. The user's complaint — "the pumpfun
-   * lunch scanner is showing nothing and token scanned card is showing number of
-   * token scanned" — is precisely the case where the counter moves and the panel
-   * does not, so the panel has to say which cause it is instead of leaving the
-   * contradiction on screen.
-   */
-  await test('the public scanner keeps connecting when wallet trading is idle', async () => {
-    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
-    window.eval(`S.status = Object.assign({}, S.status, { running: false,
-      scanner: { source: 'pumpportal', connected: false } }); S.scanFeed = []; renderScanFeed();`);
-    assert.match($('#scanFeed').textContent, /connecting to pump.fun/i);
-    assert.doesNotMatch($('#scanFeed').textContent, /start scanning/i);
-    window.eval(`S.status = Object.assign({}, S.status, { running: false,
-      scanner: { source: 'pumpportal', connected: true } }); renderScanFeed();`);
-    assert.match($('#scanFeed').textContent, /watching pump.fun/i,
-      'with zero wallets trading, public launches still stream');
-    assert.ok(!$('#btnStart'), 'there is no master engine switch on screen');
-  });
-
-  await test('the panel counter, the list and the meta line agree', async () => {
-    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
-    await window.eval(`S.status = Object.assign({}, S.status, { running: true,
-      scanner: { source: 'pumpportal', connected: true },
-      stats: { detected: 101, bought: 0, skipped: 101 } });
-      S.scanFeed = [];
-      upsertScanRow({ mint: 'M1', symbol: 'AAA', decision: 'skipped', skipReason: 'liquidity_below_min(0.4)' });
-      upsertScanRow({ mint: 'M2', symbol: 'BBB', decision: 'checking' });
-      renderScanFeed();`);
-    assert.strictEqual($('#scanCount').textContent, '2', 'the panel counter is the number of rows in the list');
-    assert.strictEqual($('#scanFeed').querySelectorAll('tbody tr').length, 2);
-    const meta = $('#scanMeta').textContent;
-    assert.match(meta, /2 launches in this list/, 'and the meta line says what the list holds');
-    assert.match(meta, /101/, 'while reconciling it with the tokens-scanned counter instead of contradicting it');
-  });
 
   /* ── the DRY RUN ⇄ LIVE switch ───────────────────────────────────────── */
 
@@ -613,13 +531,7 @@ async function click(window, el) {
     assert.match($('#stats').textContent, /paper/i, 'and the headline P&L says it is paper');
   });
 
-  await test('the scanner dot follows the feed, not whether a wallet is trading', async () => {
-    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
-    window.eval("S.status = Object.assign({}, S.status, { running: false, scanner: { source: 'pumpportal', connected: true } }); renderScanFeed();");
-    assert.strictEqual($('#scanDotText').textContent, 'live');
-    window.eval("S.status = Object.assign({}, S.status, { running: true, scanner: { source: 'pumpportal', connected: false } }); renderScanFeed();");
-    assert.strictEqual($('#scanDotText').textContent, 'connecting');
-  });
+
 
   /**
    * The notes diet, pinned.
@@ -636,8 +548,8 @@ async function click(window, el) {
     const { window, $ } = await bootDashboard({ wallets: 2, keystoreUnlocked: true });
     // Empty the lists first, so what is measured is the NOTE each panel shows and
     // not the table that replaces it once there is something to look at.
-    await window.eval(`S.positions = []; S.history = []; S.scanFeed = []; renderPositions(); renderHistory(); renderScanFeed();`);
-    for (const sel of ['#notices', '#modeBarSub', '#positions', '#history', '#scanFeed']) {
+    await window.eval(`S.positions = []; S.history = []; S.scanFeed = []; renderPositions(); renderHistory(); renderWallets();`);
+    for (const sel of ['#notices', '#modeBarSub', '#positions', '#history']) {
       const el = $(sel);
       if (!el) continue;
       const text = el.textContent.replace(/\s+/g, ' ').trim();
@@ -690,78 +602,19 @@ async function click(window, el) {
     assert.deepStrictEqual(orphans, [], `these card actions have no click handler: ${orphans.join(', ')}`);
   });
 
-  /* ─────────── the launch table, in the form the user asked for ─────────── */
-
-  console.log('\nThe launch table: dollars, and columns that fill\n');
-
-  await test('LIQUIDITY is shown in dollars, with the SOL behind it', async () => {
+  await test('terminal has no launch table, while wallet still has its own live feed', async () => {
     const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
-    await window.eval(`
-      S.scanFeed = [{
-        mint: 'Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS', symbol: 'DOLLARS', name: 'Dollars',
-        devWallet: 'DEVADDR', devHoldPct: 3.4, liquiditySol: 12.5, liquidityUsd: 2500,
-        solUsd: 200, solUsdSource: 'coingecko', riskScore: 12, riskNotes: ['dev holds 3.4%'],
-        decision: 'bought', boughtBy: 'Wallet 1', facts: { devHold: 'event', liquidity: 'event', risk: 'derived' },
-        wallets: [{ name: 'Wallet 1', action: 'bought', reason: null }], detectedAt: Date.now(),
-      }];
-      renderScanFeed();
-    `);
-    const feed = $('#scanFeed').textContent;
-    assert.match(feed, /\$2,500/, 'the dollar figure must be the one on screen');
-    assert.match(feed, /12\.50 SOL/, 'with the SOL amount underneath it, not instead of it');
-    assert.match(feed, /Wallet 1/, 'and the wallet that bought it named');
-  });
-
-  await test('a dollar figure converted at a FALLBACK rate is marked', async () => {
-    // The reference bot falls back to a constant when its price API is down and
-    // prints it as if it were a quote. This does not: an approximation is marked
-    // with a ≈ and explained, because a made-up number that looks real is exactly
-    // the failure this whole project exists in reaction to.
-    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
-    await window.eval(`
-      S.scanFeed = [{
-        mint: 'Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS', symbol: 'APPROX', name: 'Approx',
-        devWallet: 'DEVADDR', devHoldPct: 1, liquiditySol: 5, liquidityUsd: 750,
-        solUsd: 150, solUsdSource: 'fallback', riskScore: 0, riskNotes: [],
-        decision: 'skipped', skipReason: 'liquidity_below_min', facts: {}, wallets: [], detectedAt: Date.now(),
-      }];
-      renderScanFeed();
-    `);
-    const feed = $('#scanFeed').textContent;
-    assert.match(feed, /\$750/, 'the figure is still shown');
-    assert.match(feed, /≈/, 'but marked as approximate');
-  });
-
-  await test('DEV HOLD and RISK fill for a launch that was never read on chain', async () => {
-    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
-    await window.eval(`
-      S.scanFeed = [{
-        mint: 'Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS', symbol: 'FACTS', name: 'Facts',
-        devWallet: 'DEVADDR', devHoldPct: 30, liquiditySol: 12.5, liquidityUsd: 2500,
-        solUsd: 200, solUsdSource: 'coingecko', riskScore: 61,
-        riskNotes: ['dev holds 30.0% (limit 15%)'], decision: 'skipped', skipReason: 'dev_hold_too_high',
-        facts: { devHold: 'event', liquidity: 'event', risk: 'derived' }, wallets: [], detectedAt: Date.now(),
-      }];
-      renderScanFeed();
-    `);
-    const feed = $('#scanFeed').textContent;
-    assert.match(feed, /30\.0%/, 'dev hold must be on screen');
-    assert.match(feed, /61/, 'and a risk score');
-    assert.match(feed, /\*/, 'marked as derived from the launch event rather than read on chain');
-  });
-
-  await test('a cell that really could not be read says so, and never shows a bare dash', async () => {
-    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
-    await window.eval(`
-      S.scanFeed = [{
-        mint: 'Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS', symbol: 'NODATA', name: 'Nodata',
-        devWallet: null, devHoldPct: null, liquiditySol: null, liquidityUsd: null, riskScore: null,
-        riskNotes: [], decision: 'error', skipReason: 'rpc unavailable', facts: {}, wallets: [], detectedAt: Date.now(),
-      }];
-      renderScanFeed();
-    `);
-    const feed = $('#scanFeed').textContent;
-    assert.match(feed, /unread/i, 'the word "unread" is the honest answer, and it is readable');
+    assert.strictEqual($('#scanFeed'), null, 'terminal launch table is removed');
+    assert.ok($('#log'), 'terminal diagnostic log stays available');
+    const walletFeed = $('[data-wallet-feed]');
+    assert.ok(walletFeed, 'per-wallet launch table is retained');
+    window.eval(`S.scanFeed = [{ mint: 'MINT_NEW', symbol: 'NEW', devHoldPct: 3,
+      liquidityUsd: 2500, liquiditySol: 12.5, riskScore: 10, riskNotes: [],
+      wallets: [{ name: S.wallets[0].name, action: 'skipped', reason: 'liquidity_below_min_usd' }],
+      detectedAt: Date.now() }]; renderWallets();`);
+    assert.match($('[data-wallet-feed]').textContent, /NEW/);
+    assert.match($('[data-wallet-feed]').textContent, /liquidity below min usd/i);
+    assert.strictEqual($('#scanFeed'), null);
   });
 
   /* ───────────── trades per wallet, and the overall card ───────────── */

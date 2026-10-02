@@ -420,7 +420,7 @@ async function test(name, fn) {
     const store = fakeStore({ passphrase: 'rightpass1' });
     const state = {
       wallets: [{ id: 'w_1', name: 'Alpha', publicKey: 'ADDR_ALPHA' }],
-      positions: [], logs: [],
+      positions: [], logs: [], browserUnlocked: new Set(),
     };
     const toasts = [];
     // extractFunction returns `(function name(...){…})`; the keyword inside has to
@@ -439,6 +439,7 @@ async function test(name, fn) {
     const arm = calls.find((c) => /\/arm$/.test(c.p));
     assert.ok(arm, `the key is handed over for the session, saw ${JSON.stringify(calls)}`);
     assert.strictEqual(JSON.parse(arm.body).secretKey, 'SECRET_7', 'as a base58 key the server can sign with');
+    assert.ok(state.browserUnlocked.has('w_1'), 'this browser stays open until view lock or reload');
 
     // ...and a wrong passphrase never reaches the server at all.
     calls.length = 0;
@@ -566,7 +567,7 @@ async function test(name, fn) {
         openPositions: [],
       }],
       keystore: { initialised: true, unlocked: true },
-      status: { solUsd: 200, solUsdSource: 'coingecko', solUsdStale: false },
+      status: { solUsd: 200, solUsdSource: 'coingecko', solUsdStale: false }, browserUnlocked: new Set(['w_1']),
     };
     const usdOf = build(extractFunction(src, 'usdOf'), { S: state });
     const renderWallets = build(extractFunction(src, 'renderWallets'), {
@@ -581,7 +582,7 @@ async function test(name, fn) {
     const html = els['wallets'].innerHTML;
     assert.match(html, /\$400/, '2 SOL at $200 a SOL is $400, on the balance');
     assert.match(html, /\$300/, 'and $1.50 realised is $300');
-    assert.match(html, /🖥 on bot/, 'a wallet the bot holds says so on its card');
+    assert.match(html, /key saved on server/, 'a wallet the bot holds says so on its card');
     assert.match(html, /data-unpersist/, 'and can be taken back out from there');
     assert.match(html, /Bought/, 'and its card counts what it bought');
   });
@@ -615,7 +616,7 @@ async function test(name, fn) {
     const renderWallets = build(extractFunction(src, 'renderWallets'), {
       $, S: state, keystoreState: () => keystoreStateOf(state), openKeystore: () => {}, openWallet: () => {},
       esc: (s) => String(s ?? ''), fmtSol: (n) => String(n), cls: () => '', winRateOf: () => 50,
-      browserHeldWallets: () => [], usdOf: () => '', renderWalletFeeds: () => {},
+      browserHeldWallets: () => [], usdOf: () => '', renderWalletFeeds: () => {}, keyHere: () => false,
     });
 
     renderWallets();
@@ -626,6 +627,50 @@ async function test(name, fn) {
     assert.match(html, /data-detail="w_1"/, 'and it keeps its own Trades control');
     assert.match(html, /data-withdraw="w_1"/, 'its own Withdraw control');
     assert.match(html, /data-close="w_1"/, 'and its own Kill all');
+  });
+
+  await test('browser reload locks view without stopping trader, and opening verifies passphrase', async () => {
+    const { $, els } = makeDom();
+    const state = {
+      browserUnlocked: new Set(), // a new page; server reports SAME armed wallet
+      wallets: [{ id: 'w_1', name: 'Live', publicKey: 'ADDR', armed: true,
+        enabled: true, keyLocked: false, persistent: true, balanceSol: 1,
+        config: { buy: {}, exits: {}, limits: {} }, stats: {}, openPositions: [] }],
+      status: { dryRun: false },
+    };
+    const injected = { $, S: state, keyHere: () => true, esc: (x) => String(x),
+      fmtSol: (x) => String(x), cls: () => '', winRateOf: () => 0,
+      browserHeldWallets: () => [], usdOf: () => '', renderWalletFeeds: () => {},
+      keystoreState: () => ({ open: false }) };
+    const render = build(extractFunction(src, 'renderWallets'), injected);
+    render();
+    let html = els['wallets'].innerHTML;
+    assert.match(html, /Browser locked · bot trading continues/);
+    assert.match(html, /data-browser-open="w_1"/);
+    assert.doesNotMatch(html, /data-withdraw=/);
+    assert.doesNotMatch(html, /data-start=/);
+    assert.match(html, /data-stop="w_1"/, 'an emergency stop remains available');
+    const requests = [];
+    const store = { unlock: async (_, pass) => {
+      if (pass !== 'correctpass') throw new Error('Wrong passphrase');
+      return new Uint8Array([1]);
+    } };
+    const open = build(extractFunction(src, 'openBrowserWallet').replace('(function', '(async function'), {
+      S: state, walletStore: () => store, keyHere: () => true,
+      toast: () => {}, renderWallets: render, api: (...args) => requests.push(args),
+    });
+    await open('w_1', 'wrongpass');
+    assert.strictEqual(state.browserUnlocked.size, 0);
+    await open('w_1', 'correctpass');
+    assert.ok(state.browserUnlocked.has('w_1'));
+    html = els['wallets'].innerHTML;
+    assert.match(html, /data-withdraw="w_1"/);
+    const lock = build(extractFunction(src, 'lockBrowserWallet'), {
+      S: state, renderWallets: render, toast: () => {}, api: (...args) => requests.push(args),
+    });
+    lock('w_1');
+    assert.match(els['wallets'].innerHTML, /Browser locked/);
+    assert.strictEqual(requests.length, 0, 'browser view lock MUST NOT call the server lock route');
   });
 
   await test('keystoreState() answers the three states the UI words differently', () => {

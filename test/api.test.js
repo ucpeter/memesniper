@@ -436,7 +436,26 @@ const api = async (method, url, body) => {
     await post(`/api/wallets/${id}/arm`, { secretKey: (bs58.default ? bs58.default : bs58).encode(paired.secretKey) });
     await post(`/api/wallets/${id}/start`, {});
 
+    const active = await post(`/api/wallets/${id}/lock`, {});
+    assert.strictEqual(active.status, 409, 'cannot discard a running trader');
+    assert.strictEqual(engine.traders.get(id).cfg.enabled, true);
+    await post(`/api/wallets/${id}/stop`, {});
+    const trader = engine.traders.get(id);
+    const realOpenPositions = trader.openPositions;
+    trader.openPositions = () => [{ mint: 'unsold' }];
+    try {
+      for (const url of [`/api/wallets/${id}/lock`, `/api/wallets/${id}/unpersist`,
+        `/api/wallets/${id}`]) {
+        const result = await api(url === `/api/wallets/${id}` ? 'DELETE' : 'POST', url, {});
+        assert.strictEqual(result.status, 409, `${url} must not abandon an open position`);
+      }
+      const ksLock = await post('/api/keystore/lock', {});
+      assert.strictEqual(ksLock.status, 409, 'closing the keystore must not abandon exits');
+      const reset = await post('/api/keystore/reset', { confirm: 'RESET', passphrase: 'passphrase9' });
+      assert.strictEqual(reset.status, 409);
+    } finally { trader.openPositions = realOpenPositions; }
     const locked = await post(`/api/wallets/${id}/lock`, {});
+    assert.strictEqual(locked.status, 200);
     assert.strictEqual(locked.body.armed, false);
     assert.strictEqual(locked.body.keyArmed, false, 'no key is held any more');
 
