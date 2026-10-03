@@ -44,8 +44,8 @@ function endpointChain(configured = []) {
   };
 
   push(process.env.RPC_URL);
-  (configured || []).forEach(push);
   push(process.env.RPC_URL_FALLBACK);
+  (configured || []).forEach(push);
   push(PUBLIC_RPC_FALLBACK);
   return chain;
 }
@@ -56,10 +56,21 @@ function endpointChain(configured = []) {
  * `_info` is ignored on purpose: substituting a different endpoint on failure is the
  * entire point, so whatever URL the caller originally aimed at is not authoritative.
  */
+/** Never include endpoint URLs (which often embed API keys) in logs or errors. */
+function transportKind(err) {
+  const name = String(err?.name || '');
+  const code = String(err?.cause?.code || err?.code || '').toUpperCase();
+  if (name === 'TimeoutError' || name === 'AbortError' || /TIMEOUT/.test(code)) return 'timeout';
+  if (['ENOTFOUND', 'EAI_AGAIN'].includes(code)) return 'dns_failure';
+  if (['ECONNREFUSED', 'ECONNRESET', 'UND_ERR_CONNECT_TIMEOUT'].includes(code)) return code.toLowerCase();
+  return 'network_failure';
+}
+
 function resilientRpcFetch(chain = endpointChain()) {
   return async function rpcFetch(_info, init) {
-    let lastError = null;
-    for (const url of chain) {
+    const failures = [];
+    for (const [index, url] of chain.entries()) {
+      const label = `endpoint ${index + 1}`;
       try {
         const res = await fetch(url, { ...init, signal: AbortSignal.timeout(ATTEMPT_TIMEOUT_MS) });
         if (res.ok) {
@@ -70,19 +81,53 @@ function resilientRpcFetch(chain = endpointChain()) {
           const busy = err && (err.code === 429 || err.code === -32005 ||
             /rate limit|too many requests|node is behind|block not available/i.test(message));
           if (!busy) return res; // legitimate JSON-RPC error belongs to caller
-          lastError = new Error(`RPC rate limited (${err.code || message})`);
+          failures.push(`${label}: rate_limited`);
           continue;
         }
-        // 401/403/invalid request are NOT outages; returning preserves the
-        // real error instead of silently sending traffic to a different node.
+        // 401/403/invalid request are not transient. Preserve the real HTTP
+        // response for web3.js; the diagnostic probe will report its safe code.
         if (res.status !== 429 && res.status < 500) return res;
-        lastError = new Error(`RPC responded HTTP ${res.status}`);
+        failures.push(`${label}: HTTP ${res.status}`);
       } catch (err) {
-        lastError = err;
+        failures.push(`${label}: ${transportKind(err)}`);
       }
     }
-    throw lastError instanceof Error ? lastError : new Error('all RPC endpoints failed');
+    // Safe to log or show: endpoint indexes and status codes ONLY. No host,
+    // query string or third-party response body containing a provider key.
+    throw new Error(`RPC_ENDPOINTS_FAILED [${failures.join('; ') || 'no endpoints'}]`);
   };
+}
+
+/** A one-shot, bounded check of the SAME getAccountInfo method safety needs.
+ * This bypasses failover so the operator can see which endpoint is broken.
+ * No URL or provider error body is returned (API keys are often in either). */
+async function probeRpcEndpoints(chain = endpointChain(), fetchImpl = (...args) => fetch(...args)) {
+  const checked = (chain || []).slice(0, 5);
+  const results = await Promise.all(checked.map(async (url, index) => {
+    const label = `endpoint ${index + 1}`;
+    try {
+      const res = await fetchImpl(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getAccountInfo',
+          params: ['11111111111111111111111111111111', { encoding: 'base64', commitment: 'processed' }] }),
+        signal: AbortSignal.timeout(ATTEMPT_TIMEOUT_MS),
+      });
+      if (!res.ok) return { label, ok: false, status: `HTTP ${res.status}` };
+      let body;
+      try { body = await res.json(); }
+      catch { return { label, ok: false, status: 'invalid_json' }; }
+      if (body && body.error) {
+        const code = Number(body.error.code);
+        return { label, ok: false, status: Number.isSafeInteger(code) ? `JSON-RPC ${code}` : 'rpc_error' };
+      }
+      return { label, ok: Boolean(body && body.result && body.result.value),
+        status: body && body.result && body.result.value ? 'getAccountInfo OK' : 'no_account_data' };
+    } catch (err) {
+      return { label, ok: false, status: transportKind(err) };
+    }
+  }));
+  return { results, omitted: Math.max(0, (chain || []).length - checked.length) };
 }
 
 /**
@@ -125,6 +170,7 @@ module.exports = {
   ATTEMPT_TIMEOUT_MS,
   endpointChain,
   resilientRpcFetch,
+  probeRpcEndpoints,
   fastSendEndpoints,
   sendViaJsonRpc,
 };

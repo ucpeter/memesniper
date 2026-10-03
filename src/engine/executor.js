@@ -42,26 +42,43 @@ class Executor {
     // One chain for every endpoint this deployment knows about: RPC_URL from the
     // environment first (it must win — a saved config.json quietly overriding it is
     // what kept the bot on the rate-limited public RPC while .env looked correct),
-    // then the configured list, then an optional fallback, then the public RPC.
-    const chain = rpc.endpointChain(config.rpc.endpoints || []);
-    const fetchImpl = rpc.resilientRpcFetch(chain);
-    // The primary is the first endpoint of the chain; failover happens inside the
-    // fetch, per call, so a dead endpoint only costs one timeout rather than
-    // poisoning every request that happens to round-robin onto it.
-    this.connections = [
-      new Connection(chain[0], {
-        commitment: config.rpc.commitment || 'confirmed',
-        disableRetryOnRateLimit: false,
-        fetch: fetchImpl,
-      }),
-    ];
-    this.rpcChain = chain;
+    // then the env fallback, then configured endpoints, then the public RPC.
+    this.connections = [];
+    this.rpcChain = [];
+    this.rpcCommitment = '';
+    this.configureRpc();
     this.fastSend = rpc.fastSendEndpoints();
     this._tipCache = null;       // { accounts, at } — Jito's current tip accounts
     this._lastTipAccount = null; // the one this transaction actually paid
     this.rr = 0;
-    if (chain.length > 1) log.info(`RPC chain: ${chain.length} endpoint(s) — failing over per call on timeout or 429`);
+    if (this.rpcChain.length > 1) log.info(`RPC chain: ${this.rpcChain.length} endpoint(s) — failing over per call on timeout or 429`);
     if (this.fastSend.length) log.info(`Fast-send lanes enabled: ${this.fastSend.length} extra submission endpoint(s)`);
+  }
+
+  /** Rebuild the active Connection after a Settings change. Merely updating
+   * config.json never changed the fetch closure, leaving a healthy new RPC
+   * unused until the next process restart. An env RPC_URL retains priority. */
+  configureRpc() {
+    const chain = rpc.endpointChain(this.config.rpc?.endpoints || []);
+    const commitment = this.config.rpc?.commitment || 'confirmed';
+    if (this.connections.length && this.rpcCommitment === commitment &&
+        JSON.stringify(chain) === JSON.stringify(this.rpcChain)) return false;
+    const fetchImpl = rpc.resilientRpcFetch(chain);
+    this.connections = [new Connection(chain[0], {
+      commitment,
+      disableRetryOnRateLimit: false,
+      fetch: fetchImpl,
+    })];
+    this.rpcChain = chain;
+    this.rpcCommitment = commitment;
+    this.rr = 0;
+    return true;
+  }
+
+  /** One explicit read per endpoint; no trades and no URLs in the result. */
+  async probeRpc() {
+    const out = await rpc.probeRpcEndpoints(this.rpcChain);
+    return { ...out, envPriority: Boolean(process.env.RPC_URL) };
   }
 
   conn() {

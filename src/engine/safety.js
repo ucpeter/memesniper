@@ -78,6 +78,9 @@ function bondingCurvePda(mint) {
 function isTransportError(err) {
   const m = String((err && err.message) || err || '').toLowerCase();
   return (
+    m.includes('rpc_endpoints_failed') ||
+    m.includes('network_failure') ||
+    m.includes('dns_failure') ||
     m.includes('429') ||
     m.includes('401') || m.includes('403') ||
     m.includes('500') || m.includes('520') || m.includes('-32005') ||
@@ -94,6 +97,26 @@ function isTransportError(err) {
     m.includes('503') ||
     m.includes('504')
   );
+}
+
+/** Strip web3.js's account-address prefix and NEVER echo an RPC URL or
+ * third-party response body into the wallet feed / logs. Keep the safe endpoint
+ * index and failure status from our fetch wrapper, so HTTP 429 vs timeout is
+ * finally visible. Solana's getAccountInfo() puts the account address first;
+ * truncating the FIRST 60 characters hid the useful cause entirely. */
+function rpcFailureSummary(err) {
+  const text = String(err?.message || err || '');
+  const ours = text.match(/RPC_ENDPOINTS_FAILED \[([^\]]{0,220})\]/i);
+  if (ours) return `endpoints_failed(${ours[1]})`;
+  if (/\b401\b|unauthori[sz]ed/i.test(text)) return 'HTTP 401 authentication';
+  if (/\b403\b|forbidden/i.test(text)) return 'HTTP 403 forbidden';
+  if (/\b429\b|-32005|rate.limit|too many requests/i.test(text)) return 'rate_limited';
+  const http = text.match(/\bHTTP\s+(5\d\d)\b/i);
+  if (http) return `HTTP ${http[1]}`;
+  if (/timeout|timed out|AbortError/i.test(text)) return 'timeout';
+  if (/ENOTFOUND|EAI_AGAIN/i.test(text)) return 'dns_failure';
+  if (/fetch failed|network|ECONNRESET|ECONNREFUSED/i.test(text)) return 'network_failure';
+  return 'rpc_read_failure';
 }
 
 async function fetchAccountResilient(conn, address, opts = {}) {
@@ -120,7 +143,7 @@ async function fetchAccountResilient(conn, address, opts = {}) {
         // report it as an infrastructure problem so the operator can see that
         // their RPC is the issue rather than blaming the token.
         if (isTransportError(err)) {
-          return { info: null, absent: false, transportError: true, error: err.message };
+          return { info: null, absent: false, transportError: true, error: rpcFailureSummary(err) };
         }
       }
     }
@@ -137,7 +160,7 @@ async function fetchAccountResilient(conn, address, opts = {}) {
     info: null,
     absent: false,
     transportError: true,
-    error: lastErr ? lastErr.message : 'unknown',
+    error: lastErr ? rpcFailureSummary(lastErr) : 'unknown',
   };
 }
 
@@ -150,7 +173,7 @@ async function checkMintAuthorities(conn, mint) {
     const addr = new PublicKey(mint);
     const { info, absent, transportError, error } = await fetchAccountResilient(conn, addr);
     if (!info) {
-      if (transportError) return { pass: false, reason: `rpc_unavailable(${String(error).slice(0, 60)})`, confidence: 'INFRA' };
+      if (transportError) return { pass: false, reason: `rpc_unavailable(${error})`, confidence: 'INFRA' };
       return { pass: false, reason: 'mint_account_not_found', confidence: 'HARD', absent: Boolean(absent) };
     }
     const parsed = parseMint(info.data);
@@ -164,7 +187,8 @@ async function checkMintAuthorities(conn, mint) {
       supply: parsed.supply,
     };
   } catch (err) {
-    return { pass: false, reason: `mint_rpc_error:${err.message}`, confidence: 'HARD' };
+    if (isTransportError(err)) return { pass: false, reason: `rpc_unavailable(${rpcFailureSummary(err)})`, confidence: 'INFRA' };
+    return { pass: false, reason: 'mint_parse_or_address_error', confidence: 'HARD' };
   }
 }
 
@@ -173,7 +197,7 @@ async function checkCurve(conn, mint) {
     const pda = bondingCurvePda(mint);
     const { info, absent, transportError, error } = await fetchAccountResilient(conn, pda);
     if (!info) {
-      if (transportError) return { pass: false, reason: `rpc_unavailable(${String(error).slice(0, 60)})`, confidence: 'INFRA' };
+      if (transportError) return { pass: false, reason: `rpc_unavailable(${error})`, confidence: 'INFRA' };
       return { pass: false, reason: 'bonding_curve_not_found', confidence: 'HARD', absent: Boolean(absent) };
     }
     const curve = parseBondingCurve(info.data);
@@ -187,7 +211,8 @@ async function checkCurve(conn, mint) {
       progressPct: bondingCurvePct(curve.realSolReserves),
     };
   } catch (err) {
-    return { pass: false, reason: `curve_rpc_error:${err.message}`, confidence: 'HARD' };
+    if (isTransportError(err)) return { pass: false, reason: `rpc_unavailable(${rpcFailureSummary(err)})`, confidence: 'INFRA' };
+    return { pass: false, reason: 'curve_parse_or_address_error', confidence: 'HARD' };
   }
 }
 
