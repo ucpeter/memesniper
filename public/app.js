@@ -3116,7 +3116,9 @@ function openSettings() {
         <div class="section-label">RPC</div>
         <div class="field"><label>Endpoint(s), one per line</label>
           <textarea id="g_rpc" rows="3">${esc((g.rpc?.endpoints || []).join('\n'))}</textarea>
-          <div class="hint">The public endpoint is heavily rate-limited. A paid endpoint (Helius / Triton / QuickNode) is effectively required for real sniping.</div></div>
+          <div class="hint">A reliable private RPC is needed for safety checks and exits. Render's RPC_URL, if set, always runs first; other endpoints follow, then the public fallback. Saving these Settings now refreshes the active connection. Saved URLs are masked in this form; replace a line to change one.</div></div>
+        <button type="button" class="btn btn-sm" id="g_rpc_probe">Test on-chain RPC</button>
+        <div id="g_rpc_result" class="hint" aria-live="polite" style="margin:8px 0 14px">Tests getAccountInfo on each endpoint without sending a trade or showing endpoint keys.</div>
         <div class="field"><label>WebSocket endpoint (for log-based scanning)</label>
           <input type="text" id="g_rpcws" value="${esc(g.rpc?.wsEndpoint || '')}"/></div>
 
@@ -3164,6 +3166,22 @@ function openSettings() {
       closeModal();
     };
 
+    q('#g_rpc_probe').onclick = async () => {
+      const btn = q('#g_rpc_probe');
+      const out = q('#g_rpc_result');
+      btn.disabled = true;
+      out.textContent = 'Testing the same getAccountInfo read used by wallet safety…';
+      try {
+        const diag = await api('/api/rpc/diagnostics', { method: 'POST' });
+        const rows = (diag.results || []).map((r) =>
+          `<div>${esc(r.label)}: <b class="${r.ok ? 'pos' : 'neg'}">${esc(r.status)}</b></div>`).join('');
+        out.innerHTML = rows + (diag.omitted ? `<div>${diag.omitted} additional endpoint(s) not tested.</div>` : '') +
+          (diag.envPriority ? '<div>Render RPC_URL has priority over the Settings list.</div>' : '') +
+          '<div>One successful read proves reachability now, not uninterrupted future safety checks.</div>';
+      } catch { out.textContent = 'Diagnostic unavailable. Check Render logs and restart the service.'; }
+      finally { btn.disabled = false; }
+    };
+
     q('#g_probe').onclick = async () => {
       toast('Probing AI provider…', '');
       try {
@@ -3184,7 +3202,7 @@ function openSettings() {
       };
       try {
         S.config = await api('/api/config', { method: 'PUT', body: JSON.stringify(body) });
-        toast('Settings saved', ''); closeModal();
+        toast('Settings saved · active RPC connection refreshed', ''); closeModal();
       } catch (err) { toast(err.message, 'err'); }
     };
   });
