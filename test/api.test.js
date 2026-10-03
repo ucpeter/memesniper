@@ -800,6 +800,59 @@ const api = async (method, url, body) => {
     }
   });
 
+  await test('Settings PUT changes the RPC used by the running executor, not just config.json', async () => {
+    const oldList = [...config.global.rpc.endpoints];
+    const oldConn = engine.executor.conn();
+    try {
+      const saved = await api('PUT', '/api/config', { rpc: { endpoints: ['https://replacement.invalid'] } });
+      assert.strictEqual(saved.status, 200);
+      assert.ok(engine.executor.rpcChain.includes('https://replacement.invalid'));
+      assert.notStrictEqual(engine.executor.conn(), oldConn, 'Connection must be rebuilt on save');
+    } finally { await api('PUT', '/api/config', { rpc: { endpoints: oldList } }); }
+  });
+
+  await test('public status/config mask RPC URL keys; saving placeholders preserves real URLs', async () => {
+    const secret = 'PRIVATE_RPC_KEY_DO_NOT_EXPOSE';
+    const previous = [...config.global.rpc.endpoints];
+    const wsPrevious = config.global.rpc.wsEndpoint;
+    config.global.rpc.endpoints = [`https://secret.test/?api-key=${secret}`];
+    config.global.rpc.wsEndpoint = `wss://secret.test/${secret}`;
+    engine.executor.configureRpc();
+    try {
+      const status = await get('/api/status');
+      const configRes = await get('/api/config');
+      for (const r of [status, configRes]) {
+        assert.strictEqual(r.status, 200);
+        assert.ok(!JSON.stringify(r.body).includes(secret), 'never disclose a provider credential');
+      }
+      const saved = await api('PUT', '/api/config', { rpc: {
+        endpoints: configRes.body.rpc.endpoints, wsEndpoint: configRes.body.rpc.wsEndpoint,
+      } });
+      assert.strictEqual(saved.status, 200, JSON.stringify(saved.body));
+      assert.strictEqual(config.global.rpc.endpoints[0], `https://secret.test/?api-key=${secret}`);
+      assert.strictEqual(config.global.rpc.wsEndpoint, `wss://secret.test/${secret}`);
+      assert.ok(!JSON.stringify(saved.body).includes(secret));
+    } finally {
+      config.global.rpc.endpoints = previous;
+      config.global.rpc.wsEndpoint = wsPrevious;
+      engine.executor.configureRpc();
+    }
+  });
+
+  await test('RPC diagnostics require a token and reveal status but never endpoint keys', async () => {
+    const unauth = await fetch(`http://127.0.0.1:${PORT}/api/rpc/diagnostics`, { method: 'POST' });
+    assert.strictEqual(unauth.status, 401);
+    const realProbe = engine.executor.probeRpc;
+    engine.executor.probeRpc = async () => ({ envPriority: true,
+      results: [{ label: 'endpoint 1', ok: false, status: 'HTTP 429' }], omitted: 0 });
+    try {
+      const r = await post('/api/rpc/diagnostics', {});
+      assert.strictEqual(r.status, 200);
+      assert.strictEqual(r.body.results[0].status, 'HTTP 429');
+      assert.ok(!JSON.stringify(r.body).includes('https://'));
+    } finally { engine.executor.probeRpc = realProbe; }
+  });
+
   Object.assign(keystore, { has: STUBBED_KEYSTORE.has, getKeypair: STUBBED_KEYSTORE.getKeypair, isUnlocked: STUBBED_KEYSTORE.isUnlocked });
 
   /* ───────────────────────────────────────────────────────────────────── */

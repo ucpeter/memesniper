@@ -86,7 +86,7 @@ async function check(filters) {
       assert.deepEqual(calls, ['https://first']);
       assert.equal((await res.json()).error.code, -32602);
       global.fetch = async () => Response.json({ error: { code: 429, message: 'too many requests' } });
-      await assert.rejects(rpc.resilientRpcFetch(['https://first','https://backup'])('ignored', {}), /rate limited/);
+      await assert.rejects(rpc.resilientRpcFetch(['https://first','https://backup'])('ignored', {}), /rate_limited/);
     } finally { global.fetch = old; }
   });
   await test('wallet rejects event-below-USD-floor without RPC, but eligible event fails closed on RPC outage', async () => {

@@ -428,6 +428,13 @@ async function click(window, el) {
 
   /* ── the DRY RUN ⇄ LIVE switch ───────────────────────────────────────── */
 
+  await test('Settings offers an on-demand getAccountInfo diagnostic without exposing endpoints', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
+    window.eval('openSettings()');
+    assert.ok($('#g_rpc_probe'), 'RPC probe button should be in Settings');
+    assert.match($('#g_rpc_result').textContent, /getAccountInfo/);
+  });
+
   await test('the DRY RUN ⇄ LIVE switch is on the page, outside any dialog', async () => {
     const { $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
     assert.ok($('#modeSwitch'), 'the switch must exist');
