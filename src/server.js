@@ -59,8 +59,20 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
   };
 
   /** Strip secrets from anything leaving the process. */
+  const rpcPlaceholder = (i) => `[saved endpoint ${i + 1}]`;
+  const wsPlaceholder = '[saved WebSocket endpoint]';
   function sanitiseGlobal(g) {
-    return { ...g, ai: { ...g.ai, apiKey: g.ai.apiKey ? maskSecret(g.ai.apiKey) : '' }, _token: undefined };
+    // Many RPC providers embed the API key in the URL path or query string.
+    // /api/status and /api/config can be read without a login, so never include
+    // a full endpoint URL (or even a fragment of its credential) in either.
+    return { ...g,
+      rpc: { ...g.rpc,
+        endpoints: (g.rpc?.endpoints || []).map((_, i) => rpcPlaceholder(i)),
+        wsEndpoint: g.rpc?.wsEndpoint ? wsPlaceholder : '',
+      },
+      ai: { ...g.ai, apiKey: g.ai.apiKey ? maskSecret(g.ai.apiKey) : '' },
+      _token: undefined,
+    };
   }
 
   /* ------------------------------- status -------------------------------- */
@@ -301,10 +313,30 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     if (patch.ai && typeof patch.ai.apiKey === 'string' && patch.ai.apiKey.includes('••••')) {
       patch.ai.apiKey = g.ai.apiKey;
     }
+    if (patch.rpc && Array.isArray(patch.rpc.endpoints)) {
+      patch.rpc.endpoints = patch.rpc.endpoints.map((url, i) =>
+        url === rpcPlaceholder(i) ? g.rpc.endpoints[i] : url);
+      if (patch.rpc.endpoints.some((url) => !/^https?:\/\/\S+$/i.test(String(url || '')))) {
+        return res.status(400).json({ error: 'invalid_rpc_endpoint', hint: 'Use full http(s) RPC URLs, one per line.' });
+      }
+    }
+    if (patch.rpc && patch.rpc.wsEndpoint === wsPlaceholder) patch.rpc.wsEndpoint = g.rpc.wsEndpoint;
     Object.assign(g, cfg.deepMerge(g, patch));
+    // Configuration is live: refresh the Connection's URL/fetch closure NOW.
+    // Existing traders keep their executor reference, so their next read uses
+    // the new chain. Env RPC_URL still takes precedence over dashboard values.
+    if (engine.executor.configureRpc) engine.executor.configureRpc();
     saveConfig();
     bus.safeEmit('config:updated', sanitiseGlobal(g));
     res.json(sanitiseGlobal(g));
+  });
+
+  /** On-demand, authenticated RPC test using getAccountInfo, the exact
+   * method that fails in the screenshot. No endpoint URL/key or response body
+   * leaves this route. Never count a failed probe as token safety clearance. */
+  app.post('/api/rpc/diagnostics', requireToken, async (req, res) => {
+    try { res.json(await engine.executor.probeRpc()); }
+    catch { res.status(503).json({ error: 'rpc_diagnostic_failed', hint: 'Read Render logs for the underlying network failure.' }); }
   });
 
   /* ------------------------------- wallets ------------------------------- */

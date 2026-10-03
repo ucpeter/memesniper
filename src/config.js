@@ -346,7 +346,8 @@ function applyEnvOverrides(global) {
   if (process.env.RPC_URL) {
     const wanted = [process.env.RPC_URL];
     if (JSON.stringify(global.rpc.endpoints) !== JSON.stringify(wanted)) {
-      overridden.push(`rpc.endpoints ${JSON.stringify(global.rpc.endpoints)} → ${JSON.stringify(wanted)}`);
+      // Provider URLs often contain API keys. Never print either URL in logs.
+      overridden.push('rpc.endpoints overridden by RPC_URL (URLs hidden)');
       global.rpc.endpoints = wanted;
     }
   }
