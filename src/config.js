@@ -117,7 +117,7 @@ function defaultGlobalConfig() {
      * safe way to validate trailing stops / partial sells before going live. */
     dryRunBalanceSol: 10,
     rpc: {
-      // Add your own paid endpoint (Helius / Triton / QuickNode) for real speed.
+      // Set Alchemy RPC_URL and Helius RPC_URL_FALLBACK on the host for live reads.
       endpoints: [process.env.RPC_URL || 'https://api.mainnet-beta.solana.com'],
       commitment: 'processed',
       wsEndpoint: process.env.RPC_WS_URL || '',
