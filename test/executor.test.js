@@ -181,24 +181,23 @@ function transferTx({ from, to, lamports, extra = [], feePayer = from }) {
     assert.strictEqual(fees.length, 1, 'exactly one priority-fee instruction may survive');
   });
 
-  await test('broadcast races every channel and survives one of them failing', async () => {
+  await test('obsolete FAST_SEND_URLS cannot silently broadcast to QuickNode or an untipped Sender', async () => {
     const kp = Keypair.generate();
+    const old = process.env.FAST_SEND_URLS;
+    process.env.FAST_SEND_URLS = 'https://lane.example.tx';
     const ex = new Executor(cfg.defaultGlobalConfig(), { getKeypair: () => kp, has: () => true });
     const tx = transferTx({ from: kp.publicKey, to: new PublicKey(DEST), lamports: 1000 });
     tx.sign(kp);
-
-    ex.connections = [{
-      sendRawTransaction: async () => { throw new Error('429 rate limited'); },
-    }];
-    process.env.FAST_SEND_URLS = 'https://lane.example.tx';
-    const realFetch = global.fetch;
-    global.fetch = async () => ({ ok: true, json: async () => ({ result: 'LaneSig' + '2'.repeat(60) }) });
+    let rpcSends = 0;
+    ex.connections = [{ sendRawTransaction: async () => { rpcSends++; return 'Sig' + '1'.repeat(60); } }];
+    const oldFetch = global.fetch;
+    global.fetch = () => { throw new Error('generic lane must never be used'); };
     try {
-      const sig = await ex.broadcast(tx, 'w_test');
-      assert.ok(String(sig).startsWith('LaneSig'), 'the lane must carry the trade when the RPC refuses it');
+      await ex.broadcast(tx, 'w_test');
+      assert.strictEqual(rpcSends, 1);
     } finally {
-      global.fetch = realFetch;
-      delete process.env.FAST_SEND_URLS;
+      global.fetch = oldFetch;
+      if (old === undefined) delete process.env.FAST_SEND_URLS; else process.env.FAST_SEND_URLS = old;
     }
   });
 

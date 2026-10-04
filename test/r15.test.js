@@ -94,8 +94,8 @@ const MINT = Keypair.generate().publicKey.toBase58();
     const primary = process.env.RPC_URL, backup = process.env.RPC_URL_FALLBACK;
     process.env.RPC_URL = 'https://first.test';
     process.env.RPC_URL_FALLBACK = 'https://backup.test';
-    try { assert.deepEqual(rpc.endpointChain(['https://api.mainnet-beta.solana.com']).slice(0, 3),
-      ['https://first.test', 'https://backup.test', 'https://api.mainnet-beta.solana.com']); }
+    try { assert.deepEqual(rpc.endpointChain(['https://api.mainnet-beta.solana.com']),
+      ['https://first.test', 'https://backup.test']); }
     finally {
       if (primary === undefined) delete process.env.RPC_URL; else process.env.RPC_URL = primary;
       if (backup === undefined) delete process.env.RPC_URL_FALLBACK; else process.env.RPC_URL_FALLBACK = backup;
