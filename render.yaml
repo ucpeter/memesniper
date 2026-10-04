@@ -41,11 +41,17 @@ services:
       - key: DATA_DIR
         value: /var/data
 
-      # --- RPC -----------------------------------------------------------
-      # The public endpoint rate-limits almost every request under a sniping
-      # workload and will silently starve the engine. Use a paid provider.
-      - key: RPC_URL
+      # --- read RPCs + Helius Sender Max -----------------------------
+      # Set these URLs on THIS Render service, not the Coinsniper service.
+      # Provider URLs contain secrets: Render dashboard only, never git.
+      - key: RPC_URL                  # Alchemy mainnet HTTPS read RPC
         sync: false
+      - key: RPC_URL_FALLBACK         # Helius mainnet HTTPS read RPC
+        sync: false
+      # Trades are submitted to Helius Sender Max ONLY when explicitly on.
+      # Each landed trade pays 0.001 SOL tip + priority fee; dry run unchanged.
+      - key: HELIUS_SENDER_ENABLED
+        sync: false                 # set true on Render after reads are tested
       - key: RPC_WS_URL
         sync: false
 
