@@ -18,8 +18,9 @@
  * WHAT THIS DOES
  * Every call gets a timeout, and on a timeout, a network error, a 429 or a 5xx it
  * retries the SAME call against the next endpoint in the chain — primary, then an
- * optional configured fallback, then the public RPC. This is the shape the reference
- * sniper uses (a fetch wrapper handed to Connection), and it is the right shape
+ * optional configured fallback. The public RPC is used ONLY when nothing else
+ * is configured. A fetch wrapper handed to Connection makes every call inherit
+ * the same chain; this is the right shape
  * because it needs no other code change: `new Connection(url, { fetch })` makes every
  * JSON-RPC call inherit it.
  *
@@ -45,8 +46,14 @@ function endpointChain(configured = []) {
 
   push(process.env.RPC_URL);
   push(process.env.RPC_URL_FALLBACK);
-  (configured || []).forEach(push);
-  push(PUBLIC_RPC_FALLBACK);
+  // With both operator-provided URLs, never silently read from a saved or public
+  // endpoint: this deployment has exactly Alchemy -> Helius for account reads.
+  if (process.env.RPC_URL && process.env.RPC_URL_FALLBACK) return chain;
+  (configured || []).forEach((url) => {
+    if (chain.length && url === PUBLIC_RPC_FALLBACK) return;
+    push(url);
+  });
+  if (!chain.length) push(PUBLIC_RPC_FALLBACK); // local demo only
   return chain;
 }
 
@@ -130,47 +137,10 @@ async function probeRpcEndpoints(chain = endpointChain(), fetchImpl = (...args) 
   return { results, omitted: Math.max(0, (chain || []).length - checked.length) };
 }
 
-/**
- * Extra submission channels, tried in PARALLEL with the normal RPC.
- *
- * A sniped entry competes in the same slot as everyone else's; whichever channel
- * lands first wins and the others are wasted. So these are broadcast simultaneously
- * rather than in sequence. Both Helius Sender and QuickNode's Fastlane accept a
- * plain JSON-RPC `sendTransaction`, so one generic mechanism covers them both —
- * configure with FAST_SEND_URLS, comma separated.
- */
-function fastSendEndpoints() {
-  return String(process.env.FAST_SEND_URLS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
-/** POST a signed transaction to one JSON-RPC endpoint, returning its signature. */
-async function sendViaJsonRpc(url, base64Tx, label) {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: Date.now().toString(),
-      method: 'sendTransaction',
-      params: [base64Tx, { encoding: 'base64', skipPreflight: true, maxRetries: 0 }],
-    }),
-    signal: AbortSignal.timeout(8000),
-  });
-  const json = await res.json();
-  if (json.error) throw new Error(`${label}: ${json.error.message || JSON.stringify(json.error)}`);
-  if (!json.result) throw new Error(`${label}: no signature returned`);
-  return json.result;
-}
-
 module.exports = {
   PUBLIC_RPC_FALLBACK,
   ATTEMPT_TIMEOUT_MS,
   endpointChain,
   resilientRpcFetch,
   probeRpcEndpoints,
-  fastSendEndpoints,
-  sendViaJsonRpc,
 };

@@ -19,6 +19,7 @@ const {
 const log = require('../util/logger');
 const bus = require('../util/events');
 const rpc = require('./rpc');
+const heliusSender = require('./heliusSender');
 
 /**
  * Jito's tip accounts are FETCHED, never assumed.
@@ -42,17 +43,21 @@ class Executor {
     // One chain for every endpoint this deployment knows about: RPC_URL from the
     // environment first (it must win — a saved config.json quietly overriding it is
     // what kept the bot on the rate-limited public RPC while .env looked correct),
-    // then the env fallback, then configured endpoints, then the public RPC.
+    // then the env fallback; only use public RPC when no private URL exists.
     this.connections = [];
     this.rpcChain = [];
     this.rpcCommitment = '';
     this.configureRpc();
-    this.fastSend = rpc.fastSendEndpoints();
+    // Opt in on the host. The generic FAST_SEND_URLS path is deliberately
+    // disabled: it did not add Sender's required tip before signing.
+    this.senderEnabled = /^(true|1|yes)$/i.test(process.env.HELIUS_SENDER_ENABLED || '');
+    this._senderPrepared = new WeakSet();
     this._tipCache = null;       // { accounts, at } — Jito's current tip accounts
     this._lastTipAccount = null; // the one this transaction actually paid
     this.rr = 0;
     if (this.rpcChain.length > 1) log.info(`RPC chain: ${this.rpcChain.length} endpoint(s) — failing over per call on timeout or 429`);
-    if (this.fastSend.length) log.info(`Fast-send lanes enabled: ${this.fastSend.length} extra submission endpoint(s)`);
+    if (this.senderEnabled) log.info('Helius Sender Max enabled for trades (0.001 SOL tip per landed trade); normal RPC reserved for reads/confirmation');
+    if (process.env.FAST_SEND_URLS) log.warn('FAST_SEND_URLS is obsolete and ignored; no generic send lanes are active');
   }
 
   /** Rebuild the active Connection after a Settings change. Merely updating
@@ -82,7 +87,7 @@ class Executor {
   }
 
   conn() {
-    // Round-robin endpoints; a dead RPC should never stall the whole bot.
+    // Each call fails over within the single configured read connection.
     const c = this.connections[this.rr % this.connections.length];
     this.rr += 1;
     return c;
@@ -229,7 +234,8 @@ class Executor {
   }
 
   /**
-   * Add the priority fee and the Jito tip to an UNSIGNED transaction.
+   * Add the priority fee and, when enabled, the correct Jito or Helius Sender
+   * tip to an UNSIGNED transaction.
    *
    * Must run before signing: adding an instruction afterwards invalidates the
    * signature. Handles both shapes — a legacy Transaction from our own builder, and
@@ -245,7 +251,18 @@ class Executor {
     }
 
     let tipAccount = null;
-    if (this.config.jito.enabled) {
+    if (this.senderEnabled) {
+      if (!process.env.RPC_URL || !process.env.RPC_URL_FALLBACK || this.rpcChain.length !== 2 ||
+          this.rpcChain.some((url) => /sender\.helius-rpc\.com\/fast/i.test(url))) {
+        throw new Error('Set two distinct Alchemy and Helius READ RPC URLs on this app before enabling Sender');
+      }
+      tipAccount = heliusSender.tipAccount().toBase58();
+      extra.push(SystemProgram.transfer({
+        fromPubkey: payer,
+        toPubkey: new PublicKey(tipAccount),
+        lamports: heliusSender.TIP_LAMPORTS,
+      }));
+    } else if (this.config.jito.enabled) {
       tipAccount = await this.jitoTipAccount();
       if (tipAccount) {
         extra.push(SystemProgram.transfer({
@@ -264,6 +281,7 @@ class Executor {
     if (!extra.length) return tx;
     if (tx instanceof Transaction) {
       tx.add(...extra);
+      if (this.senderEnabled) this._senderPrepared.add(tx);
       return tx;
     }
 
@@ -275,7 +293,9 @@ class Executor {
     }
     const msg = TransactionMessage.decompile(tx.message, { addressLookupTableAccounts: tables });
     msg.instructions.push(...extra);
-    return new VersionedTransaction(msg.compileToV0Message(tables));
+    const prepared = new VersionedTransaction(msg.compileToV0Message(tables));
+    if (this.senderEnabled) this._senderPrepared.add(prepared);
+    return prepared;
   }
 
   /** Submit a signed transaction through one Jito bundle. Returns the bundle id. */
@@ -297,30 +317,24 @@ class Executor {
     return j.result; // bundle id — bundles need separate status polling
   }
 
-  /**
-   * Broadcast a SIGNED transaction through every available channel at once.
-   *
-   * They race. A sniped entry competes for the same slot as everyone else's, so
-   * whichever lands first wins and the rest are simply wasted effort — trying them
-   * one after another would add the latency of the failures to every trade. The RPC
-   * is always one of the channels; a Jito bundle and any FAST_SEND_URLS lanes are
-   * added when configured.
-   */
+  /** Submit trades ONLY through Helius Sender Max when explicitly enabled.
+   * Sender's acceptance is a signature, not proof of landing; confirm over the
+   * Alchemy -> Helius read chain. Withdrawals use their separate browser-signed
+   * standard-RPC path and are never silently charged a Sender tip. */
   async broadcast(signedTx, walletId) {
+    if (this.senderEnabled) {
+      if (!this._senderPrepared.has(signedTx)) throw new Error('helius_sender_tip_not_prepared');
+      return heliusSender.send(signedTx);
+    }
+    // Legacy RPC/Jito execution when Sender is OFF; no generic third-party lanes.
     const raw = signedTx.serialize();
-    const b64 = Buffer.from(raw).toString('base64');
     const channels = [['rpc', () => this.conn().sendRawTransaction(raw, {
       skipPreflight: true,
       maxRetries: this.config.execution.maxRetries,
     })]];
-
     if (this.config.jito.enabled && this._lastTipAccount) {
       channels.push(['jito', () => this.sendJito(signedTx)]);
     }
-    rpc.fastSendEndpoints().forEach((url, i) => {
-      channels.push([`lane${i + 1}`, () => rpc.sendViaJsonRpc(url, b64, `lane ${i + 1}`)]);
-    });
-
     const results = await Promise.allSettled(channels.map(([, run]) => run()));
     const failures = [];
     let winner = null;
@@ -328,24 +342,13 @@ class Executor {
       if (r.status === 'fulfilled' && !winner) winner = { channel: channels[i][0], value: r.value };
       else if (r.status === 'rejected') failures.push(`${channels[i][0]}: ${r.reason && r.reason.message}`);
     });
-
     if (!winner) throw new Error(`every submission channel failed — ${failures.join(' | ')}`);
-
-    // A Jito bundle id is not a transaction signature, so if Jito won the race we
-    // still need the RPC's signature to confirm the fill. The RPC channel therefore
-    // has to be reported when it succeeded, whatever else came back first.
     if (winner.channel !== 'rpc') {
-      const rpcIdx = channels.findIndex(([n]) => n === 'rpc');
-      const rpcResult = results[rpcIdx];
-      if (rpcResult.status === 'fulfilled') {
-        log.info(`${winner.channel} accepted first (${String(winner.value).slice(0, 12)}…) — confirming via the RPC signature`, { wallet: walletId });
-        return rpcResult.value;
-      }
-      // Only Jito answered: its bundle id goes back and confirmation will fall
-      // through to the normal timeout path, which reports honestly rather than
-      // pretending the fill is confirmed.
-      log.warn(`Only ${winner.channel} accepted the transaction; no RPC signature to confirm against`, { wallet: walletId });
-      return winner.value;
+      const rpcResult = results[0];
+      if (rpcResult.status === 'fulfilled') return rpcResult.value;
+      // A bundle id is NOT a transaction signature; derive it from our locally
+      // signed bytes so confirmation never polls an unrelated bundle id.
+      return heliusSender.localSignature(signedTx);
     }
     return winner.value;
   }
@@ -712,8 +715,7 @@ class Executor {
         if (prepared instanceof Transaction) prepared.sign(kp);
         else prepared.sign([kp]);
 
-        // Race every submission channel and take the first signature back. A dead
-        // RPC then costs one failed attempt in parallel rather than the whole trade.
+        // Submit by the configured trade route; read RPC confirms separately.
         const signature = await this.broadcast(prepared, walletId);
 
       bus.safeEmit('exec:filed', { walletId, label, signature, simulated: false, ts: Date.now() });
