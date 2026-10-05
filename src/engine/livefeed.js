@@ -90,6 +90,9 @@ function deriveRisk(row, thresholds) {
     notes.push(`liquidity $${Math.round(row.liquidityUsd).toLocaleString('en-US')} below floor $${Math.round(liqFloor).toLocaleString('en-US')}`);
   }
 
+  // A partial event can establish danger, but cannot establish safety. If one
+  // required fact is unread, a "0 risk" score would pretend all checks passed.
+  if (score === 0 && (!hasDev || !hasLiq)) return { score: null, notes };
   return { score: Math.max(0, Math.min(100, score)), notes };
 }
 

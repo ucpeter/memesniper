@@ -197,6 +197,13 @@ class Engine {
     if (candidate.initialBuy == null || candidate.vSolInBondingCurve == null) this._recon(candidate);
     if (!this.running) return;
 
+    // Only wallets actively taking NEW entries have a decision on this launch.
+    // The public feed still receives every token from LiveFeed.note. A stopped or
+    // paused wallet must not acquire made-up "wallet disabled" feed rows just
+    // because another wallet keeps the engine running.
+    const activeTraders = [...this.traders.values()].filter((t) => t.cfg.enabled && !t.stats.paused);
+    if (!activeTraders.length) return;
+
     // Fill in what the launch actually IS before anything can decide whether to
     // skip it. Deliberately the first thing here, and deliberately outside the
     // entry queue below: the table has to show dev hold, liquidity and risk for a
@@ -222,7 +229,7 @@ class Engine {
       if (t.unref) t.unref();
     });
 
-    const evaluation = Promise.all([...this.traders.values()].map((t) => t.consider(candidate, { engine: this })));
+    const evaluation = Promise.all(activeTraders.map((t) => t.consider(candidate, { engine: this })));
 
     // The timeout exists ONLY to free the queue slot. The underlying evaluation
     // keeps running — and may still buy — so it must own the accounting, or a
@@ -245,8 +252,8 @@ class Engine {
         bus.safeEmit('scan:final', {
           mint: candidate.mint,
           outcomes,
-          walletNames: [...this.traders.values()].map((t) => t.cfg.name),
-          walletIds: [...this.traders.keys()],
+          walletNames: activeTraders.map((t) => t.cfg.name),
+          walletIds: activeTraders.map((t) => t.cfg.id),
         });
         if (bought) bus.safeEmit('engine:stats', this.stats);
       })

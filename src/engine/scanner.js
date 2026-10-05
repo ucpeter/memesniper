@@ -17,6 +17,13 @@ const { PublicKey } = require('@solana/web3.js');
 const bus = require('../util/events');
 const log = require('../util/logger');
 
+/** A missing PumpPortal field is UNKNOWN, not numeric zero (Number(null) is 0). */
+function finiteEventNumber(value) {
+  if (value === null || value === undefined || (typeof value === 'string' && value.trim() === '')) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 class Scanner {
   constructor(config) {
     this.config = config;
@@ -100,9 +107,9 @@ class Scanner {
            * fields (`initialBuy` / `vSolInBondingCurve`). We were discarding them
            * and then asking an RPC for the same numbers, so on any launch whose
            * read was rate-limited the cells came out blank. */
-          vTokensInBondingCurve: Number.isFinite(Number(msg.vTokensInBondingCurve)) ? Number(msg.vTokensInBondingCurve) : null,
-          vSolInBondingCurve: Number.isFinite(Number(msg.vSolInBondingCurve)) ? Number(msg.vSolInBondingCurve) : null,
-          solAmount: Number.isFinite(Number(msg.solAmount)) ? Number(msg.solAmount) : null,
+          vTokensInBondingCurve: finiteEventNumber(msg.vTokensInBondingCurve),
+          vSolInBondingCurve: finiteEventNumber(msg.vSolInBondingCurve),
+          solAmount: finiteEventNumber(msg.solAmount),
           detectedAt: Date.now(),
           source: 'pumpportal',
         };
@@ -215,3 +222,4 @@ class Scanner {
 }
 
 module.exports = Scanner;
+module.exports.finiteEventNumber = finiteEventNumber;
