@@ -857,9 +857,11 @@ html, body { max-width: 100%; overflow-x: hidden; }
 
 /* Inline per-wallet decisions stay WITH the wallet, including on phones. */
 .wallet-feed { border-top: 1px solid var(--border-hi); margin-top: 12px; padding-top: 10px; min-width: 0; }
-.wallet-feed-title { font-weight: 700; font-size: 12px; margin-bottom: 7px; }
+.wallet-feed-title { font-weight: 700; font-size: 12px; margin-bottom: 4px; }
+.wallet-feed-hint { font-size: 10px; color: var(--text-mute); line-height: 1.4; margin-bottom: 7px; }
 .wallet-feed-empty { color: var(--text-mute); font-size: 11px; padding: 7px 0; }
-.wallet-feed .scan-tbl { min-width: 460px; }
+.wallet-feed .scan-tbl { min-width: 520px; }
+.wallet-feed .scan-tbl th:nth-child(2), .wallet-feed .scan-tbl td:nth-child(2) { min-width: 138px; }
 .wallet-feed .tbl-wrap { max-height: 270px; overflow: auto; }
 .wallet-feed .scan-tbl td { padding: 6px 7px; }
 .wallet-feed .scan-tbl th { padding: 7px; }

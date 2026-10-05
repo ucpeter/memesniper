@@ -2175,6 +2175,7 @@ function renderWalletFeeds() {
     const recent = rows.slice(0, 8);
     const body = `<div class="wallet-feed-title">📡 ${esc(w.name)} · pump.fun launches
       <span class="count">${rows.length}</span></div>
+      <div class="wallet-feed-hint">Shows filtered launches too · curve liquidity is not a DEX pool${w.armed ? '' : ' · stopped wallets get no new decisions'}</div>
       ${recent.length ? `<div class="tbl-wrap">${walletFeedTable(w, 8)}</div>`
         : `<div class="wallet-feed-empty">${w.keyLocked
           ? 'Key locked · open this wallet to evaluate launches.'
@@ -2214,8 +2215,8 @@ function walletFeedTable(w, limit = 40) {
   }
   return `<table class="scan-tbl">
     <thead><tr>
-      <th>Token</th><th class="num">Dev hold</th><th class="num">Liquidity</th><th class="num">Risk</th>
-      <th>What ${esc(w.name)} did</th>
+      <th>Token</th><th>What ${esc(w.name)} did</th><th class="num">Dev hold</th>
+      <th class="num" title="Real SOL in the pump.fun bonding curve, converted to USD. Not a separate DEX liquidity pool.">Curve liquidity</th><th class="num" title="Informational risk only; the wallet's decision is shown separately.">Info risk</th>
     </tr></thead>
     <tbody>${rows.map((r) => {
       const v = walletVerdict(r, w);
@@ -2226,18 +2227,18 @@ function walletFeedTable(w, limit = 40) {
           <div class="scan-sym">${esc(r.symbol || 'unknown')}</div>
           <a class="scan-mint mono" href="https://pump.fun/coin/${esc(r.mint)}" target="_blank" rel="noopener noreferrer">${esc(short(r.mint, 4))}</a>
         </td>
+        <td>
+          <span class="badge ${v.cls}" style="padding:1px 7px;font-size:9.5px">${esc(v.label)}</span>
+          ${v.reason ? `<div class="scan-reason" title="${esc(v.reason)}">${esc(shortReason(v.reason))}</div>` : ''}
+        </td>
         <td class="num ${r.devHoldPct === null || r.devHoldPct === undefined ? 'mute' : ''}">
           ${r.devHoldPct === null || r.devHoldPct === undefined ? 'unread' : `${Number(r.devHoldPct).toFixed(1)}%`}
         </td>
         <td class="num ${liqUsd === null ? 'mute' : ''}">
-          ${liqUsd === null ? 'unread' : `$${liqUsd.toLocaleString('en-US')}`}
+          ${liqUsd === null ? 'unread' : liqUsd === 0 && Number(r.liquiditySol) > 0 ? '<$1' : `$${liqUsd.toLocaleString('en-US')}`}
         </td>
         <td class="num ${risk === null ? 'mute' : risk >= 50 ? 'neg' : risk > 0 ? 'warn' : 'pos'}">
           ${risk === null ? 'unread' : risk}
-        </td>
-        <td>
-          <span class="badge ${v.cls}" style="padding:1px 7px;font-size:9.5px">${esc(v.label)}</span>
-          ${v.reason ? `<div class="scan-reason" title="${esc(v.reason)}">${esc(shortReason(v.reason))}</div>` : ''}
         </td>
       </tr>`;
     }).join('')}</tbody>
