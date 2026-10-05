@@ -207,7 +207,7 @@ function startDemo() {
       decision: 'skipped', skipReason: 'dev_hold_high(47.0%>20%)', detectedAt: now - 21_000, decidedAt: now - 19_000,
       wallets: [{ name: 'Alpha', action: 'skipped', reason: 'dev_hold_high' }, { name: 'Scalper', action: 'skipped', reason: 'dev_hold_high' }, { name: 'Degen', action: 'skipped', reason: 'dev_hold_high' }] },
     { mint: 'DEMO3notarealmintaaaaaaaaaaaaaaaaaaaaaaaaaaa', symbol: 'TINYPOT', name: 'tiny liquidity',
-      devWallet: 'DEMO-dev-3-not-real', devHoldPct: 8.0, liquiditySol: 0.42, riskScore: 0, riskNotes: [],
+      devWallet: 'DEMO-dev-3-not-real', devHoldPct: 8.0, liquiditySol: 0.42, riskScore: 40, riskNotes: ['real SOL backing $68 below floor $2,000'],
       decision: 'skipped', skipReason: 'liquidity_below_min(0.42)', detectedAt: now - 34_000, decidedAt: now - 32_000,
       wallets: [{ name: 'Alpha', action: 'skipped', reason: 'liquidity_below_min' }] },
     { mint: 'DEMO4notarealmintaaaaaaaaaaaaaaaaaaaaaaaaaaa', symbol: 'FROZEN', name: 'can not sell',
@@ -223,6 +223,17 @@ function startDemo() {
       devWallet: 'DEMO-dev-6-not-real', devHoldPct: null, liquiditySol: null, riskScore: null, riskNotes: [],
       decision: 'checking', skipReason: null, detectedAt: now - 400, decidedAt: null, wallets: [] },
   ];
+  // Demo reserves have separate meanings too. This is illustrative offline data,
+  // NEVER a chain observation or a reason to enable real trading.
+  for (const row of S.scanFeed) {
+    if (!Number.isFinite(row.liquiditySol)) continue;
+    row.realLiquiditySol = row.liquiditySol;
+    row.realLiquidityUsd = Math.round(row.realLiquiditySol * DEMO_SOL_USD);
+    row.virtualLiquiditySol = row.realLiquiditySol + 30;
+    row.virtualLiquidityUsd = Math.round(row.virtualLiquiditySol * DEMO_SOL_USD);
+    row.liquiditySol = row.virtualLiquiditySol;
+    row.liquidityUsd = row.virtualLiquidityUsd;
+  }
 
   S.wallets = [
     { id: 'w_a', name: 'Alpha', publicKey: 'DEMO-Alpha-not-a-real-address', enabled: true, armed: true,
@@ -1844,7 +1855,7 @@ function renderOverall() {
   const rate = totals.wins + totals.losses > 0 ? `${((totals.wins / (totals.wins + totals.losses)) * 100).toFixed(1)}%` : '—';
   const dry = S.status ? S.status.dryRun !== false : true;
 
-  mount.innerHTML = `
+  const html = `
     <div class="panel-head">
       <span class="panel-title">Trades per wallet <span class="count" id="overallCount">${ws.length}</span></span>
       <span class="panel-sub">${dry ? 'simulated trades (DRY RUN)' : 'real trades'} · ${closedTotal} closed in total${totals.locked ? ' · locked wallets show their last saved figures' : ''}</span>
@@ -1885,6 +1896,16 @@ function renderOverall() {
         own card and 📄 Trades dialog show only its own.
       </div></div>
     </div>`;
+  // Heartbeats must not replace the scrolling trade board while the user swipes.
+  if (mount.querySelector('.tbl-wrap[data-touching="1"]')) return;
+  if (renderOverall.lastHtml === html && mount.querySelector('.overall-tbl')) return;
+  const wrap = mount.querySelector('.tbl-wrap');
+  const left = wrap?.scrollLeft || 0;
+  const top = wrap?.scrollTop || 0;
+  mount.innerHTML = html;
+  renderOverall.lastHtml = html;
+  const next = mount.querySelector('.tbl-wrap');
+  if (next) { next.scrollLeft = left; next.scrollTop = top; }
 }
 
 function renderStats() {
@@ -1929,6 +1950,19 @@ function renderStats() {
     </div>`).join('');
 }
 
+// A heartbeat may change balances/stats while a finger is still on a mobile
+// table. Defer structural card/board redraws until the gesture finishes.
+document.addEventListener('touchstart', (e) => {
+  const wrap = e.target.closest?.('.tbl-wrap');
+  if (wrap) { clearTimeout(wrap._touchTimer); wrap.dataset.touching = '1'; }
+}, { passive: true });
+const endTableTouch = (e) => {
+  const wrap = e.target.closest?.('.tbl-wrap');
+  if (wrap) wrap._touchTimer = setTimeout(() => { delete wrap.dataset.touching; }, 300);
+};
+document.addEventListener('touchend', endTableTouch, { passive: true });
+document.addEventListener('touchcancel', endTableTouch, { passive: true });
+
 function renderWallets() {
   // A WS tick arrives every 2s. Replacing innerHTML while the owner types
   // destroys the input/keyboard and discards the passphrase on Android.
@@ -1943,6 +1977,7 @@ function renderWallets() {
   if (held.length) S.heldWallets = held.map((w) => w.publicKey);
 
   if (!ws.length) {
+    renderWallets.lastHtml = null;
     // One empty state now, because there is one truth: a wallet is created in
     // this browser. (The old version branched on the server keystore's state —
     // a file that no longer holds the wallets, so its branches had stopped
@@ -1967,7 +2002,7 @@ function renderWallets() {
     return;
   }
 
-  $('wallets').innerHTML = ws.map((w) => {
+  const walletCardsHtml = ws.map((w) => {
     // A wallet the bot cannot sign for yet. Its key is not in this process.
     //
     // Two situations, worded differently because the fix is different:
@@ -2151,7 +2186,26 @@ function renderWallets() {
       <div class="wallet-feed" data-wallet-feed="${esc(w.id)}"></div>
     </div>`;
   }).join('');
-  renderWalletFeeds();
+  const cards = $('wallets');
+  if (cards.querySelector('.tbl-wrap[data-touching="1"]')) { renderWalletFeeds(); return; }
+  // A heartbeat runs every 2s. Keep identical cards and their touch targets in
+  // place; replacing them cancels an in-progress horizontal swipe on Android.
+  if (renderWallets.lastHtml !== walletCardsHtml || !cards.querySelector('[data-wallet-feed]')) {
+    const scroll = new Map([...cards.querySelectorAll('[data-wallet-feed]')].map((el) => {
+      const wrap = el.querySelector('.tbl-wrap');
+      return [el.getAttribute('data-wallet-feed'), { left: wrap?.scrollLeft || 0, top: wrap?.scrollTop || 0 }];
+    }));
+    cards.innerHTML = walletCardsHtml;
+    renderWallets.lastHtml = walletCardsHtml;
+    renderWalletFeeds();
+    for (const el of cards.querySelectorAll('[data-wallet-feed]')) {
+      const saved = scroll.get(el.getAttribute('data-wallet-feed'));
+      const wrap = el.querySelector('.tbl-wrap');
+      if (saved && wrap) { wrap.scrollLeft = saved.left; wrap.scrollTop = saved.top; }
+    }
+  } else {
+    renderWalletFeeds();
+  }
 }
 
 /**
@@ -2166,21 +2220,72 @@ function renderWallets() {
  * evaluation writes one, including the `filtered` and `skipped` cases — or when
  * that wallet is the one that bought it.
  */
+/** Update rows in place. A full innerHTML replacement resets the horizontal
+ * scrollbar on every launch, exactly what made the user's swipe spring back. */
+function reconcileWalletTable(wrap, w, limit) {
+  if (!wrap) return;
+  const template = document.createElement('template');
+  template.innerHTML = walletFeedTable(w, limit);
+  const fresh = template.content.querySelector('table');
+  const old = wrap.querySelector('table');
+  if (!old || !fresh) {
+    const left = wrap.scrollLeft, top = wrap.scrollTop;
+    if (wrap.innerHTML !== template.innerHTML) wrap.innerHTML = template.innerHTML;
+    wrap.scrollLeft = left; wrap.scrollTop = top;
+    return;
+  }
+  if (old.tHead.innerHTML !== fresh.tHead.innerHTML) old.tHead.innerHTML = fresh.tHead.innerHTML;
+  const tbody = old.tBodies[0];
+  const original = new Map([...tbody.rows].map((tr) => [tr.getAttribute('data-mint'), tr]));
+  const wanted = [...fresh.tBodies[0].rows];
+  for (let i = 0; i < wanted.length; i += 1) {
+    const updated = wanted[i];
+    const key = updated.getAttribute('data-mint');
+    let row = original.get(key);
+    if (row && row.outerHTML !== updated.outerHTML) { row.replaceWith(updated); row = updated; }
+    if (!row) row = updated;
+    if (tbody.rows[i] !== row) tbody.insertBefore(row, tbody.rows[i] || null);
+    original.delete(key);
+  }
+  for (const row of original.values()) row.remove();
+}
+
 function renderWalletFeeds() {
   for (const w of S.wallets || []) {
     const mount = [...$('wallets').querySelectorAll('[data-wallet-feed]')]
       .find((el) => el.getAttribute('data-wallet-feed') === w.id);
-    if (!mount) continue;
     const rows = walletFeed(w);
     const recent = rows.slice(0, 8);
-    const body = `<div class="wallet-feed-title">📡 ${esc(w.name)} · pump.fun launches
-      <span class="count">${rows.length}</span></div>
-      <div class="wallet-feed-hint">Shows filtered launches too · curve liquidity is not a DEX pool${w.armed ? '' : ' · stopped wallets get no new decisions'}</div>
-      ${recent.length ? `<div class="tbl-wrap">${walletFeedTable(w, 8)}</div>`
-        : `<div class="wallet-feed-empty">${w.keyLocked
-          ? 'Key locked · open this wallet to evaluate launches.'
-          : w.armed ? 'Watching launches · no evaluation yet.' : 'Start this wallet to evaluate launches.'}</div>`}`;
-    if (mount.innerHTML !== body) mount.innerHTML = body;
+    if (mount) {
+      if (!mount.querySelector('.wallet-feed-title') ||
+          Boolean(mount.querySelector('.tbl-wrap')) !== Boolean(recent.length)) {
+        mount.innerHTML = `<div class="wallet-feed-title">📡 ${esc(w.name)} · pump.fun launches
+          <span class="count">${rows.length}</span></div>
+          ${recent.length ? '<div class="tbl-wrap"></div>'
+            : `<div class="wallet-feed-empty">${w.keyLocked
+              ? 'Key locked · open this wallet to evaluate launches.'
+              : w.armed ? 'Watching launches · no evaluation yet.' : 'Start this wallet to evaluate launches.'}</div>`}`;
+      }
+      const count = mount.querySelector('.wallet-feed-title .count');
+      if (count) count.textContent = String(rows.length);
+      reconcileWalletTable(mount.querySelector('.tbl-wrap'), w, 8);
+    }
+    // Both the standalone feed dialog and 📄 Trades reuse the same live stream.
+    // Keep their scroll containers alive; refresh only table rows and counts.
+    for (const wrap of document.querySelectorAll('[data-live-wallet-feed]')) {
+      if (wrap.getAttribute('data-live-wallet-feed') !== w.id) continue;
+      reconcileWalletTable(wrap, w, 40);
+    }
+    const liveCount = document.querySelector('[data-live-wallet-count]');
+    if (liveCount && liveCount.getAttribute('data-live-wallet-count') === w.id) {
+      liveCount.textContent = String(rows.length);
+    }
+    const liveBought = document.querySelector('[data-live-wallet-bought]');
+    if (liveBought && liveBought.getAttribute('data-live-wallet-bought') === w.id) {
+      liveBought.textContent = String(rows.filter((r) => r.boughtById
+        ? r.boughtById === w.id : (r.wallets || []).some((x) =>
+          (x.walletId ? x.walletId === w.id : x.name === w.name) && x.action === 'bought')).length);
+    }
   }
 }
 
@@ -2215,30 +2320,32 @@ function walletFeedTable(w, limit = 40) {
   }
   return `<table class="scan-tbl">
     <thead><tr>
-      <th>Token</th><th>What ${esc(w.name)} did</th><th class="num">Dev hold</th>
-      <th class="num" title="Real SOL in the pump.fun bonding curve, converted to USD. Not a separate DEX liquidity pool.">Curve liquidity</th><th class="num" title="Informational risk only; the wallet's decision is shown separately.">Info risk</th>
+      <th>Token</th><th class="num">Dev hold</th><th class="num">Liquidity</th><th class="num">Risk</th>
+      <th>What ${esc(w.name)} did</th>
     </tr></thead>
     <tbody>${rows.map((r) => {
       const v = walletVerdict(r, w);
       const liqUsd = r.liquidityUsd === null || r.liquidityUsd === undefined ? null : Number(r.liquidityUsd);
+      const realUsd = r.realLiquidityUsd === null || r.realLiquidityUsd === undefined ? null : Number(r.realLiquidityUsd);
       const risk = r.riskScore === null || r.riskScore === undefined ? null : Number(r.riskScore);
-      return `<tr>
+      return `<tr data-mint="${esc(r.mint)}">
         <td>
           <div class="scan-sym">${esc(r.symbol || 'unknown')}</div>
           <a class="scan-mint mono" href="https://pump.fun/coin/${esc(r.mint)}" target="_blank" rel="noopener noreferrer">${esc(short(r.mint, 4))}</a>
-        </td>
-        <td>
-          <span class="badge ${v.cls}" style="padding:1px 7px;font-size:9.5px">${esc(v.label)}</span>
-          ${v.reason ? `<div class="scan-reason" title="${esc(v.reason)}">${esc(shortReason(v.reason))}</div>` : ''}
         </td>
         <td class="num ${r.devHoldPct === null || r.devHoldPct === undefined ? 'mute' : ''}">
           ${r.devHoldPct === null || r.devHoldPct === undefined ? 'unread' : `${Number(r.devHoldPct).toFixed(1)}%`}
         </td>
         <td class="num ${liqUsd === null ? 'mute' : ''}">
-          ${liqUsd === null ? 'unread' : liqUsd === 0 && Number(r.liquiditySol) > 0 ? '<$1' : `$${liqUsd.toLocaleString('en-US')}`}
+          <div class="scan-liq-main" title="Virtual curve SOL — pricing liquidity, not deposited SOL">${liqUsd === null ? 'virtual unread' : `${liqUsd === 0 && Number(r.virtualLiquiditySol ?? r.liquiditySol) > 0 ? '<$1' : `$${liqUsd.toLocaleString('en-US')}`} virtual`}</div>
+          <div class="scan-liq-real" title="Real SOL deposited by buyers — used by your wallet's USD minimum">${realUsd === null ? 'real unread' : `${realUsd === 0 && Number(r.realLiquiditySol) > 0 ? '<$1' : `$${realUsd.toLocaleString('en-US')}`} real`}</div>
         </td>
         <td class="num ${risk === null ? 'mute' : risk >= 50 ? 'neg' : risk > 0 ? 'warn' : 'pos'}">
           ${risk === null ? 'unread' : risk}
+        </td>
+        <td>
+          <span class="badge ${v.cls}" style="padding:1px 7px;font-size:9.5px">${esc(v.label)}</span>
+          ${v.reason ? `<div class="scan-reason" title="${esc(v.reason)}">${esc(shortReason(v.reason))}</div>` : ''}
         </td>
       </tr>`;
     }).join('')}</tbody>
@@ -2255,7 +2362,7 @@ function openWalletFeed(walletId) {
     <div class="modal" style="max-width:900px">
       <div class="modal-head">
         <span class="modal-title">📡 ${esc(w.name)} — launches</span>
-        <span class="wallet-preset">${rows.length} seen · ${bought} bought</span>
+        <span class="wallet-preset"><span data-live-wallet-count="${esc(w.id)}">${rows.length}</span> seen · <span data-live-wallet-bought="${esc(w.id)}">${bought}</span> bought</span>
         <button class="btn btn-ghost btn-sm" data-close-modal="1" title="Close this dialog (Esc also works)">Close</button>
       </div>
       <div class="modal-body">
@@ -2263,7 +2370,7 @@ function openWalletFeed(walletId) {
           Every launch this wallet evaluated, and what it did about it. A launch it never reached
           (the engine was stopped, or the queue was full) is not in this list.
         </div></div>
-        <div class="tbl-wrap" style="margin-top:12px">${walletFeedTable(w)}</div>
+        <div class="tbl-wrap" data-live-wallet-feed="${esc(w.id)}" style="margin-top:12px">${walletFeedTable(w)}</div>
       </div>
     </div>`);
 }
@@ -2338,8 +2445,8 @@ function openWalletDetail(walletId) {
           ${stat('Real balance', `${fmtSol(w.balanceSol, 3)} SOL${usdOf(w.balanceSol) ? ` · ${usdOf(w.balanceSol)}` : ''}`)}
         </div>
 
-        <div class="section-label">What ${esc(w.name)} did with the launches it saw (${walletFeed(w).length})</div>
-        <div class="tbl-wrap">${walletFeedTable(w)}</div>
+        <div class="section-label">What ${esc(w.name)} did with the launches it saw (<span data-live-wallet-count="${esc(w.id)}">${walletFeed(w).length}</span>)</div>
+        <div class="tbl-wrap" data-live-wallet-feed="${esc(w.id)}">${walletFeedTable(w)}</div>
 
         <div class="section-label">Open positions (${open.length})</div>
         <div class="tbl-wrap">${openRows}</div>
@@ -3410,14 +3517,17 @@ function demoTickLaunches() {
     upsertScanRow({
       mint, symbol, name: symbol.toLowerCase(), devWallet: `DEMO-dev-${demoLaunchSeq}-not-real`,
       devHoldPct: skipped ? 34.0 : 3.4,
-      liquiditySol: skipped ? 0.42 : 12.5,
-      // Priced in dollars, like the real table. The preview uses a fixed rate and
-      // says so, rather than implying a live quote it cannot fetch offline.
-      liquidityUsd: Math.round((skipped ? 0.42 : 12.5) * DEMO_SOL_USD),
+      // Fixed demo-only USD conversion; the virtual curve is not buyer deposits.
+      virtualLiquiditySol: skipped ? 30.42 : 42.5,
+      virtualLiquidityUsd: Math.round((skipped ? 30.42 : 42.5) * DEMO_SOL_USD),
+      realLiquiditySol: skipped ? 0.42 : 12.5,
+      realLiquidityUsd: Math.round((skipped ? 0.42 : 12.5) * DEMO_SOL_USD),
+      liquiditySol: skipped ? 30.42 : 42.5,
+      liquidityUsd: Math.round((skipped ? 30.42 : 42.5) * DEMO_SOL_USD),
       solUsd: DEMO_SOL_USD, solUsdSource: 'demo',
       riskScore: skipped ? 61 : 12,
-      riskNotes: skipped ? ['dev holds 34.0% (limit 15%)', 'liquidity $68 below floor $2,000'] : ['dev holds 3.4%'],
-      facts: { devHold: 'event', liquidity: 'event', risk: 'derived' },
+      riskNotes: skipped ? ['dev holds 34.0% (limit 15%)', 'real SOL backing $68 below floor $2,000'] : ['dev holds 3.4%'],
+      facts: { devHold: 'event', liquidity: 'virtual_event', realLiquidity: 'demo', risk: 'derived' },
       decision: skipped ? 'skipped' : 'checking', skipReason: skipped ? reason : null,
       detectedAt: now, decidedAt: skipped ? now : null, wallets: verdicts,
     });
@@ -3472,7 +3582,7 @@ function demoTickLaunches() {
     liquidityUsd: Math.round(12.5 * DEMO_SOL_USD),
     solUsd: DEMO_SOL_USD, solUsdSource: 'demo',
     riskScore: 12, riskNotes: ['dev holds 3.4%'],
-    facts: { devHold: 'event', liquidity: 'event', risk: 'derived' },
+    facts: { devHold: 'event', liquidity: 'virtual_event', realLiquidity: 'demo', risk: 'derived' },
     decision: opened ? 'bought' : 'skipped',
     skipReason: opened ? null : 'no wallet had room for another position',
     // Which wallet took it — the question the per-wallet view is built around.
