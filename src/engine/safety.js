@@ -208,6 +208,7 @@ async function checkCurve(conn, mint) {
       confidence: 'HARD',
       curve,
       liquiditySol: lamportsToSol(curve.realSolReserves),
+      virtualLiquiditySol: lamportsToSol(curve.virtualSolReserves),
       progressPct: bondingCurvePct(curve.realSolReserves),
     };
   } catch (err) {
@@ -428,6 +429,7 @@ async function recon(candidate, ctx = {}) {
     reason: unreachable.length ? unreachable.map((r) => r.reason).join('; ') : null,
     report: {
       liquiditySol: curveReport && curveReport.confidence !== 'INFRA' ? curveReport.liquiditySol ?? null : null,
+      virtualLiquiditySol: curveReport && curveReport.confidence !== 'INFRA' ? curveReport.virtualLiquiditySol ?? null : null,
       // The dev's own opening buy, straight off the launch event — the same
       // derivation the reference bot uses. Present even when the RPC is not.
       devHoldPctFromEvent: Number.isFinite(Number(candidate.initialBuy)) && candidate.initialBuy !== null

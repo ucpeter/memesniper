@@ -102,7 +102,9 @@ class Scanner {
            *
            * PumpPortal's `create` payload already carries the bonding curve state
            * and the dev's opening buy, so DEV HOLD and LIQUIDITY are known the
-           * instant a launch arrives — with no RPC call at all. The reference bot
+           * instant a launch arrives — with no RPC call at all. The virtual
+           * SOL is for price discovery, NOT deposited SOL for wallet filters.
+           * The reference bot
            * this project is measured against derives both from exactly these two
            * fields (`initialBuy` / `vSolInBondingCurve`). We were discarding them
            * and then asking an RPC for the same numbers, so on any launch whose

@@ -190,10 +190,11 @@ class Engine {
 
   /* ------------------------------- entry --------------------------------- */
   _onToken(candidate) {
-    // Most pump.fun creates already include BOTH facts needed by the public
-    // feed. Sending two RPC requests for every launch saturated public nodes,
-    // and duplicated the wallet evaluation's own on-chain reads. Recon only
-    // when the event actually omitted a fact; never hide a missing read as 0.
+    // Most creates include the dev opening buy and the VIRTUAL SOL reserve.
+    // Real deposited SOL requires a separate on-chain read. To avoid flooding
+    // public RPCs, recon on missing event facts; active wallet evaluations also
+    // publish their on-chain real reserve. Otherwise show "real unread" rather
+    // than inventing a deposit from the virtual event reserve.
     if (candidate.initialBuy == null || candidate.vSolInBondingCurve == null) this._recon(candidate);
     if (!this.running) return;
 

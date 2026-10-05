@@ -47,12 +47,14 @@ const DECISION = {
 
 /**
  * RISK, 0–100, where **higher means more dangerous** — the same direction as the
- * reference bot's RiskBadge. It is derived from the two facts every launch
- * carries, so the column is filled for every row instead of only for the ones
- * whose RPC read happened to succeed:
+ * reference bot's RiskBadge. It uses the event dev holding immediately, and
+ * REAL on-chain SOL when available; a clean score remains unread until the
+ * actual deposited reserve has been checked:
  *
  *   · dev concentration vs the configured ceiling
- *   · liquidity (in dollars) vs the configured floor
+ *   · REAL SOL deposited in the curve (in dollars) vs the configured floor.
+ * The launch's virtual SOL is useful for price discovery, NOT actual cash
+ * backing; it must not be substituted for real deposits when scoring safety.
  *
  * An on-chain honeypot reading, when one arrives, is merged in as a floor: the
  * table shows the worst thing known about the token, never the most reassuring.
@@ -65,7 +67,9 @@ function deriveRisk(row, thresholds) {
   const liqFloor = thresholds.minLiquidityUsd;
 
   const hasDev = Number.isFinite(row.devHoldPct);
-  const hasLiq = Number.isFinite(row.liquidityUsd);
+  // Never accept the compatibility alias (virtual USD) as deposited real SOL.
+  const liq = row.realLiquidityUsd;
+  const hasLiq = Number.isFinite(liq);
   if (!hasDev && !hasLiq) return { score: null, notes: [] };
 
   const notes = [];
@@ -83,11 +87,11 @@ function deriveRisk(row, thresholds) {
     }
   }
 
-  if (hasLiq && liqFloor > 0 && row.liquidityUsd < liqFloor) {
-    // Thin liquidity: the most common way a brand-new launch eats a sniper alive.
-    const shortfall = (liqFloor - row.liquidityUsd) / liqFloor; // 0..1+
+  if (hasLiq && liqFloor > 0 && liq < liqFloor) {
+    // The real SOL is the only reserve the wallet's USD floor actually checks.
+    const shortfall = (liqFloor - liq) / liqFloor; // 0..1+
     score += Math.min(40, Math.round(12 + shortfall * 28));
-    notes.push(`liquidity $${Math.round(row.liquidityUsd).toLocaleString('en-US')} below floor $${Math.round(liqFloor).toLocaleString('en-US')}`);
+    notes.push(`real SOL backing $${Math.round(liq).toLocaleString('en-US')} below floor $${Math.round(liqFloor).toLocaleString('en-US')}`);
   }
 
   // A partial event can establish danger, but cannot establish safety. If one
@@ -138,19 +142,26 @@ class LiveFeed {
       /* Derived from the launch event, not from an RPC.
        *
        * `initialBuy` is the dev's opening buy in tokens against a fixed 1e9
-       * supply; `vSolInBondingCurve` is the curve's real SOL. Both arrive with the
-       * create event, so these two cells are filled on EVERY launch — which is
-       * what they are for. An on-chain read (see recon()) refines them a moment
-       * later when it succeeds, and is ignored when it does not. */
+       * supply; `vSolInBondingCurve` is VIRTUAL SOL (~30 SOL at launch), not
+       * SOL deposited by buyers. Keep the event's virtual reserve separate from
+       * on-chain real SOL, or simply starting a wallet changes the meaning of
+       * the displayed liquidity from ~$4,500 to ~$7 for the SAME token. */
       devHoldPct: Number.isFinite(Number(candidate.initialBuy)) && candidate.initialBuy !== null
         ? (Number(candidate.initialBuy) / PUMP_FUN_TOTAL_SUPPLY) * 100
         : null,
+      virtualLiquiditySol: Number.isFinite(candidate.vSolInBondingCurve) ? candidate.vSolInBondingCurve : null,
+      virtualLiquidityUsd: null,
+      realLiquiditySol: null,
+      realLiquidityUsd: null,
+      // Compatibility for existing feed clients: primary displayed figure is
+      // VIRTUAL SOL; real SOL is separately and explicitly labelled.
       liquiditySol: Number.isFinite(candidate.vSolInBondingCurve) ? candidate.vSolInBondingCurve : null,
       liquidityUsd: null,
       // Where each of those came from, so the table can be honest about it.
       facts: {
         devHold: Number.isFinite(Number(candidate.initialBuy)) && candidate.initialBuy !== null ? 'event' : null,
-        liquidity: Number.isFinite(candidate.vSolInBondingCurve) ? 'event' : null,
+        liquidity: Number.isFinite(candidate.vSolInBondingCurve) ? 'virtual_event' : null,
+        realLiquidity: null,
         risk: null,
       },
       riskScore: null,
@@ -176,31 +187,30 @@ class LiveFeed {
   /**
    * Liquidity in dollars, which is the form a human can judge.
    *
-   * `solUsd` and `liqSource` ride along so the table can mark a figure that was
+   * `solUsd` and `solUsdSource` ride along so the table can mark a figure that was
    * converted at a last-resort constant instead of a real quote. That is the one
    * place this deliberately differs from the reference bot, which prints its
    * fallback price as though it were live.
    */
   _price(row) {
-    if (!Number.isFinite(row.liquiditySol)) { row.liquidityUsd = null; return; }
-    /* Ask for a price if we do not have a fresh one. Without this the table would
-     * convert at the fallback constant forever: `lastKnown()` never fetches, and
-     * nothing else did either. The call is not awaited — a row must never wait on
-     * a price API — and the module caches, so this is one request per 20 seconds
-     * no matter how many launches arrive. */
+    const hasVirtual = Number.isFinite(row.virtualLiquiditySol);
+    const hasReal = Number.isFinite(row.realLiquiditySol);
+    if (!hasVirtual && !hasReal) {
+      row.liquiditySol = row.liquidityUsd = null;
+      row.virtualLiquidityUsd = row.realLiquidityUsd = null;
+      return;
+    }
+    /* Fetch asynchronously and share the cached SOL quote across all launches. */
     const price = solprice.lastKnown();
     if (price.usd === null || price.stale) solprice.get().catch(() => {});
-    /* The figure and its provenance must come from the SAME decision, or the table
-     * marks the wrong rows. `lastKnown()` reports `source: 'none'` when no provider
-     * has ever answered — and that is precisely the case where the conversion uses
-     * the fallback constant, so it is labelled 'fallback' rather than 'none'. Caught
-     * live: the row was priced at the fallback and said `none`, which would have
-     * shown an invented dollar figure with no marker on it. */
     const never = price.usd === null || price.source === 'none';
     row.solUsd = never ? solprice.FALLBACK_USD : price.usd;
     row.solUsdSource = never ? 'fallback' : price.source;
     row.solUsdStale = Boolean(price.stale);
-    row.liquidityUsd = Math.round(row.liquiditySol * row.solUsd);
+    row.virtualLiquidityUsd = hasVirtual ? Math.round(row.virtualLiquiditySol * row.solUsd) : null;
+    row.realLiquidityUsd = hasReal ? Math.round(row.realLiquiditySol * row.solUsd) : null;
+    row.liquiditySol = row.virtualLiquiditySol;
+    row.liquidityUsd = row.virtualLiquidityUsd;
   }
 
   /** Risk, from whatever is known right now. */
@@ -260,12 +270,18 @@ class LiveFeed {
    * so "later report wins" would erase good data with null.
    */
   _mergeFacts(row, r) {
-    if (!row.facts) row.facts = { devHold: null, liquidity: null, risk: null };
-    if (r.liquiditySol !== undefined && r.liquiditySol !== null) {
-      row.liquiditySol = r.liquiditySol;
-      row.facts.liquidity = 'onchain';
+    if (!row.facts) row.facts = { devHold: null, liquidity: null, realLiquidity: null, risk: null };
+    if (r.virtualLiquiditySol !== undefined && r.virtualLiquiditySol !== null &&
+        !Number.isFinite(row.virtualLiquiditySol)) {
+      row.virtualLiquiditySol = r.virtualLiquiditySol;
+      row.facts.liquidity = 'virtual_onchain';
     }
-    // A curve read that worked is a better basis for the dollar figure.
+    if (r.liquiditySol !== undefined && r.liquiditySol !== null) {
+      row.realLiquiditySol = r.liquiditySol;
+      row.facts.realLiquidity = 'real_onchain';
+    }
+    // Never replace the virtual launch figure with real SOL: they are different
+    // numbers and starting/stopping the bot must not change a column's meaning.
     this._price(row);
     if (r.devHoldPct !== undefined && r.devHoldPct !== null) {
       row.devHoldPct = r.devHoldPct;
@@ -276,8 +292,12 @@ class LiveFeed {
       // another's more permissive one.
       // The worst known signal wins: a honeypot that reads clean does not
       // cancel a dev holding half the supply.
-      row.riskScore = row.riskScore === null ? r.honeypot.risk : Math.max(row.riskScore, r.honeypot.risk);
-      if (row.facts) row.facts.risk = 'onchain';
+      // A clean honeypot read is only one check: without a real-SOL read it
+      // cannot claim this launch is zero-risk (or clear the wallet's floor).
+      if (r.honeypot.risk > 0 || row.riskScore !== null) {
+        row.riskScore = row.riskScore === null ? r.honeypot.risk : Math.max(row.riskScore, r.honeypot.risk);
+        if (row.facts) row.facts.risk = 'onchain';
+      }
       if (Array.isArray(r.honeypot.notes)) {
         row.riskNotes = [...new Set([...(row.riskNotes || []), ...r.honeypot.notes])];
       }
