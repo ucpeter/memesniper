@@ -76,7 +76,8 @@ function withFeed(fn, thresholds = THRESHOLDS) {
       assert.strictEqual(row.devHoldPct, 3, 'dev hold = initialBuy / 1e9 = 3%');
       assert.strictEqual(row.liquiditySol, 12.5, 'liquidity = the curve, in SOL');
       assert.strictEqual(row.facts.devHold, 'event', 'and the row records where it came from');
-      assert.strictEqual(row.facts.liquidity, 'event');
+      assert.strictEqual(row.facts.liquidity, 'virtual_event');
+      assert.strictEqual(row.realLiquiditySol, null, 'an event does not prove deposited SOL');
     });
   });
 
@@ -100,19 +101,21 @@ function withFeed(fn, thresholds = THRESHOLDS) {
     }
   });
 
-  await test('RISK is filled for every launch, even with no on-chain read', () => {
+  await test('virtual launch liquidity cannot pass the real-SOL risk floor', () => {
     solprice.__setPrice(200, 'test');
     try {
       withFeed((feed) => {
         bus.safeEmit('token:detected', launch());
         const row = feed.rows.get(MINT('a'));
-        assert.strictEqual(typeof row.riskScore, 'number', 'a number, not a dash');
-        assert.strictEqual(row.facts.risk, 'derived', 'derived from the event, and labelled as such');
-        assert.ok(row.riskNotes.length, 'with the reason it scored that way');
+        assert.strictEqual(row.virtualLiquidityUsd, 2500);
+        assert.strictEqual(row.realLiquidityUsd, null);
+        assert.strictEqual(row.riskScore, null, 'real SOL not yet read — never claim a safe zero');
+        assert.strictEqual(row.facts.risk, null);
+        bus.safeEmit('token:recon', { candidate: { mint: MINT('a') },
+          report: { honeypot: { risk: 0, notes: [] } } });
+        assert.strictEqual(row.riskScore, null, 'one clean check cannot make virtual SOL safe');
       });
-    } finally {
-      solprice.__reset();
-    }
+    } finally { solprice.__reset(); }
   });
 
   await test('a dangerous launch scores dangerous, a clean one does not', () => {
@@ -125,9 +128,8 @@ function withFeed(fn, thresholds = THRESHOLDS) {
 
         const bad = feed.rows.get(MINT('b'));
         const good = feed.rows.get(MINT('c'));
-        assert.ok(bad.riskScore >= 50, `a 40% dev hold on a $240 curve must read as risky (got ${bad.riskScore})`);
-        assert.ok(good.riskScore < 50, `a 0.1% dev hold on a $10k curve must not (got ${good.riskScore})`);
-        assert.ok(bad.riskScore > good.riskScore, 'and the order must be the right way round');
+        assert.ok(bad.riskScore >= 40, `a 40% dev holding is risky (got ${bad.riskScore})`);
+        assert.strictEqual(good.riskScore, null, 'a large virtual curve alone cannot prove safety');
       });
     } finally {
       solprice.__reset();
@@ -135,8 +137,8 @@ function withFeed(fn, thresholds = THRESHOLDS) {
   });
 
   await test('higher risk means more dangerous — the same direction as the reference bot', () => {
-    const clean = deriveRisk({ devHoldPct: 1, liquidityUsd: 50_000 }, THRESHOLDS);
-    const dirty = deriveRisk({ devHoldPct: 60, liquidityUsd: 100 }, THRESHOLDS);
+    const clean = deriveRisk({ devHoldPct: 1, realLiquidityUsd: 50_000 }, THRESHOLDS);
+    const dirty = deriveRisk({ devHoldPct: 60, realLiquidityUsd: 100 }, THRESHOLDS);
     assert.ok(dirty.score > clean.score, 'more danger must score higher');
     assert.strictEqual(clean.score, 0, 'and an unremarkable launch scores 0');
   });
@@ -158,9 +160,9 @@ function withFeed(fn, thresholds = THRESHOLDS) {
           candidate: { mint: MINT('i') },
           report: { liquiditySol: 0.1, devHoldPct: 1.2 },
         });
-        assert.strictEqual(row.facts.liquidity, 'onchain', 'the liquidity now comes from the chain');
+        assert.strictEqual(row.facts.realLiquidity, 'real_onchain', 'deposited SOL comes from the chain');
         assert.ok(row.riskScore >= 35, `thin liquidity must score dangerous, got ${row.riskScore}`);
-        assert.ok(row.riskNotes.some((n) => /liquidity \$/.test(n)), 'and say which floor it fell through');
+        assert.ok(row.riskNotes.some((n) => /real SOL backing \$/.test(n)), 'and say which floor it fell through');
       });
     } finally {
       solprice.__reset();
@@ -175,7 +177,7 @@ function withFeed(fn, thresholds = THRESHOLDS) {
         bus.safeEmit('token:detected', launch({ mint: MINT('j'), initialBuy: 300_000_000, vSolInBondingCurve: 1 }));
         const row = feed.rows.get(MINT('j'));
         const before = row.riskScore;
-        assert.ok(before >= 50, `30% dev hold must be dangerous, got ${before}`);
+        assert.ok(before >= 40, `30% dev hold must be dangerous, got ${before}`);
         // A later, healthier on-chain reading must not talk the number down.
         bus.safeEmit('token:recon', { candidate: { mint: MINT('j') }, report: { liquiditySol: 40, devHoldPct: 2 } });
         assert.strictEqual(row.riskScore, before, 'the worst known signal stays');
@@ -285,9 +287,12 @@ function withFeed(fn, thresholds = THRESHOLDS) {
           report: { liquiditySol: 20, devHoldPct: 9.5, honeypot: { risk: 40, notes: ['freeze authority live'] } },
         });
         const row = feed.rows.get(MINT('a'));
-        assert.strictEqual(row.liquiditySol, 20, 'the on-chain reading wins for liquidity');
-        assert.strictEqual(row.liquidityUsd, 4000, 'and the dollar figure is recomputed from it');
-        assert.strictEqual(row.facts.liquidity, 'onchain', 'with the provenance updated');
+        assert.strictEqual(row.liquiditySol, 12.5, 'the virtual event figure remains virtual');
+        assert.strictEqual(row.virtualLiquidityUsd, 2500);
+        assert.strictEqual(row.realLiquiditySol, 20, 'real deposited SOL is separate');
+        assert.strictEqual(row.realLiquidityUsd, 4000);
+        assert.strictEqual(row.facts.liquidity, 'virtual_event');
+        assert.strictEqual(row.facts.realLiquidity, 'real_onchain');
         assert.strictEqual(row.devHoldPct, 9.5, 'so does dev hold');
         assert.ok(row.riskScore >= 40, 'and the honeypot reading joins the score');
         assert.ok(row.riskNotes.join(' ').includes('freeze'), 'carrying its note with it');

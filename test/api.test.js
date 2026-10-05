@@ -143,8 +143,8 @@ const api = async (method, url, body) => {
     bus.safeEmit('token:detected', thin);
     const row = engine.liveFeed.rows.get(thin.mint);
     assert.ok(row, 'the launch must become a row');
-    assert.ok(row.riskScore > 50, `a 40%-dev, $60-liquidity launch must score dangerous, not ${row.riskScore}`);
-    assert.ok(row.riskNotes.some((n) => /liquidity \$/.test(n)), 'and say which floor it fell through');
+    assert.ok(row.riskScore >= 40, `a 40%-dev holding is dangerous even before the real reserve read, not ${row.riskScore}`);
+    assert.strictEqual(row.realLiquidityUsd, null, 'virtual USD must not masquerade as real backing');
     assert.ok(row.riskNotes.some((n) => /dev holds/.test(n)), 'and that the dev is over the ceiling');
   });
 
@@ -175,7 +175,7 @@ const api = async (method, url, body) => {
     const rows = engine.liveFeed.snapshot(10);
     assert.strictEqual(rows.filter((r) => r.mint === mint).length, 1, 'still one row for that mint');
     const row = rows.find((r) => r.mint === mint);
-    assert.strictEqual(row.liquiditySol, 12.5, 'the checks filled it in');
+    assert.strictEqual(row.realLiquiditySol, 12.5, 'the checks filled in real SOL, not the virtual alias');
     assert.strictEqual(row.decision, 'skipped');
     assert.match(row.skipReason, /liquidity/, 'and say WHY, in words');
   });
@@ -371,8 +371,20 @@ const api = async (method, url, body) => {
     const row = got.body.rows.find((r) => r.mint === mint);
     assert.ok(row, 'the public stream shows a token even with no wallet trading');
     assert.strictEqual(row.devHoldPct, 30);
-    assert.ok(row.liquidityUsd !== null);
+    assert.ok(row.virtualLiquidityUsd !== null);
+    assert.strictEqual(row.realLiquidityUsd, null);
     assert.ok(row.riskScore > 0, 'informational risk ignores wallet/global trading thresholds');
+    // A subsequent on-chain report adds real SOL without rewriting the event's
+    // virtual liquidity or exposing wallet verdicts in the public response.
+    engine.liveFeed.recon({ candidate: { mint }, report: { liquiditySol: 0.047,
+      virtualLiquiditySol: 30, devHoldPct: 30 } });
+    const later = (await (await fetch(`http://127.0.0.1:${PORT}/api/launches`)).json())
+      .rows.find((r) => r.mint === mint);
+    assert.strictEqual(later.virtualLiquidityUsd, row.virtualLiquidityUsd);
+    assert.strictEqual(later.realLiquiditySol, 0.047);
+    assert.ok(later.realLiquidityUsd > 0 && later.realLiquidityUsd < 100);
+    assert.strictEqual(later.liquidityUsd, row.liquidityUsd, 'alias stays virtual, never changes its meaning');
+    assert.ok(!('wallets' in later));
     assert.strictEqual(engine.running, before, 'reading the launch does NOT start trading');
     for (const name of ['wallets', 'boughtBy', 'walletId', 'skipReason', 'config', 'secretKey']) {
       assert.ok(!(name in row), `public feed must not expose ${name}`);

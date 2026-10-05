@@ -28,10 +28,10 @@ const conn = {
   calls: 0,
   getTokenLargestAccounts: async () => ({ value: [] }),
 };
-async function check(filters) {
+async function check(filters, event = {}) {
   safety._reportCache.clear(); conn.calls = 0;
   const w = cfg.normaliseWallet({ name: 'USD', filters });
-  return safety.evaluate({ mint, symbol: 'USD', detectedAt: Date.now() }, w,
+  return safety.evaluate({ mint, symbol: 'USD', detectedAt: Date.now(), ...event }, w,
     { conn, config: cfg.defaultGlobalConfig() });
 }
 (async () => {
@@ -55,6 +55,12 @@ async function check(filters) {
       assert.ok(low.reasons.some((r) => /liquidity_below_min_usd\(\$500<\$600\)/.test(r)), low.reasons.join(', '));
       const okay = await check({ minLiquiditySol: 500, minLiquidityUsd: 450, maxLiquidityUsd: 0 });
       assert.ok(!okay.reasons.some((r) => /liquidity_below_min/.test(r)), okay.reasons.join(', '));
+    });
+    await test('a $6,000 VIRTUAL curve cannot pass a $600 REAL deposit floor', async () => {
+      const v = await check({ minLiquidityUsd: 600, maxLiquidityUsd: 0 }, { vSolInBondingCurve: 30 });
+      assert.equal(v.report.curveReport.liquiditySol, 2.5);
+      assert.equal(v.report.curveReport.virtualLiquiditySol, 30);
+      assert.ok(v.reasons.some((r) => /liquidity_below_min_usd\(\$500<\$600\)/.test(r)), v.reasons.join(', '));
     });
     await test('USD max is also enforced in USD', async () => {
       const v = await check({ minLiquiditySol: 0, minLiquidityUsd: 0, maxLiquidityUsd: 400 });
@@ -89,7 +95,7 @@ async function check(filters) {
       await assert.rejects(rpc.resilientRpcFetch(['https://first','https://backup'])('ignored', {}), /rate_limited/);
     } finally { global.fetch = old; }
   });
-  await test('wallet rejects event-below-USD-floor without RPC, but eligible event fails closed on RPC outage', async () => {
+  await test('wallet never uses VIRTUAL event SOL for its real-SOL floor and fails closed on RPC outage', async () => {
     const globalCfg = cfg.defaultGlobalConfig();
     const wallet = cfg.normaliseWallet({ name: 'Gate', id: 'gate', enabled: true,
       filters: { minLiquidityUsd: 600, maxLiquidityUsd: 0 } });
@@ -101,13 +107,14 @@ async function check(filters) {
     const ctx = { engine: { traders: new Map([['gate', trader]]), stats: {} } };
     solprice.__setPrice(200, 'test');
     try {
-      const weak = await trader.consider({ mint, initialBuy: 0, vSolInBondingCurve: 2.5 }, ctx);
-      assert.match(weak, /liquidity_below_min_usd/);
-      assert.equal(reads, 0, 'no redundant RPC for an event already below the floor');
       safety._reportCache.clear();
-      const eligible = await trader.consider({ mint, initialBuy: 0, vSolInBondingCurve: 10 }, ctx);
+      const weak = await trader.consider({ mint, initialBuy: 0, vSolInBondingCurve: 2.5 }, ctx);
+      assert.match(weak, /rpc_unavailable|infra|error/, weak);
+      assert.ok(reads > 0, 'an event BELOW the floor still needs a real-SOL RPC read');
+      const before = reads;
+      const eligible = await trader.consider({ mint, initialBuy: 0, vSolInBondingCurve: 30 }, ctx);
       assert.match(eligible, /rpc_unavailable|infra|error/, eligible);
-      assert.ok(reads > 0, 'eligible launch still requires authoritative RPC reads');
+      assert.ok(reads > before, 'an event ABOVE the floor still needs a real-SOL RPC read');
     } finally { solprice.__reset(); }
   });
   await test('no recon RPC on fully populated launch; missing facts still request recon', async () => {

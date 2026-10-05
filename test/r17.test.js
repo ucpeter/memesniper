@@ -35,7 +35,7 @@ const next = () => new Promise((resolve) => setTimeout(resolve, 0));
     const b = feed.note({ mint: 'actual-zero', initialBuy: 0, vSolInBondingCurve: Scanner.finiteEventNumber(0) });
     assert.equal(b.liquiditySol, 0);
     assert.equal(b.liquidityUsd, 0);
-    assert.ok(b.riskScore > 0, 'a truly empty curve is NOT safe');
+    assert.equal(b.riskScore, null, 'zero VIRTUAL SOL is not a measured real deposit');
   });
   await test('wallet stopped: new launches reach public feed, not wallet feed; start evaluates and labels rejection', async () => {
     const engine = Object.create(Engine.prototype);
@@ -84,7 +84,7 @@ const next = () => new Promise((resolve) => setTimeout(resolve, 0));
       assert.deepEqual(feed.rows.get(afterStop.mint).wallets, []);
     } finally { bus.off('scan:final', onFinal); }
   });
-  await test('on a phone, wallet decision precedes numbers and explains curve liquidity', async () => {
+  await test('wallet scanner keeps the previous column order and USD liquidity', async () => {
     const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
     const app = fs.readFileSync(path.join(ROOT, 'public/app.js'), 'utf8');
     const dom = new JSDOM(html.replace('<script src="./app.js"></script>', ''), {
@@ -110,13 +110,13 @@ const next = () => new Promise((resolve) => setTimeout(resolve, 0));
     })()`);
     const table = window.document.querySelector('table');
     const heads = [...table.querySelectorAll('th')].map((x) => x.textContent.trim());
-    assert.match(heads[1], /What Sniper 1 did/);
-    assert.match(heads[3], /Curve liquidity/);
-    assert.match(heads[4], /Info risk/);
+    assert.deepEqual(heads, ['Token', 'Dev hold', 'Liquidity', 'Risk', 'What Sniper 1 did']);
+    assert.ok(!app.includes('wallet-feed-hint'), 'remove the extra explanatory line');
     const first = table.querySelector('tbody tr');
     const cells = [...first.querySelectorAll('td')].map((x) => x.textContent.trim());
-    assert.match(cells[1], /filtered.*liquidity below min usd/is);
-    assert.equal(cells[3], '<$1', 'a small positive curve value must not display as zero');
+    assert.match(cells[4], /filtered.*liquidity below min usd/is);
+    assert.match(cells[2], /<\$1 virtual/, 'a small positive virtual value must not display as zero');
+    assert.match(cells[2], /real unread/, 'real backing is not inferred from a virtual value');
     assert.match(table.querySelectorAll('tbody tr')[1].textContent, /unread/);
     dom.window.close();
   });

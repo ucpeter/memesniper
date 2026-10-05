@@ -722,6 +722,44 @@ async function click(window, el) {
     assert.match(feed.textContent, /2\.0%/, 'dev hold appears on wallet card');
   });
 
+  await test('virtual and real USD remain distinct on the card and in Trades as scans stream live', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1 });
+    window.eval(`S.scanFeed = [{mint:'FIRST_MINT', symbol:'FIRST', liquidityUsd:4500,
+      virtualLiquiditySol:30, realLiquidityUsd:7, realLiquiditySol:0.047,
+      wallets:[{walletId:S.wallets[0].id,name:S.wallets[0].name,action:'filtered',
+        reason:'liquidity_below_min_usd($7<$2000)'}]}]; renderWallets();`);
+    const cardWrap = $('[data-wallet-feed] .tbl-wrap');
+    assert.match(cardWrap.textContent, /\$4,500 virtual/);
+    assert.match(cardWrap.textContent, /\$7 real/);
+    cardWrap.scrollLeft = 140;
+    const overallWrap = $('#overall .tbl-wrap');
+    overallWrap.scrollLeft = 90;
+    window.eval('renderWallets(); renderOverall();');
+    assert.strictEqual($('[data-wallet-feed] .tbl-wrap'), cardWrap, 'heartbeat must leave the card scroller attached');
+    assert.strictEqual(cardWrap.scrollLeft, 140);
+    assert.strictEqual($('#overall .tbl-wrap'), overallWrap, 'unchanged trades board stays attached');
+    assert.strictEqual(overallWrap.scrollLeft, 90);
+
+    window.eval('openWalletDetail(S.wallets[0].id)');
+    const detailWrap = $('[data-live-wallet-feed]');
+    assert.match(detailWrap.textContent, /\$7 real/);
+    detailWrap.scrollLeft = 115;
+    window.eval(`upsertScanRow({mint:'SECOND_MINT', symbol:'SECOND', liquidityUsd:4501,
+      realLiquidityUsd:0, realLiquiditySol:0,
+      wallets:[{walletId:S.wallets[0].id,name:S.wallets[0].name,action:'filtered',
+        reason:'liquidity_below_min_usd($0<$2000)'}]});`);
+    assert.strictEqual($('[data-wallet-feed] .tbl-wrap'), cardWrap, 'new scan patches rows without replacing the card scroller');
+    assert.strictEqual($('[data-live-wallet-feed]'), detailWrap, 'Trades dialog scroller stays attached');
+    assert.strictEqual(cardWrap.scrollLeft, 140);
+    assert.strictEqual(detailWrap.scrollLeft, 115);
+    assert.match(detailWrap.textContent, /SECOND/);
+    assert.match(detailWrap.textContent, /\$0 real/);
+    assert.match($('[data-live-wallet-count]').textContent, /2/);
+    window.eval(`S.wallets[0].stats.bought = 3; renderWallets(); renderOverall();`);
+    assert.strictEqual($('[data-wallet-feed] .tbl-wrap').scrollLeft, 140, 'changed card markup restores horizontal scroll');
+    assert.strictEqual($('#overall .tbl-wrap').scrollLeft, 90, 'changed trades board restores horizontal scroll');
+  });
+
   /* ────────────── withdrawing: who signs it, in plain words ────────────── */
 
   console.log('\nWithdrawing — signed here, or signed by the bot\n');

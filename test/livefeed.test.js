@@ -95,8 +95,9 @@ const candidate = (n) => ({
         report: { liquiditySol: 12.5, devHoldPct: 3.4, top10Pct: 22, honeypot: { risk: 0, notes: [] } },
       });
       const row = feed.snapshot()[0];
-      assert.strictEqual(row.liquiditySol, 12.5, 'liquidity must be shown');
-      assert.strictEqual(row.liquidityUsd, 2500, 'and priced — 12.5 SOL at the pinned $200');
+      assert.strictEqual(row.realLiquiditySol, 12.5, 'real deposited SOL must be shown separately');
+      assert.strictEqual(row.realLiquidityUsd, 2500, 'real SOL priced at the pinned $200');
+      assert.strictEqual(row.virtualLiquidityUsd, null, 'a missing event reserve is not invented');
       assert.strictEqual(row.devHoldPct, 3.4, 'dev holdings must be shown');
       // $2,500 clears the $2,000 floor and 3.4% is well under the 15% ceiling, so
       // the derived score is 0 and the honeypot read's 0 stands.
@@ -121,7 +122,7 @@ const candidate = (n) => ({
       // 2.1 SOL is $420 at the pinned price: under the floor, so the derived risk
       // note joins the honeypot one. Both are reasons this launch is dangerous.
       assert.ok(row.riskNotes.includes('mint_authority_live'), 'the honeypot note survives');
-      assert.ok(row.riskNotes.some((n) => /liquidity \$/.test(n)), 'and the thin liquidity is named too');
+      assert.ok(row.riskNotes.some((n) => /real SOL backing \$/.test(n)), 'and the thin liquidity is named too');
       assert.ok(row.riskScore >= 25, 'the score keeps the worst signal, not the last one');
       assert.strictEqual(row.wallets[0].action, 'skipped');
     });
@@ -194,7 +195,7 @@ const candidate = (n) => ({
       feed.analyze({ wallet: 'Scalper', candidate: c, ok: false, reasons: ['mint_authority_live'], report: { liquiditySol: null, devHoldPct: null } });
 
       const row = feed.snapshot()[0];
-      assert.strictEqual(row.liquiditySol, 4.4, 'a real liquidity figure must survive');
+      assert.strictEqual(row.realLiquiditySol, 4.4, 'a real liquidity figure must survive');
       assert.strictEqual(row.devHoldPct, 9, 'and so must the dev holding');
     });
   });
@@ -232,7 +233,7 @@ const candidate = (n) => ({
   const row = feed.snapshot().find((r) => r.mint === mint);
   assert.ok(row, 'the row exists');
   assert.strictEqual(row.devHoldPct, 7.25, 'dev hold comes from the recon pass');
-  assert.strictEqual(row.liquiditySol, 2.4, 'and so does liquidity');
+  assert.strictEqual(row.realLiquiditySol, 2.4, 'and so does real SOL');
   // The recon pass reports the honeypot risk AND, because $2.4 is not a number
   // anyone can judge, the derived score now runs over the same facts — 2.4 SOL is
   // $480 at the pinned price, under the $2,000 floor, so the derived score is
@@ -240,7 +241,7 @@ const candidate = (n) => ({
   // 2.4 SOL = $480; shortfall (2000-480)/2000 = 0.76 → 12 + 21.3 = 33.
   assert.strictEqual(row.riskScore, 33, 'the risk score takes the worst known signal');
   assert.ok(row.riskNotes.includes('mint_authority_live'), 'the honeypot note is kept');
-  assert.ok(row.riskNotes.some((n) => /liquidity \$480/.test(n)), 'and the dollar figure is in the note');
+  assert.ok(row.riskNotes.some((n) => /real SOL backing \$480/.test(n)), 'and the dollar figure is in the note');
   // It is a fact read, not a verdict: the row must not claim a wallet decided.
   assert.strictEqual(row.decision, 'checking', 'no wallet has decided anything');
   assert.strictEqual(row.wallets.length, 0, 'and no wallet is credited with a verdict');
@@ -258,7 +259,7 @@ test('recon never erases a number a wallet already measured', () => {
   bus.safeEmit('token:recon', { candidate: { mint }, report: { liquiditySol: null, devHoldPct: null, honeypot: null } });
 
   const row = feed.snapshot().find((r) => r.mint === mint);
-  assert.strictEqual(row.liquiditySol, 9.9);
+  assert.strictEqual(row.realLiquiditySol, 9.9);
   assert.strictEqual(row.devHoldPct, 3.3);
   assert.strictEqual(row.riskScore, 60, 'the highest risk seen still wins');
 });
