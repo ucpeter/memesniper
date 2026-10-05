@@ -865,9 +865,11 @@ html, body { max-width: 100%; overflow-x: hidden; }
 
 /* Inline per-wallet decisions stay WITH the wallet, including on phones. */
 .wallet-feed { border-top: 1px solid var(--border-hi); margin-top: 12px; padding-top: 10px; min-width: 0; }
-.wallet-feed-title { font-weight: 700; font-size: 12px; margin-bottom: 7px; }
+.wallet-feed-title { font-weight: 700; font-size: 12px; margin-bottom: 4px; }
+.wallet-feed-hint { font-size: 10px; color: var(--text-mute); line-height: 1.4; margin-bottom: 7px; }
 .wallet-feed-empty { color: var(--text-mute); font-size: 11px; padding: 7px 0; }
-.wallet-feed .scan-tbl { min-width: 460px; }
+.wallet-feed .scan-tbl { min-width: 520px; }
+.wallet-feed .scan-tbl th:nth-child(2), .wallet-feed .scan-tbl td:nth-child(2) { min-width: 138px; }
 .wallet-feed .tbl-wrap { max-height: 270px; overflow: auto; }
 .wallet-feed .scan-tbl td { padding: 6px 7px; }
 .wallet-feed .scan-tbl th { padding: 7px; }
@@ -3630,6 +3632,7 @@ function renderWalletFeeds() {
     const recent = rows.slice(0, 8);
     const body = `<div class="wallet-feed-title">📡 ${esc(w.name)} · pump.fun launches
       <span class="count">${rows.length}</span></div>
+      <div class="wallet-feed-hint">Shows filtered launches too · curve liquidity is not a DEX pool${w.armed ? '' : ' · stopped wallets get no new decisions'}</div>
       ${recent.length ? `<div class="tbl-wrap">${walletFeedTable(w, 8)}</div>`
         : `<div class="wallet-feed-empty">${w.keyLocked
           ? 'Key locked · open this wallet to evaluate launches.'
@@ -3669,8 +3672,8 @@ function walletFeedTable(w, limit = 40) {
   }
   return `<table class="scan-tbl">
     <thead><tr>
-      <th>Token</th><th class="num">Dev hold</th><th class="num">Liquidity</th><th class="num">Risk</th>
-      <th>What ${esc(w.name)} did</th>
+      <th>Token</th><th>What ${esc(w.name)} did</th><th class="num">Dev hold</th>
+      <th class="num" title="Real SOL in the pump.fun bonding curve, converted to USD. Not a separate DEX liquidity pool.">Curve liquidity</th><th class="num" title="Informational risk only; the wallet's decision is shown separately.">Info risk</th>
     </tr></thead>
     <tbody>${rows.map((r) => {
       const v = walletVerdict(r, w);
@@ -3681,18 +3684,18 @@ function walletFeedTable(w, limit = 40) {
           <div class="scan-sym">${esc(r.symbol || 'unknown')}</div>
           <a class="scan-mint mono" href="https://pump.fun/coin/${esc(r.mint)}" target="_blank" rel="noopener noreferrer">${esc(short(r.mint, 4))}</a>
         </td>
+        <td>
+          <span class="badge ${v.cls}" style="padding:1px 7px;font-size:9.5px">${esc(v.label)}</span>
+          ${v.reason ? `<div class="scan-reason" title="${esc(v.reason)}">${esc(shortReason(v.reason))}</div>` : ''}
+        </td>
         <td class="num ${r.devHoldPct === null || r.devHoldPct === undefined ? 'mute' : ''}">
           ${r.devHoldPct === null || r.devHoldPct === undefined ? 'unread' : `${Number(r.devHoldPct).toFixed(1)}%`}
         </td>
         <td class="num ${liqUsd === null ? 'mute' : ''}">
-          ${liqUsd === null ? 'unread' : `${liqUsd.toLocaleString('en-US')}`}
+          ${liqUsd === null ? 'unread' : liqUsd === 0 && Number(r.liquiditySol) > 0 ? '<$1' : `${liqUsd.toLocaleString('en-US')}`}
         </td>
         <td class="num ${risk === null ? 'mute' : risk >= 50 ? 'neg' : risk > 0 ? 'warn' : 'pos'}">
           ${risk === null ? 'unread' : risk}
-        </td>
-        <td>
-          <span class="badge ${v.cls}" style="padding:1px 7px;font-size:9.5px">${esc(v.label)}</span>
-          ${v.reason ? `<div class="scan-reason" title="${esc(v.reason)}">${esc(shortReason(v.reason))}</div>` : ''}
         </td>
       </tr>`;
     }).join('')}</tbody>
@@ -4571,7 +4574,9 @@ function openSettings() {
         <div class="section-label">RPC</div>
         <div class="field"><label>Endpoint(s), one per line</label>
           <textarea id="g_rpc" rows="3">${esc((g.rpc?.endpoints || []).join('\n'))}</textarea>
-          <div class="hint">The public endpoint is heavily rate-limited. A paid endpoint (Helius / Triton / QuickNode) is effectively required for real sniping.</div></div>
+          <div class="hint">A reliable private RPC is needed for safety checks and exits. Render's RPC_URL, if set, always runs first; other endpoints follow, then the public fallback. Saving these Settings now refreshes the active connection. Saved URLs are masked in this form; replace a line to change one.</div></div>
+        <button type="button" class="btn btn-sm" id="g_rpc_probe">Test on-chain RPC</button>
+        <div id="g_rpc_result" class="hint" aria-live="polite" style="margin:8px 0 14px">Tests getAccountInfo on each endpoint without sending a trade or showing endpoint keys.</div>
         <div class="field"><label>WebSocket endpoint (for log-based scanning)</label>
           <input type="text" id="g_rpcws" value="${esc(g.rpc?.wsEndpoint || '')}"/></div>
 
@@ -4619,6 +4624,22 @@ function openSettings() {
       closeModal();
     };
 
+    q('#g_rpc_probe').onclick = async () => {
+      const btn = q('#g_rpc_probe');
+      const out = q('#g_rpc_result');
+      btn.disabled = true;
+      out.textContent = 'Testing the same getAccountInfo read used by wallet safety…';
+      try {
+        const diag = await api('/api/rpc/diagnostics', { method: 'POST' });
+        const rows = (diag.results || []).map((r) =>
+          `<div>${esc(r.label)}: <b class="${r.ok ? 'pos' : 'neg'}">${esc(r.status)}</b></div>`).join('');
+        out.innerHTML = rows + (diag.omitted ? `<div>${diag.omitted} additional endpoint(s) not tested.</div>` : '') +
+          (diag.envPriority ? '<div>Render RPC_URL has priority over the Settings list.</div>' : '') +
+          '<div>One successful read proves reachability now, not uninterrupted future safety checks.</div>';
+      } catch { out.textContent = 'Diagnostic unavailable. Check Render logs and restart the service.'; }
+      finally { btn.disabled = false; }
+    };
+
     q('#g_probe').onclick = async () => {
       toast('Probing AI provider…', '');
       try {
@@ -4639,7 +4660,7 @@ function openSettings() {
       };
       try {
         S.config = await api('/api/config', { method: 'PUT', body: JSON.stringify(body) });
-        toast('Settings saved', ''); closeModal();
+        toast('Settings saved · active RPC connection refreshed', ''); closeModal();
       } catch (err) { toast(err.message, 'err'); }
     };
   });
