@@ -176,7 +176,7 @@ function defaultGlobalConfig() {
      * not change depending on which wallet happens to be enabled. */
     risk: {
       maxDevHoldPct: 15,     // dev's opening buy, % of the 1e9 supply
-      minLiquidityUsd: 2000, // curve liquidity floor, in dollars
+      minLiquidityUsd: 2000, // REAL deposited SOL floor in USD; never virtual curve SOL
     },
   };
 }

@@ -176,6 +176,8 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
       rows: rows.map((r) => ({
         mint: r.mint, symbol: r.symbol, devWallet: r.devWallet,
         devHoldPct: r.devHoldPct, liquidityUsd: r.liquidityUsd,
+        virtualLiquiditySol: r.virtualLiquiditySol, virtualLiquidityUsd: r.virtualLiquidityUsd,
+        realLiquiditySol: r.realLiquiditySol, realLiquidityUsd: r.realLiquidityUsd,
         liquidityApprox: r.solUsdSource === 'fallback' || Boolean(r.solUsdStale),
         riskScore: deriveRisk(r, { maxDevHoldPct: 15, minLiquidityUsd: 2000 }).score,
         detectedAt: r.detectedAt,
