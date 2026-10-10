@@ -246,37 +246,16 @@ async function checkDistribution(conn, mint, curvePda, supply, tokenProgram = TO
     if ((reserveAmount || 0n) + listedAmount > minted) {
       return { pass: false, confidence: 'INFRA', skipped: 'distribution_inconsistent' };
     }
-    // The ten sampled token ACCOUNTS are only a lower bound for the top ten
-    // OWNERS. An owner can control multiple accounts and smaller unlisted ones.
-    let ownersVerified = false;
-    let uniqueHolderSample = null;
-    let amounts = entries.map((a) => BigInt(a.amount));
-    if (conn.getMultipleAccountsInfo && entries.length) {
-      const infos = await conn.getMultipleAccountsInfo(entries.map((a) => a.address), 'confirmed');
-      if (Array.isArray(infos) && infos.length === entries.length) {
-        const byOwner = new Map();
-        ownersVerified = infos.every((info, i) => {
-          const data = info?.data;
-          if (!Buffer.isBuffer(data) || data.length < 72 ||
-              !data.subarray(0, 32).equals(new PublicKey(mint).toBuffer()) ||
-              !info.owner?.equals(tokenProgram) || data.readBigUInt64LE(64) !== BigInt(entries[i].amount)) return false;
-          const owner = new PublicKey(data.subarray(32, 64)).toBase58();
-          byOwner.set(owner, (byOwner.get(owner) || 0n) + BigInt(entries[i].amount));
-          return true;
-        });
-        if (ownersVerified) {
-          amounts = [...byOwner.values()].sort((x, y) => x === y ? 0 : x > y ? -1 : 1);
-          uniqueHolderSample = byOwner.size;
-        }
-      }
-    }
+    // Sampled token accounts give a lower bound for top-ten owners; the full
+    // circulating supply gives an upper bound. Neither requires waiting for
+    // other buyers or for eight distinct token holders to appear.
+    const amounts = entries.map((a) => BigInt(a.amount));
     const top10 = amounts.slice(0, 10).reduce((acc, n) => acc + n, 0n);
     return {
-      pass: true, confidence: 'HEUR', ownersVerified,
-      top10Pct: pct(top10), // lower bound only
+      pass: true, confidence: 'HEUR',
+      top10Pct: pct(top10), // lower bound; do not label as an exact owner count
       top10UpperPct: reserveAmount === null ? null : pct(minted - reserveAmount),
-      uniqueHolderSample,
-      holderSample: entries.length,
+      holderSample: entries.length, // token ACCOUNT count, not a holder minimum
       largestHolderPct: amounts.length ? pct(amounts[0]) : 0,
     };
   } catch (err) {
@@ -573,8 +552,8 @@ async function evaluate(candidate, cfg, ctx) {
   const priced = quote.ok && !quote.stale && Number.isFinite(quote.usd) && quote.usd > 0;
   const liquidityUsd = priced ? liquiditySol * quote.usd : null;
   if (f.minLiquidityUsd !== undefined && f.minLiquidityUsd !== null) {
-    if (!priced) hardFails.push('sol_usd_quote_unavailable');
-    else if (liquidityUsd < f.minLiquidityUsd) hardFails.push(`liquidity_below_min_usd($${liquidityUsd.toFixed(0)}<$${f.minLiquidityUsd})`);
+    if (f.minLiquidityUsd > 0 && !priced) hardFails.push('sol_usd_quote_unavailable');
+    else if (priced && liquidityUsd < f.minLiquidityUsd) hardFails.push(`liquidity_below_min_usd($${liquidityUsd.toFixed(0)}<$${f.minLiquidityUsd})`);
   } else if (liquiditySol < f.minLiquiditySol) {
     hardFails.push(`liquidity_below_min(${liquiditySol.toFixed(2)})`);
   }
@@ -614,10 +593,6 @@ async function evaluate(candidate, cfg, ctx) {
   else if (devHoldPct > f.maxDevHoldPct) hardFails.push(`dev_hold_high(${devHoldPct.toFixed(1)}%>${f.maxDevHoldPct}%)`);
   if (!distribution.pass) hardFails.push(distribution.skipped || 'distribution_unread');
   else {
-    if (!distribution.ownersVerified) hardFails.push('holders_unverified');
-    else if (distribution.uniqueHolderSample < f.minHolders) {
-      hardFails.push(`holders_below_min(${distribution.uniqueHolderSample}<${f.minHolders})`);
-    }
     if (distribution.top10Pct > f.maxTop10HoldersPct) {
       hardFails.push(`top10_concentrated(${distribution.top10Pct.toFixed(1)}%>${f.maxTop10HoldersPct}%)`);
     } else if (distribution.top10UpperPct === null || distribution.top10UpperPct > f.maxTop10HoldersPct) {
