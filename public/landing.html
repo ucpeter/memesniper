@@ -175,7 +175,7 @@
     </div>
     <p class="launch-note">New tokens appear automatically. Risk is informational, not a trade decision.</p>
     <div class="launch-table-wrap"><table class="launch-table">
-      <thead><tr><th>Token</th><th>Dev</th><th>Dev hold</th><th>Liquidity (USD)<span class="minor">virtual / real</span></th><th>Risk</th></tr></thead>
+      <thead><tr><th>Token</th><th>Dev</th><th>Dev hold<span class="minor">current / opening</span></th><th>Liquidity (USD)<span class="minor">virtual / real</span></th><th>Risk</th></tr></thead>
       <tbody id="launchRows"><tr><td colspan="5">Waiting for the feed…</td></tr></tbody>
     </table></div>
     <p class="launch-foot">Open a wallet in the <a href="/terminal">Terminal</a> to see launches filtered by that wallet and what it bought.</p>
@@ -266,7 +266,11 @@
         a.target = '_blank'; a.rel = 'noopener noreferrer';
         add(token, 'span', row.mint ? row.mint.slice(0, 5) + '…' + row.mint.slice(-5) : '—', 'minor');
         add(tr.insertCell(), 'span', row.devWallet ? row.devWallet.slice(0, 5) + '…' + row.devWallet.slice(-4) : '—', 'mono');
-        add(tr.insertCell(), 'span', row.devHoldPct == null ? 'unread' : Number(row.devHoldPct).toFixed(1) + '%');
+        const devCell = tr.insertCell();
+        add(devCell, 'span', row.currentDevHoldPct == null ? 'current unread' :
+          Number(row.currentDevHoldPct).toFixed(1) + '% current');
+        add(devCell, 'span', row.devHoldPct == null ? 'opening unread' :
+          Number(row.devHoldPct).toFixed(1) + '% opening', 'minor');
         const liqCell = tr.insertCell();
         add(liqCell, 'span', row.liquidityUsd == null ? 'virtual unread' :
           (Number(row.liquidityUsd) === 0 && Number(row.virtualLiquiditySol) > 0
