@@ -160,6 +160,80 @@ const candidate = (n) => ({
     });
   });
 
+  await test('a completed wallet evaluation never remains "evaluating" after any early skip', () => {
+    withFeed((feed) => {
+      const c = candidate('early'); feed.note(c);
+      feed.start({ mint: c.mint, walletIds: ['w1', 'w2'], walletNames: ['First', 'Second'] });
+      feed.analyze({ walletId: 'w1', wallet: 'First', candidate: c, ok: true,
+        report: { liquiditySol: 14, devHoldPct: 2 } });
+      feed.finalize({ mint: c.mint, outcomes: ['skip:balance_unknown', 'skip:cooldown'],
+        walletIds: ['w1', 'w2'], walletNames: ['First', 'Second'] });
+      const row = feed.snapshot()[0];
+      assert.strictEqual(row.decision, DECISION.SKIPPED);
+      assert.deepStrictEqual(row.wallets.map((w) => w.action), ['skipped', 'skipped']);
+      assert.deepStrictEqual(row.wallets.map((w) => w.reason), ['balance_unknown', 'cooldown']);
+      assert.ok(row.decidedAt, 'once completed, the verdict has a timestamp');
+    });
+  });
+
+  await test('the feed names the current evaluation step instead of hiding it', () => {
+    withFeed((feed) => {
+      const c = candidate('phase'); feed.note(c);
+      feed.start({ mint: c.mint, walletNames: ['First'], walletIds: ['w1'] });
+      feed.stage({ candidate: c, wallet: 'First', walletId: 'w1', stage: 'Reading wallet balance' });
+      assert.equal(feed.snapshot()[0].wallets[0].stage, 'Reading wallet balance');
+      feed.finalize({ mint: c.mint, outcomes: ['skip:balance_unknown'],
+        walletNames: ['First'], walletIds: ['w1'] });
+      assert.equal(feed.snapshot()[0].wallets[0].action, 'skipped');
+    });
+  });
+
+  await test('a slow evaluation is labelled pending, and its final result supersedes it', () => {
+    withFeed((feed) => {
+      const c = candidate('slow'); feed.note(c);
+      feed.start({ mint: c.mint, walletNames: ['First'], walletIds: ['w1'] });
+      feed.slow({ mint: c.mint, walletNames: ['First'], walletIds: ['w1'] });
+      assert.strictEqual(feed.snapshot()[0].wallets[0].action, 'slow');
+      assert.strictEqual(feed.snapshot()[0].decidedAt, null);
+      feed.finalize({ mint: c.mint, outcomes: ['skip:eval_timeout'],
+        walletNames: ['First'], walletIds: ['w1'] });
+      assert.strictEqual(feed.snapshot()[0].wallets[0].action, 'timed_out');
+      assert.strictEqual(feed.snapshot()[0].decision, DECISION.ERROR);
+    });
+  });
+
+  await test('an unresolved evaluation stops saying "evaluating" and can still accept a late result', () => {
+    withFeed((feed) => {
+      const c = candidate('stalled'); feed.note(c);
+      feed.start({ mint: c.mint, walletNames: ['First'], walletIds: ['w1'] });
+      feed.stalled({ mint: c.mint, walletNames: ['First'], walletIds: ['w1'] });
+      assert.equal(feed.snapshot()[0].wallets[0].action, 'unconfirmed');
+      assert.equal(feed.snapshot()[0].wallets[0].pendingFinal, true);
+      assert.equal(feed.snapshot()[0].decision, DECISION.ERROR);
+      feed.finalize({ mint: c.mint, outcomes: ['skip:balance_unknown'],
+        walletNames: ['First'], walletIds: ['w1'] });
+      assert.equal(feed.snapshot()[0].wallets[0].action, 'skipped');
+      assert.equal(feed.snapshot()[0].wallets[0].pendingFinal, undefined);
+      assert.equal(feed.snapshot()[0].decision, DECISION.SKIPPED);
+    });
+  });
+
+  await test('submitted but unconfirmed is NOT bought or a verified skip; a later position can correct it', () => {
+    withFeed((feed) => {
+      const c = candidate('unconfirmed'); feed.note(c);
+      feed.start({ mint: c.mint, walletNames: ['First'], walletIds: ['w1'] });
+      const signature = '3'.repeat(87);
+      feed.finalize({ mint: c.mint, outcomes: [`buy_unconfirmed:${signature}`],
+        walletNames: ['First'], walletIds: ['w1'] });
+      assert.strictEqual(feed.snapshot()[0].wallets[0].action, 'unconfirmed');
+      assert.strictEqual(feed.snapshot()[0].wallets[0].txSignature, signature);
+      assert.strictEqual(feed.snapshot()[0].decision, DECISION.ERROR);
+      feed.bought({ mint: c.mint, wallet: 'First', walletId: 'w1' });
+      assert.strictEqual(feed.snapshot()[0].wallets[0].action, 'bought');
+      assert.strictEqual(feed.snapshot()[0].decision, DECISION.BOUGHT);
+    });
+  });
+
   await test('newest first, and the ring is bounded', () => {
     const feed = new LiveFeed({ max: 3 }).attach();
     for (let i = 1; i <= 5; i += 1) feed.note(candidate(10 + i));
@@ -168,6 +242,19 @@ const candidate = (n) => ({
     assert.strictEqual(rows[0].symbol, 'TOK15', 'the newest launch must be at the top');
     assert.strictEqual(rows[2].symbol, 'TOK13');
     feed.clear();
+  });
+
+  await test('an in-flight wallet evaluation survives newer launches without unbounded memory', () => {
+    const feed = new LiveFeed({ max: 3 });
+    const first = candidate('inflight');
+    feed.note(first);
+    feed.start({ mint: first.mint, walletNames: ['First'], walletIds: ['w1'] });
+    for (let i = 0; i < 5; i += 1) feed.note(candidate(`new${i}`));
+    assert.equal(feed.size, 3, 'memory remains bounded');
+    assert.ok(feed.rows.has(first.mint), 'pending result is not discarded in a launch storm');
+    feed.stalled({ mint: first.mint, walletNames: ['First'], walletIds: ['w1'] });
+    feed.note(candidate('newFinal'));
+    assert.ok(!feed.rows.has(first.mint), 'unknown outcomes eventually become evictable');
   });
 
   await test('the same mint is one row, however many wallets look at it', () => {

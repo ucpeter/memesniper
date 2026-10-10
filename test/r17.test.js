@@ -84,6 +84,64 @@ const next = () => new Promise((resolve) => setTimeout(resolve, 0));
       assert.deepEqual(feed.rows.get(afterStop.mint).wallets, []);
     } finally { bus.off('scan:final', onFinal); }
   });
+  await test('queue watchdog marks pending at deadline, then reports a late skip honestly', async () => {
+    const engine = Object.create(Engine.prototype);
+    engine.running = true;
+    engine.config = { global: { scanner: { evaluateConcurrency: 1, evalTimeoutMs: 100, unresolvedWarnMs: 210 } } };
+    engine.stats = { detected: 0, evaluated: 0, bought: 0, skipped: 0, evalTimeouts: 0 };
+    engine._evalQueue = 0;
+    engine._recon = () => {};
+    let finish;
+    const t = { cfg: { id: 'slow', name: 'Slow wallet', enabled: true }, stats: { paused: false },
+      consider: () => new Promise((resolve) => { finish = resolve; }) };
+    engine.traders = new Map([['slow', t]]);
+    const feed = new LiveFeed();
+    const handlers = [['scan:started', (e) => feed.start(e)],
+      ['scan:slow', (e) => feed.slow(e)], ['scan:stalled', (e) => feed.stalled(e)],
+      ['scan:final', (e) => feed.finalize(e)]];
+    for (const [event, fn] of handlers) bus.on(event, fn);
+    try {
+      const launch = { mint: 'slow-launch', initialBuy: 0, vSolInBondingCurve: 30 };
+      feed.note(launch);
+      engine._onToken(launch);
+      await next();
+      assert.equal(feed.snapshot()[0].wallets[0].action, 'checking');
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      assert.equal(engine._evalQueue, 0, 'watchdog frees the scanner queue');
+      assert.equal(feed.snapshot()[0].wallets[0].action, 'slow', 'not falsely marked as skipped');
+      await new Promise((resolve) => setTimeout(resolve, 110));
+      assert.equal(feed.snapshot()[0].wallets[0].action, 'unconfirmed', 'eventual unknown is not infinite evaluating');
+      finish('skip:balance_unknown');
+      await next();
+      assert.equal(feed.snapshot()[0].wallets[0].action, 'skipped');
+      assert.equal(feed.snapshot()[0].wallets[0].reason, 'balance_unknown');
+    } finally { for (const [event, fn] of handlers) bus.off(event, fn); }
+  });
+
+  await test('one rejecting wallet cannot freeze another wallet or the final scan', async () => {
+    const engine = Object.create(Engine.prototype);
+    engine.running = true;
+    engine.config = { global: { scanner: { evaluateConcurrency: 1, evalTimeoutMs: 500 } } };
+    engine.stats = { detected: 0, evaluated: 0, bought: 0, skipped: 0 };
+    engine._evalQueue = 0;
+    engine._recon = () => {};
+    engine.traders = new Map([
+      ['broken', { cfg: { id: 'broken', name: 'Broken', enabled: true }, stats: { paused: false },
+        consider: async () => { throw new Error('test_only'); } }],
+      ['healthy', { cfg: { id: 'healthy', name: 'Healthy', enabled: true }, stats: { paused: false },
+        consider: async () => 'skip:cooldown' }],
+    ]);
+    let finished;
+    const onFinal = (evt) => { finished = evt; };
+    bus.on('scan:final', onFinal);
+    try {
+      engine._onToken({ mint: 'caught-error', initialBuy: 0, vSolInBondingCurve: 30 });
+      await next();
+      assert.deepEqual(finished.outcomes, ['error:evaluation_failed', 'skip:cooldown']);
+      assert.deepEqual(finished.walletIds, ['broken', 'healthy']);
+    } finally { bus.off('scan:final', onFinal); }
+  });
+
   await test('wallet scanner keeps the previous column order and USD liquidity', async () => {
     const html = fs.readFileSync(path.join(ROOT, 'public/index.html'), 'utf8');
     const app = fs.readFileSync(path.join(ROOT, 'public/app.js'), 'utf8');

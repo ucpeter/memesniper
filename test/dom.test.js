@@ -760,6 +760,22 @@ async function click(window, el) {
     assert.strictEqual($('#overall .tbl-wrap').scrollLeft, 90, 'changed trades board restores horizontal scroll');
   });
 
+  await test('Trades replaces evaluating with a real final verdict and keeps more than eight rows', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1 });
+    window.eval(`S.scanFeed = Array.from({length:15}, (_,i) => ({ mint:'MINT_' + i,
+      symbol: 'TOK' + i, liquidityUsd: 4500, realLiquidityUsd: i,
+      wallets:[{walletId:S.wallets[0].id,name:S.wallets[0].name,action:'checking'}] }));
+      renderWallets(); openWalletDetail(S.wallets[0].id);`);
+    const dialog = $('[data-live-wallet-feed]');
+    assert.strictEqual(dialog.querySelectorAll('tbody tr').length, 15);
+    assert.strictEqual($('[data-wallet-feed] .scan-tbl').querySelectorAll('tbody tr').length, 8);
+    assert.match(dialog.textContent, /evaluating/i);
+    window.eval(`upsertScanRow({ ...S.scanFeed[0], wallets:[{walletId:S.wallets[0].id,
+      name:S.wallets[0].name,action:'skipped',reason:'balance_unknown'}], decidedAt:Date.now() });`);
+    assert.match(dialog.querySelector('tbody tr').textContent, /skipped.*balance unknown/is);
+    assert.doesNotMatch(dialog.querySelector('tbody tr').textContent, /evaluating/i);
+  });
+
   /* ────────────── withdrawing: who signs it, in plain words ────────────── */
 
   console.log('\nWithdrawing — signed here, or signed by the bot\n');

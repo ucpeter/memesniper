@@ -175,6 +175,30 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
     assert.ok(p.tokensHeld > 0n, 'position should hold tokens');
   });
 
+  await test('a stale evaluation can NEVER initiate a late buy after its deadline', async () => {
+    const { trader, executor } = makeTrader('balanced', NO_COOLDOWN);
+    const prev = safety.evaluate;
+    try {
+      safety.evaluate = async (...args) => {
+        await new Promise((resolve) => setTimeout(resolve, 18));
+        return prev(...args);
+      };
+      const result = await trader.consider({ ...CANDIDATE, mint: 'ExpiredMint11111111111111111111111111111111111' },
+        { engine: ENGINE, entryDeadlineAt: Date.now() + 3 });
+      assert.strictEqual(result, 'skip:eval_timeout');
+      assert.strictEqual(executor.fills.length, 0, 'no order may be sent after expiry');
+    } finally { safety.evaluate = prev; }
+  });
+
+  await test('a submitted but unconfirmed buy is not recorded as a managed position', async () => {
+    const { trader, executor } = makeTrader('balanced', NO_COOLDOWN);
+    executor.signAndSend = async () => ({ ok: false, signature: '3'.repeat(87), error: 'confirmation_timeout' });
+    const outcome = await trader.consider({ ...CANDIDATE, mint: 'UnconfirmedMint111111111111111111111111111111' },
+      { engine: ENGINE });
+    assert.match(outcome, /^buy_unconfirmed:/);
+    assert.strictEqual(trader.openPositions().length, 0, 'never pretend an unconfirmed order is a fill');
+  });
+
   await test('same mint cannot be bought twice by the same wallet', async () => {
     const { trader } = makeTrader('balanced', NO_COOLDOWN);
     await trader.consider(CANDIDATE, { engine: ENGINE });
