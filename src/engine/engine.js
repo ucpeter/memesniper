@@ -224,41 +224,53 @@ class Engine {
     // Hard ceiling on how long one token may hold a slot. Without this, a
     // stalled RPC call leaks the slot forever and the engine quietly stops
     // evaluating new launches — it looks alive while doing nothing at all.
-    const EVAL_TIMEOUT_MS = this.config.global.scanner.evalTimeoutMs || 8000;
-    const timeout = new Promise((resolve) => {
-      const t = setTimeout(() => resolve(['skip:eval_timeout']), EVAL_TIMEOUT_MS);
-      if (t.unref) t.unref();
+    const EVAL_TIMEOUT_MS = Math.max(100, Number(this.config.global.scanner.evalTimeoutMs) || 8000);
+    const walletNames = activeTraders.map((t) => t.cfg.name);
+    const walletIds = activeTraders.map((t) => t.cfg.id);
+    const ctx = { engine: this, entryDeadlineAt: Date.now() + EVAL_TIMEOUT_MS };
+    // Start a decision for each ACTIVE wallet, not stopped wallets. A wallet
+    // rejected before safety.analyze() (cooldown/balance) still gets a verdict.
+    bus.safeEmit('scan:started', { mint: candidate.mint, walletNames, walletIds });
+    const evaluation = Promise.all(activeTraders.map((t) => Promise.resolve()
+      .then(() => t.consider(candidate, ctx))
+      .catch((err) => {
+        log.error(`Evaluation failed for ${candidate.mint.slice(0, 8)} (${t.cfg.name}): ${err.message}`);
+        // An unexpected exception is NOT evidence that no order was submitted.
+        return 'error:evaluation_failed';
+      })));
+    let timer;
+    const unresolvedMs = Math.max(EVAL_TIMEOUT_MS + 100,
+      Number(this.config.global.scanner.unresolvedWarnMs) || 45_000);
+    const unresolvedTimer = setTimeout(() => {
+      bus.safeEmit('scan:stalled', { mint: candidate.mint, walletNames, walletIds });
+    }, unresolvedMs);
+    if (unresolvedTimer.unref) unresolvedTimer.unref();
+    const slow = new Promise((resolve) => {
+      timer = setTimeout(() => resolve('slow'), EVAL_TIMEOUT_MS);
+      if (timer.unref) timer.unref();
     });
-
-    const evaluation = Promise.all(activeTraders.map((t) => t.consider(candidate, { engine: this })));
-
-    // The timeout exists ONLY to free the queue slot. The underlying evaluation
-    // keeps running — and may still buy — so it must own the accounting, or a
-    // late fill would go uncounted while the slot reported a "timeout".
-    Promise.race([evaluation, timeout]).then((outcome) => {
-      if (Array.isArray(outcome) && outcome.includes('skip:eval_timeout')) {
+    // Release only the scanner queue slot at the deadline. The in-flight work
+    // may have already SUBMITTED a buy, so never declare it skipped merely
+    // because confirmation/RPC is slow. Let the eventual result update the row.
+    Promise.race([evaluation.then(() => 'done'), slow]).then((state) => {
+      if (state === 'slow') {
         this.stats.evalTimeouts = (this.stats.evalTimeouts || 0) + 1;
+        bus.safeEmit('scan:slow', { mint: candidate.mint, walletNames, walletIds });
       }
-    }).finally(() => { this._evalQueue -= 1; });
+    }).finally(() => { clearTimeout(timer); this._evalQueue -= 1; });
 
-    evaluation
-      .then((outcomes) => {
-        const bought = outcomes.filter((o) => o === 'bought').length;
-        this.stats.evaluated += 1;
-        this.stats.bought += bought;
-        this.stats.skipped += outcomes.filter((o) => o.startsWith('skip:')).length;
-        // Close the live-feed row for this launch. This is the only place that
-        // knows the verdict of EVERY wallet, which is what separates "every wallet
-        // declined" from "one of them took it".
-        bus.safeEmit('scan:final', {
-          mint: candidate.mint,
-          outcomes,
-          walletNames: activeTraders.map((t) => t.cfg.name),
-          walletIds: activeTraders.map((t) => t.cfg.id),
-        });
-        if (bought) bus.safeEmit('engine:stats', this.stats);
-      })
-      .catch((err) => log.error(`Evaluation pipeline error: ${err.message}`));
+    evaluation.then((outcomes) => {
+      clearTimeout(unresolvedTimer);
+      const bought = outcomes.filter((o) => o === 'bought').length;
+      this.stats.evaluated += 1;
+      this.stats.bought += bought;
+      this.stats.skipped += outcomes.filter((o) => o.startsWith('skip:')).length;
+      bus.safeEmit('scan:final', { mint: candidate.mint, outcomes, walletNames, walletIds });
+      if (bought) bus.safeEmit('engine:stats', this.stats);
+    }).catch((err) => {
+      clearTimeout(unresolvedTimer);
+      log.error(`Evaluation pipeline error: ${err.message}`);
+    });
   }
 
   /**

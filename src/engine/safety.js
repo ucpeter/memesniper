@@ -527,8 +527,12 @@ async function evaluate(candidate, cfg, ctx) {
   }
 
   /* ---- HEUR / EXT scoring ---- */
-  const distribution = await checkDistribution(conn, candidate.mint, bondingCurvePda(candidate.mint));
-  const metadata = await checkMetadata(candidate.mint, { blockCopycatNames: f.blockCopycatNames });
+  // Independent holder and metadata checks can run together; waiting for them
+  // serially needlessly delays time-sensitive entries without changing filters.
+  const [distribution, metadata] = await Promise.all([
+    checkDistribution(conn, candidate.mint, bondingCurvePda(candidate.mint)),
+    checkMetadata(candidate.mint, { blockCopycatNames: f.blockCopycatNames }),
+  ]);
   const devHoldPct = estimateDevHold(distribution);
 
   if (devHoldPct !== null && devHoldPct > f.maxDevHoldPct) {

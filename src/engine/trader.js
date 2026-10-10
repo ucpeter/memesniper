@@ -123,6 +123,12 @@ class Trader {
    */
   async consider(candidate, ctx) {
     const g = this.getConfig();
+    // The engine's queue timeout is not cancellation: RPCs can finish MUCH
+    // later. Never initiate a fresh buy after the permitted entry window.
+    const expired = () => Number.isFinite(ctx?.entryDeadlineAt) && Date.now() >= ctx.entryDeadlineAt;
+    const progress = (stage) => bus.safeEmit('token:stage', {
+      candidate, walletId: this.cfg.id, wallet: this.cfg.name, stage,
+    });
 
     /* 1 — never double-enter the same mint from this wallet. Checked first
      *     because it is the most specific reason and should not be masked by
@@ -156,6 +162,7 @@ class Trader {
         return `skip:${reason}`;
       }
     }
+    progress('Reading on-chain safety checks');
     const verdict = await safety.evaluate(candidate, this.cfg, { conn: this.executor.conn(), config: g });
     // Publish what the checks actually found, pass or fail. The live scanner view
     // shows dev holdings, liquidity and honeypot risk per launch; without this a row
@@ -201,7 +208,10 @@ class Trader {
       return `skip:${verdict.reasons[0] || 'filters'}`;
     }
 
+    if (expired()) return 'skip:eval_timeout';
+
     /* 4 — AI veto layer (can only veto, never size up) */
+    progress('Reviewing token risk');
     const aiResult = await ai.review(candidate, verdict.report, g.ai, this.cfg.ai);
     if (aiResult.verdict !== 'allow') {
       log.debug(`AI vetoed ${candidate.symbol || candidate.mint.slice(0, 6)}: ${aiResult.primaryRisk || aiResult.detail}`, { wallet: this.cfg.name });
@@ -209,8 +219,12 @@ class Trader {
       return `skip:ai_${aiResult.primaryRisk || aiResult.detail}`;
     }
 
+    if (expired()) return 'skip:eval_timeout';
+
     /* 5 — size it */
+    progress('Reading wallet balance');
     await this.refreshBalance();
+    if (expired()) return 'skip:eval_timeout';
     // In live mode an unreadable balance must not be treated as spendable, nor
     // as empty. Refuse the trade, but say why, so it is never misreported as
     // "insufficient balance".
@@ -227,10 +241,11 @@ class Trader {
     if (sizeSol <= 0.001) return 'skip:size_too_small';
 
     /* 6 — execute */
-    return this._executeBuy(candidate, sizeSol, verdict.report, aiResult);
+    progress('Preparing a buy');
+    return this._executeBuy(candidate, sizeSol, verdict.report, aiResult, ctx);
   }
 
-  async _executeBuy(candidate, sizeSol, report, aiResult) {
+  async _executeBuy(candidate, sizeSol, report, aiResult, ctx) {
     const g = this.getConfig();
     const mint = candidate.mint;
 
@@ -250,7 +265,9 @@ class Trader {
       const provider = this._providerFor(g);
       let result;
 
+      if (Number.isFinite(ctx?.entryDeadlineAt) && Date.now() >= ctx.entryDeadlineAt) return 'skip:eval_timeout';
       if (this.executor.dryRun) {
+        bus.safeEmit('token:stage', { candidate, walletId: this.cfg.id, wallet: this.cfg.name, stage: 'Recording simulated buy' });
         result = await this.executor.signAndSend({
           walletId: this.cfg.id,
           tx: { dry: true },
@@ -272,6 +289,10 @@ class Trader {
           computeUnitLimit: g.execution.computeUnitLimit,
           creator: candidate.creator,
         });
+        // Building can involve network calls. Recheck BEFORE the first possible
+        // submission, not after it; an in-flight order must be allowed to resolve.
+        if (Number.isFinite(ctx?.entryDeadlineAt) && Date.now() >= ctx.entryDeadlineAt) return 'skip:eval_timeout';
+        bus.safeEmit('token:stage', { candidate, walletId: this.cfg.id, wallet: this.cfg.name, stage: 'Submitting or confirming buy' });
         result = await this.executor.signAndSend({
           walletId: this.cfg.id,
           tx: built.tx,
@@ -281,7 +302,11 @@ class Trader {
 
       if (!result.ok) {
         bus.safeEmit('trade:failed', { walletId: this.cfg.id, side: 'buy', mint, error: result.error });
-        return `buy_failed:${result.error}`;
+        if (result.signature) {
+          log.warn(`Buy ${result.signature} was submitted but not confirmed. Check its chain status and wallet holdings; no managed position was recorded.`, { wallet: this.cfg.name });
+          return `buy_unconfirmed:${result.signature}`;
+        }
+        return 'buy_failed';
       }
 
       // Actual fill: in live mode read it from chain, otherwise use the curve estimate.
@@ -340,7 +365,9 @@ class Trader {
       return 'bought';
     } catch (err) {
       log.error(`Buy threw for ${mint.slice(0, 8)}: ${err.message}`, { wallet: this.cfg.name });
-      return `buy_error:${err.message}`;
+      // A provider can throw after a broadcast was attempted: the absence of a
+      // recorded position does not prove the chain rejected the transaction.
+      return 'buy_error';
     }
   }
 

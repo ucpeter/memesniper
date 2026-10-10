@@ -119,6 +119,10 @@ class LiveFeed {
     this._bound = true;
 
     bus.on('token:detected', (c) => this.note(c));
+    bus.on('scan:started', (e) => this.start(e));
+    bus.on('scan:slow', (e) => this.slow(e));
+    bus.on('scan:stalled', (e) => this.stalled(e));
+    bus.on('token:stage', (e) => this.stage(e));
     bus.on('token:recon', (e) => this.recon(e));
     bus.on('token:analyzed', (e) => this.analyze(e));
     bus.on('token:skipped', (e) => this.skip(e));
@@ -355,31 +359,123 @@ class LiveFeed {
     return row;
   }
 
-  /**
-   * Every wallet has finished evaluating. Called by the engine once the evaluation
-   * promise settles, because only there is it known whether ANY wallet bought.
-   */
+  /** The engine admitted a token to the entry queue for these wallets only. */
+  start({ mint, walletNames = [], walletIds = [] }) {
+    const row = mint ? this.rows.get(mint) : null;
+    if (!row) return null;
+    walletNames.forEach((name, i) => this._pushWallet(row, name, 'checking', null, walletIds[i]));
+    this._emit(row);
+    return row;
+  }
+
+  /** Progress is informational, not a verdict or permission to trade. */
+  stage({ candidate, walletId, wallet, stage }) {
+    const row = candidate?.mint ? this.rows.get(candidate.mint) : null;
+    if (!row) return null;
+    const entry = row.wallets.find((w) => walletId && w.walletId
+      ? w.walletId === walletId : w.name === wallet);
+    if (entry && ['checking', 'slow'].includes(entry.action)) {
+      entry.stage = stage;
+      this._emit(row);
+    }
+    return row;
+  }
+
+  /** A slow read or in-flight submission is NOT a confirmed skip or buy. */
+  slow({ mint, walletNames = [], walletIds = [] }) {
+    const row = mint ? this.rows.get(mint) : null;
+    if (!row || row.decidedAt) return row;
+    walletNames.forEach((name, i) => {
+      const mine = row.wallets.find((w) => walletIds[i] && w.walletId
+        ? w.walletId === walletIds[i] : w.name === name);
+      if (!mine || mine.action === 'checking') {
+        this._pushWallet(row, name, 'slow', 'Still processing; an order may be pending. Check positions before retrying.', walletIds[i]);
+      }
+    });
+    this._emit(row);
+    return row;
+  }
+
+  /** An unresolved evaluation is UNKNOWN, not an indefinite "evaluating". */
+  stalled({ mint, walletNames = [], walletIds = [] }) {
+    const row = mint ? this.rows.get(mint) : null;
+    if (!row || row.decidedAt) return row;
+    walletNames.forEach((name, i) => {
+      const entry = row.wallets.find((w) => walletIds[i] && w.walletId
+        ? w.walletId === walletIds[i] : w.name === name);
+      if (entry && ['checking', 'slow'].includes(entry.action)) {
+        this._pushWallet(row, name, 'unconfirmed',
+          'No final result received; buy status unknown. Check wallet holdings before retrying.', walletIds[i]);
+        entry.pendingFinal = true; // a late REAL result may still replace this warning
+      }
+    });
+    if (row.wallets.some((w) => w.pendingFinal)) {
+      row.decision = DECISION.ERROR;
+      row.skipReason = 'evaluation unresolved — check wallet holdings; not a confirmed buy or skip';
+      this._emit(row);
+    }
+    return row;
+  }
+
+  /** End EACH wallet's "evaluating" state even if it returned before the
+   * on-chain checks, a buy failed, or one wallet threw. Never report an
+   * unconfirmed submission as a verified skip or a verified purchase. */
   finalize({ mint, outcomes, walletNames, walletIds }) {
     const row = mint ? this.rows.get(mint) : null;
     if (!row) return null;
-
     const results = outcomes || [];
-    const bought = results.filter((o) => o === 'bought').length;
-    if (row.decision === DECISION.BOUGHT || bought > 0) {
+    (walletNames || []).forEach((name, i) => {
+      const outcome = String(results[i] || 'error:no_verdict');
+      const id = walletIds?.[i] || null;
+      const mine = row.wallets.find((w) => id && w.walletId ? w.walletId === id : w.name === name);
+      let action = 'error', reason = 'Evaluation ended without a confirmed verdict. Check wallet holdings.';
+      if (outcome === 'bought') { action = 'bought'; reason = null; }
+      else if (outcome.startsWith('skip:')) {
+        const code = outcome.slice(5);
+        if (/rpc_unavailable/.test(code)) {
+          action = 'rpc_error'; reason = 'RPC unavailable; token not verified.';
+        } else if (code === 'eval_timeout') {
+          action = 'timed_out'; reason = 'Evaluation timed out before a new buy could be submitted.';
+        } else {
+          action = 'skipped'; reason = code;
+        }
+      } else if (outcome.startsWith('buy_unconfirmed:')) {
+        action = 'unconfirmed';
+        reason = 'Buy submitted, confirmation unavailable. Check transaction and wallet; no managed position recorded.';
+      } else if (outcome.startsWith('buy_failed')) {
+        action = 'unconfirmed';
+        reason = 'No confirmed buy recorded. Check wallet holdings before retrying.';
+      } else if (outcome.startsWith('buy_error') || outcome.startsWith('error:')) {
+        action = 'unconfirmed';
+        reason = 'Buy status unknown after an error. Check wallet holdings before retrying.';
+      }
+      // The on-chain filter event already carried a more precise reason. A
+      // terminal decision from token:skipped/position:opened wins over a generic
+      // final skip; only unsettled 'checking'/'slow' entries need a new verdict.
+      if (!mine || mine.action === 'checking' || mine.action === 'slow' || mine.pendingFinal || action === 'bought') {
+        this._pushWallet(row, name, action, reason, id);
+        if (mine) delete mine.pendingFinal;
+      }
+      if (action === 'unconfirmed' && outcome.startsWith('buy_unconfirmed:')) {
+        const sig = outcome.slice('buy_unconfirmed:'.length);
+        const entry = row.wallets.find((w) => id && w.walletId ? w.walletId === id : w.name === name);
+        if (entry && /^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(sig)) entry.txSignature = sig;
+      }
+    });
+
+    const bought = row.decision === DECISION.BOUGHT || results.includes('bought');
+    if (bought) {
       row.decision = DECISION.BOUGHT;
+      row.skipReason = null;
     } else {
-      const skips = results.filter((o) => String(o).startsWith('skip:'));
-      const infra = skips.some((s) => /rpc_unavailable|eval_timeout/.test(s));
-      row.decision = infra ? DECISION.ERROR : DECISION.SKIPPED;
-      row.skipReason = infra
-        ? 'rpc unavailable or evaluation timed out — infrastructure, not the token'
-        : (skips[0] ? String(skips[0]).replace(/^skip:/, '') : 'no wallet was eligible');
-      if (infra) this.stats.errors += 1; else this.stats.skipped += 1;
+      const issues = row.wallets.filter((w) => ['rpc_error', 'timed_out', 'unconfirmed', 'error'].includes(w.action));
+      row.decision = issues.length ? DECISION.ERROR : DECISION.SKIPPED;
+      row.skipReason = issues.length
+        ? (issues[0].action === 'rpc_error' ? 'rpc unavailable — infrastructure, not the token' : issues[0].reason)
+        : (row.wallets[0]?.reason || String(results[0] || 'no wallet was eligible').replace(/^skip:/, ''));
+      if (issues.length) this.stats.errors += 1; else this.stats.skipped += 1;
     }
     row.decidedAt = Date.now();
-    if (walletNames && !row.wallets.length) {
-      row.wallets = walletNames.map((name, i) => ({ name, walletId: walletIds?.[i] || null, action: 'skipped', reason: row.skipReason }));
-    }
     this._emit(row);
     return row;
   }
@@ -416,10 +512,23 @@ class LiveFeed {
 
   _trim() {
     if (this.rows.size <= this.max) return;
-    const excess = this.rows.size - this.max;
-    const keys = [...this.rows.keys()].slice(0, excess);
-    for (const k of keys) this.rows.delete(k);
-    this.stats.dropped += excess;
+    // A launch whose wallet is still processing must remain traceable even in
+    // a launch storm. Evict older completed/public-only rows first. Once the
+    // 45s watchdog marks it unknown it is eligible for normal eviction; if ALL
+    // rows are pending we still enforce the hard memory bound.
+    const newestMint = [...this.rows.keys()].at(-1);
+    for (const [mint, row] of this.rows) {
+      if (this.rows.size <= this.max) break;
+      if (mint === newestMint) continue; // a new launch should not be evicted on arrival
+      if (row.wallets.some((w) => w.action === 'checking' || w.action === 'slow')) continue;
+      this.rows.delete(mint);
+      this.stats.dropped += 1;
+    }
+    for (const mint of this.rows.keys()) {
+      if (this.rows.size <= this.max) break;
+      this.rows.delete(mint);
+      this.stats.dropped += 1;
+    }
   }
 
   _emit(row) {
