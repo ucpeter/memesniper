@@ -1347,7 +1347,7 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
         // Every launch already scanned this session, newest first, so the live
         // scanner table is populated when the page loads rather than only after the
         // next launch happens to arrive.
-        scanFeed: engine.liveFeed ? engine.liveFeed.snapshot(60) : [],
+        scanFeed: engine.liveFeed ? engine.liveFeed.snapshot(200) : [],
         scan: engine.liveFeed ? { ...engine.liveFeed.stats, rows: engine.liveFeed.size } : null,
         logs: log.history(120),
         prices: Object.fromEntries(engine.priceCache),
