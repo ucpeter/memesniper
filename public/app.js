@@ -2851,7 +2851,7 @@ function defaultCfg() {
     limits: { dailyLossLimitSol: 2, dailyProfitTargetSol: 0, maxTradesPerDay: 100, maxExposureSol: 3, stopAfterConsecutiveLosses: 5 },
     filters: {
       maxDevHoldPct: 20, requireMintAuthorityRevoked: true, requireFreezeAuthorityRevoked: true, maxBuyTaxPct: 10, maxSellTaxPct: 10,
-      minLiquiditySol: 1, maxLiquiditySol: 0, minLiquidityUsd: 150, maxLiquidityUsd: 0, maxTop10HoldersPct: 35, minHolders: 8, requireSocial: false, minNameLength: 2, blockCopycatNames: true,
+      minLiquiditySol: 1, maxLiquiditySol: 0, minLiquidityUsd: 150, maxLiquidityUsd: 0, maxTop10HoldersPct: 35, requireSocial: false, minNameLength: 2, blockCopycatNames: true,
       maxAgeMs: 120000, maxBondingCurvePct: 60, devBlacklist: [], mintBlacklist: [],
     },
     ai: { enabled: false, overrideProvider: '', minConfidence: 0 },
