@@ -145,7 +145,7 @@ const api = async (method, url, body) => {
     assert.ok(row, 'the launch must become a row');
     assert.ok(row.riskScore >= 40, `a 40%-dev holding is dangerous even before the real reserve read, not ${row.riskScore}`);
     assert.strictEqual(row.realLiquidityUsd, null, 'virtual USD must not masquerade as real backing');
-    assert.ok(row.riskNotes.some((n) => /dev holds/.test(n)), 'and that the dev is over the ceiling');
+    assert.ok(row.riskNotes.some((n) => /dev opening buy/.test(n)), 'the opening buy is over the informational ceiling');
   });
 
   await test('status().scan reports what the panel is showing', () => {

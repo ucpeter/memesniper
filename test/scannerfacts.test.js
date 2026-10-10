@@ -73,9 +73,9 @@ function withFeed(fn, thresholds = THRESHOLDS) {
       bus.safeEmit('token:detected', launch());
       const row = feed.rows.get(MINT('a'));
 
-      assert.strictEqual(row.devHoldPct, 3, 'dev hold = initialBuy / 1e9 = 3%');
+      assert.strictEqual(row.devHoldPct, 3, 'opening buy = initialBuy / 1e9 = 3%; current hold unread');
       assert.strictEqual(row.liquiditySol, 12.5, 'liquidity = the curve, in SOL');
-      assert.strictEqual(row.facts.devHold, 'event', 'and the row records where it came from');
+      assert.strictEqual(row.facts.devHold, 'opening_buy_event', 'and the row records where it came from');
       assert.strictEqual(row.facts.liquidity, 'virtual_event');
       assert.strictEqual(row.realLiquiditySol, null, 'an event does not prove deposited SOL');
     });
@@ -250,7 +250,7 @@ function withFeed(fn, thresholds = THRESHOLDS) {
         bus.safeEmit('token:detected', launch({ mint: MINT('e'), initialBuy: 0 }));
         const row = feed.rows.get(MINT('e'));
         assert.strictEqual(row.devHoldPct, 0, 'zero is zero');
-        assert.strictEqual(row.facts.devHold, 'event', 'and it still came from the event');
+        assert.strictEqual(row.facts.devHold, 'opening_buy_event', 'and it still came from the event');
       });
     } finally {
       solprice.__reset();
@@ -293,7 +293,9 @@ function withFeed(fn, thresholds = THRESHOLDS) {
         assert.strictEqual(row.realLiquidityUsd, 4000);
         assert.strictEqual(row.facts.liquidity, 'virtual_event');
         assert.strictEqual(row.facts.realLiquidity, 'real_onchain');
-        assert.strictEqual(row.devHoldPct, 9.5, 'so does dev hold');
+        assert.strictEqual(row.devHoldPct, 3, 'the opening buy must not be overwritten');
+        assert.strictEqual(row.currentDevHoldPct, 9.5, 'current on-chain creator hold is separate');
+        assert.strictEqual(row.facts.currentDevHold, 'creator_onchain');
         assert.ok(row.riskScore >= 40, 'and the honeypot reading joins the score');
         assert.ok(row.riskNotes.join(' ').includes('freeze'), 'carrying its note with it');
       });

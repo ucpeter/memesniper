@@ -12,6 +12,7 @@ const cfg = require('../src/config');
 const Position = require('../src/engine/position');
 const curve = require('../src/engine/curve');
 const safety = require('../src/engine/safety');
+const { Keypair } = require('@solana/web3.js');
 
 let passed = 0;
 let failed = 0;
@@ -19,15 +20,24 @@ let failed = 0;
 /** BigInt-safe dump for assertion messages. */
 const show = (v) => JSON.stringify(v, (k, x) => (typeof x === 'bigint' ? `${x}n` : x));
 
-function test(name, fn) {
-  try {
-    fn();
-    passed += 1;
-    console.log(`  \x1b[32m✓\x1b[0m ${name}`);
-  } catch (err) {
+let pending = Promise.resolve();
+function record(name, err) {
+  if (err) {
     failed += 1;
     console.log(`  \x1b[31m✗\x1b[0m ${name}\n      ${err.message}`);
+  } else {
+    passed += 1;
+    console.log(`  \x1b[32m✓\x1b[0m ${name}`);
   }
+}
+function test(name, fn) {
+  if (fn.constructor.name === 'AsyncFunction') {
+    // Do not report a Promise as a passed assertion or call process.exit()
+    // before the on-chain mocks have even completed.
+    pending = pending.then(() => fn()).then(() => record(name), (err) => record(name, err));
+    return;
+  }
+  try { fn(); record(name); } catch (err) { record(name, err); }
 }
 
 /** Build a position with a given entry and current price (floats in SOL/token). */
@@ -872,16 +882,21 @@ function curveAccount({ realSolReserves = 2_500_000_000n, complete = false } = {
 }
 
 test('UNITS: recon() fills liquidity, dev hold and risk for a wallet-free read', async () => {
-  const mint = 'R'.repeat(43);
+  const mint = Keypair.generate().publicKey.toBase58();
   const conn = {
     getAccountInfo: async (addr) => {
-      // The curve PDA and the mint are different accounts; serve both.
+      if (addr.toBase58() === mint) {
+        const data = Buffer.alloc(82);
+        data.writeBigUInt64LE(1_000_000_000_000_000n, 36);
+        data.writeUInt8(6, 44); data.writeUInt8(1, 45);
+        return { owner: safety.TOKEN_PROGRAM, data, executable: false, lamports: 1 };
+      }
       return { owner: safety.PUMP_PROGRAM, data: curveAccount(), executable: false, lamports: 1 };
     },
     getTokenLargestAccounts: async () => ({
       value: [
-        { address: { toBase58: () => 'dev1111111111111111111111111111111111111111' }, amount: '180000000' },
-        { address: { toBase58: () => 'a11111111111111111111111111111111111111111' }, amount: '20000000' },
+        { address: { toBase58: () => 'holder1111111111111111111111111111111111111' }, amount: '180000000000000' },
+        { address: { toBase58: () => 'a11111111111111111111111111111111111111111' }, amount: '20000000000000' },
       ],
     }),
   };
@@ -889,8 +904,9 @@ test('UNITS: recon() fills liquidity, dev hold and risk for a wallet-free read',
   const out = await safety.recon({ mint, symbol: 'RCN' }, { conn, config: cfg.defaultGlobalConfig() });
   assert.ok(out.report, 'a report is always returned');
   assert.strictEqual(out.report.liquiditySol, 2.5, `liquidity in SOL, got ${out.report.liquiditySol}`);
-  // The largest NON-curve holder is the dev-hold estimate (90% here).
-  assert.strictEqual(out.report.devHoldPct, 90, `dev hold %, got ${out.report.devHoldPct}`);
+  assert.strictEqual(out.report.devHoldPct, null, 'a random holder is NOT identified as developer');
+  assert.strictEqual(out.report.largestHolderPct, 18, 'largest holder is 18% of ALL minted supply, not 90% of float');
+  assert.strictEqual(out.report.top10Pct, 20);
   assert.ok(typeof out.report.honeypot.risk === 'number', 'a numeric risk score is always present');
 });
 
@@ -909,5 +925,7 @@ test('UNITS: a definitive "no such account" is still a HARD token rejection', as
   assert.ok(v.reasons.some((r) => r === 'mint_account_not_found' || r === 'bonding_curve_not_found'), `got ${show(v.reasons)}`);
 });
 
-console.log(`  ${passed} passed, ${failed} failed\n`);
-process.exit(failed === 0 ? 0 : 1);
+pending.then(() => {
+  console.log(`  ${passed} passed, ${failed} failed\n`);
+  process.exitCode = failed === 0 ? 0 : 1;
+});

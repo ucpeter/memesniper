@@ -722,6 +722,27 @@ async function click(window, el) {
     assert.match(feed.textContent, /2\.0%/, 'dev hold appears on wallet card');
   });
 
+  await test('dev opening buy and current holding stay distinct; Trades shows SAVED wallet limits', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1 });
+    window.eval(`S.wallets[0].config.filters.minLiquidityUsd = 2000;
+      S.wallets[0].config.filters.maxDevHoldPct = 20;
+      S.wallets[0].config.filters.maxTop10HoldersPct = 35;
+      S.scanFeed = [{ mint:'DEV_MINT', symbol:'DEVCOIN', devHoldPct:2,
+        currentDevHoldPct:97, realLiquidityUsd:100, liquidityUsd:4500,
+        riskScore:78, wallets:[{walletId:S.wallets[0].id,
+          name:S.wallets[0].name,action:'skipped',reason:'insufficient_balance'}] }];
+      renderWallets(); openWalletDetail(S.wallets[0].id);`);
+    const cells = [...$('[data-live-wallet-feed] tbody tr').querySelectorAll('td')];
+    assert.match(cells[1].textContent, /97\.0% current/);
+    assert.match(cells[1].textContent, /2\.0% opening/);
+    assert.match(cells[2].textContent, /\$100 real/);
+    assert.match(cells[4].textContent, /SKIPPED[\s\S]*insufficient balance/i);
+    assert.match(window.document.querySelector('.modal-bg').textContent,
+      /Saved wallet rules: real liquidity ≥ \$2,000 · creator ≤ 20% · top 10 ≤ 35%/);
+    assert.deepStrictEqual([...$('[data-live-wallet-feed] thead tr').querySelectorAll('th')]
+      .map((th) => th.textContent.trim()), ['Token', 'Dev hold', 'Liquidity', 'Risk', 'What Wallet 1 did']);
+  });
+
   await test('virtual and real USD remain distinct on the card and in Trades as scans stream live', async () => {
     const { window, $ } = await bootDashboard({ wallets: 1 });
     window.eval(`S.scanFeed = [{mint:'FIRST_MINT', symbol:'FIRST', liquidityUsd:4500,

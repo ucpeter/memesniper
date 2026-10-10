@@ -98,7 +98,7 @@ const candidate = (n) => ({
       assert.strictEqual(row.realLiquiditySol, 12.5, 'real deposited SOL must be shown separately');
       assert.strictEqual(row.realLiquidityUsd, 2500, 'real SOL priced at the pinned $200');
       assert.strictEqual(row.virtualLiquidityUsd, null, 'a missing event reserve is not invented');
-      assert.strictEqual(row.devHoldPct, 3.4, 'dev holdings must be shown');
+      assert.strictEqual(row.currentDevHoldPct, 3.4, 'current creator balance must be separate');
       // $2,500 clears the $2,000 floor and 3.4% is well under the 15% ceiling, so
       // the derived score is 0 and the honeypot read's 0 stands.
       assert.strictEqual(row.riskScore, 0);
@@ -283,7 +283,7 @@ const candidate = (n) => ({
 
       const row = feed.snapshot()[0];
       assert.strictEqual(row.realLiquiditySol, 4.4, 'a real liquidity figure must survive');
-      assert.strictEqual(row.devHoldPct, 9, 'and so must the dev holding');
+      assert.strictEqual(row.currentDevHoldPct, 9, 'and so must the current creator holding');
     });
   });
 
@@ -319,7 +319,7 @@ const candidate = (n) => ({
 
   const row = feed.snapshot().find((r) => r.mint === mint);
   assert.ok(row, 'the row exists');
-  assert.strictEqual(row.devHoldPct, 7.25, 'dev hold comes from the recon pass');
+  assert.strictEqual(row.currentDevHoldPct, 7.25, 'current creator hold comes from the recon pass');
   assert.strictEqual(row.realLiquiditySol, 2.4, 'and so does real SOL');
   // The recon pass reports the honeypot risk AND, because $2.4 is not a number
   // anyone can judge, the derived score now runs over the same facts — 2.4 SOL is
@@ -347,7 +347,7 @@ test('recon never erases a number a wallet already measured', () => {
 
   const row = feed.snapshot().find((r) => r.mint === mint);
   assert.strictEqual(row.realLiquiditySol, 9.9);
-  assert.strictEqual(row.devHoldPct, 3.3);
+  assert.strictEqual(row.currentDevHoldPct, 3.3);
   assert.strictEqual(row.riskScore, 60, 'the highest risk seen still wins');
 });
 
