@@ -183,6 +183,8 @@ class Trader {
           liquiditySol: curveRep.liquiditySol ?? null,
           virtualLiquiditySol: curveRep.virtualLiquiditySol ?? null,
           devHoldPct: rep.devHoldPct ?? null,
+          devHoldPctFromEvent: rep.openingBuyPct ?? null,
+          largestHolderPct: dist.largestHolderPct ?? null,
           top10Pct: dist.top10Pct ?? null,
           holderSample: dist.holderSample ?? null,
           honeypot: rep.honeypot || null,

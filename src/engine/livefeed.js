@@ -29,7 +29,7 @@ const solprice = require('./solprice');
 
 /**
  * pump.fun mints 1,000,000,000 tokens per launch, always — the same constant the
- * reference bot divides by to get dev hold (`initialBuy / 1e9`). The dev's
+ * reference bot divides by to get the launch opening-buy percentage (`initialBuy / 1e9`). The dev's
  * opening buy is reported in TOKENS, so this is the whole calculation.
  */
 const PUMP_FUN_TOTAL_SUPPLY = 1_000_000_000;
@@ -66,25 +66,33 @@ function deriveRisk(row, thresholds) {
   const devLimit = thresholds.maxDevHoldPct;
   const liqFloor = thresholds.minLiquidityUsd;
 
-  const hasDev = Number.isFinite(row.devHoldPct);
+  const currentDev = row.currentDevHoldPct === undefined ? row.devHoldPct : row.currentDevHoldPct;
+  const hasDev = Number.isFinite(currentDev);
+  const openingBuy = Number.isFinite(row.devHoldPct) ? row.devHoldPct : null;
   // Never accept the compatibility alias (virtual USD) as deposited real SOL.
   const liq = row.realLiquidityUsd;
   const hasLiq = Number.isFinite(liq);
-  if (!hasDev && !hasLiq) return { score: null, notes: [] };
+  if (!hasDev && !hasLiq && !(openingBuy > devLimit)) return { score: null, notes: [] };
 
   const notes = [];
   let score = 0;
 
   if (hasDev && devLimit > 0) {
-    const over = row.devHoldPct - devLimit;
+    const over = currentDev - devLimit;
     if (over > 0) {
       // Scales with how far past the ceiling it is, capped at 45 — the same order
       // of magnitude as the reference bot's own dev-hold penalty.
       score += Math.min(45, Math.round(6 + over * 3));
-      notes.push(`dev holds ${row.devHoldPct.toFixed(1)}% (limit ${devLimit}%)`);
-    } else if (row.devHoldPct > 0) {
-      notes.push(`dev holds ${row.devHoldPct.toFixed(1)}%`);
+      notes.push(`dev holds ${currentDev.toFixed(1)}% (limit ${devLimit}%)`);
+    } else if (currentDev > 0) {
+      notes.push(`dev holds ${currentDev.toFixed(1)}%`);
     }
+  }
+
+  if (openingBuy !== null && openingBuy > devLimit && devLimit > 0) {
+    const over = openingBuy - devLimit;
+    score = Math.max(score, Math.min(45, Math.round(6 + over * 3)));
+    notes.push(`dev opening buy ${openingBuy.toFixed(1)}% (limit ${devLimit}%)`);
   }
 
   if (hasLiq && liqFloor > 0 && liq < liqFloor) {
@@ -138,6 +146,9 @@ class LiveFeed {
     if (!candidate || !candidate.mint) return null;
     if (this.rows.has(candidate.mint)) return this.rows.get(candidate.mint);
 
+    const buy = Number(candidate.initialBuy);
+    const hasOpeningBuy = candidate.initialBuy !== null && candidate.initialBuy !== undefined &&
+      candidate.initialBuy !== '' && Number.isFinite(buy) && buy >= 0 && buy <= PUMP_FUN_TOTAL_SUPPLY;
     const row = {
       mint: candidate.mint,
       symbol: candidate.symbol || '',
@@ -150,9 +161,11 @@ class LiveFeed {
        * SOL deposited by buyers. Keep the event's virtual reserve separate from
        * on-chain real SOL, or simply starting a wallet changes the meaning of
        * the displayed liquidity from ~$4,500 to ~$7 for the SAME token. */
-      devHoldPct: Number.isFinite(Number(candidate.initialBuy)) && candidate.initialBuy !== null
-        ? (Number(candidate.initialBuy) / PUMP_FUN_TOTAL_SUPPLY) * 100
-        : null,
+      devHoldPct: hasOpeningBuy
+        ? (buy / PUMP_FUN_TOTAL_SUPPLY) * 100
+        : null, // opening buy only; not the current creator balance
+      currentDevHoldPct: null,
+      largestHolderPct: null,
       virtualLiquiditySol: Number.isFinite(candidate.vSolInBondingCurve) ? candidate.vSolInBondingCurve : null,
       virtualLiquidityUsd: null,
       realLiquiditySol: null,
@@ -163,7 +176,8 @@ class LiveFeed {
       liquidityUsd: null,
       // Where each of those came from, so the table can be honest about it.
       facts: {
-        devHold: Number.isFinite(Number(candidate.initialBuy)) && candidate.initialBuy !== null ? 'event' : null,
+        devHold: hasOpeningBuy ? 'opening_buy_event' : null,
+        currentDevHold: null,
         liquidity: Number.isFinite(candidate.vSolInBondingCurve) ? 'virtual_event' : null,
         realLiquidity: null,
         risk: null,
@@ -287,10 +301,15 @@ class LiveFeed {
     // Never replace the virtual launch figure with real SOL: they are different
     // numbers and starting/stopping the bot must not change a column's meaning.
     this._price(row);
-    if (r.devHoldPct !== undefined && r.devHoldPct !== null) {
-      row.devHoldPct = r.devHoldPct;
-      row.facts.devHold = 'onchain';
+    if (r.devHoldPctFromEvent !== undefined && r.devHoldPctFromEvent !== null && row.devHoldPct === null) {
+      row.devHoldPct = r.devHoldPctFromEvent;
+      row.facts.devHold = 'opening_buy_event';
     }
+    if (r.devHoldPct !== undefined && r.devHoldPct !== null) {
+      row.currentDevHoldPct = r.devHoldPct;
+      row.facts.currentDevHold = 'creator_onchain';
+    }
+    if (r.largestHolderPct !== undefined && r.largestHolderPct !== null) row.largestHolderPct = r.largestHolderPct;
     if (r.honeypot && typeof r.honeypot.risk === 'number') {
       // Highest risk seen wins: one wallet's stricter view must not be masked by
       // another's more permissive one.

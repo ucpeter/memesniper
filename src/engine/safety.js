@@ -18,6 +18,7 @@ const solprice = require('./solprice');
 const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const TOKEN_2022_PROGRAM = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+const ASSOCIATED_TOKEN_PROGRAM = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
 
 /* ------------------------------------------------------------------ *
  * Account decoders
@@ -185,6 +186,7 @@ async function checkMintAuthorities(conn, mint) {
       freezeAuthorityRevoked: parsed.freezeAuthorityOption === 0,
       decimals: parsed.decimals,
       supply: parsed.supply,
+      tokenProgram: info.owner?.toBase58?.() || null,
     };
   } catch (err) {
     if (isTransportError(err)) return { pass: false, reason: `rpc_unavailable(${rpcFailureSummary(err)})`, confidence: 'INFRA' };
@@ -217,53 +219,109 @@ async function checkCurve(conn, mint) {
   }
 }
 
-/**
- * [HEUR] Concentration check.
- * On a brand-new launch almost all supply sits in the curve itself, so raw
- * "top holder holds 60%" rejections are useless. We therefore exclude the
- * bonding curve's own token account and measure concentration among real
- * holders only.
- */
-async function checkDistribution(conn, mint, curvePda) {
+/** The curve's TOKEN account is an ATA of the curve PDA, not the PDA itself.
+ * Counting it as a holder fabricated 90%+ "dev hold" in the screenshot. */
+function curveTokenAccount(mint, curvePda, tokenProgram = TOKEN_PROGRAM) {
+  return PublicKey.findProgramAddressSync(
+    [curvePda.toBuffer(), tokenProgram.toBuffer(), new PublicKey(mint).toBuffer()],
+    ASSOCIATED_TOKEN_PROGRAM
+  )[0];
+}
+
+/** Holder concentration is a share of ALL minted supply, not a share of the
+ * tiny circulating float and never a claim about which holder is the dev. */
+async function checkDistribution(conn, mint, curvePda, supply, tokenProgram = TOKEN_PROGRAM) {
   try {
+    const reserve = curveTokenAccount(mint, curvePda, tokenProgram).toBase58();
     const largest = await conn.getTokenLargestAccounts(new PublicKey(mint), 'confirmed');
-    if (!largest?.value?.length) return { pass: true, confidence: 'HEUR', skipped: 'no_token_accounts_yet' };
-
+    if (!Array.isArray(largest?.value)) return { pass: false, confidence: 'INFRA', skipped: 'distribution_unread' };
+    const reserveEntry = largest.value.find((a) => a.address.toBase58() === reserve);
     const entries = largest.value
-      .filter((a) => a.address.toBase58() !== curvePda.toBase58())
-      .map((a) => ({ address: a.address.toBase58(), amount: BigInt(a.amount) }));
-
-    const total = entries.reduce((acc, e) => acc + e.amount, 0n);
-    const top10 = entries.slice(0, 10).reduce((acc, e) => acc + e.amount, 0n);
-    const top10Pct = total === 0n ? 0 : Number((top10 * 10000n) / total) / 100;
-
+      .filter((a) => a.address.toBase58() !== reserve && BigInt(a.amount) > 0n);
+    const minted = BigInt(supply || 0);
+    if (minted <= 0n) return { pass: false, confidence: 'INFRA', skipped: 'supply_unread' };
+    const pct = (n) => Number((n * 10000n) / minted) / 100;
+    const reserveAmount = reserveEntry ? BigInt(reserveEntry.amount) : null;
+    const listedAmount = entries.reduce((sum, entry) => sum + BigInt(entry.amount), 0n);
+    if ((reserveAmount || 0n) + listedAmount > minted) {
+      return { pass: false, confidence: 'INFRA', skipped: 'distribution_inconsistent' };
+    }
+    // The ten sampled token ACCOUNTS are only a lower bound for the top ten
+    // OWNERS. An owner can control multiple accounts and smaller unlisted ones.
+    let ownersVerified = false;
+    let uniqueHolderSample = null;
+    let amounts = entries.map((a) => BigInt(a.amount));
+    if (conn.getMultipleAccountsInfo && entries.length) {
+      const infos = await conn.getMultipleAccountsInfo(entries.map((a) => a.address), 'confirmed');
+      if (Array.isArray(infos) && infos.length === entries.length) {
+        const byOwner = new Map();
+        ownersVerified = infos.every((info, i) => {
+          const data = info?.data;
+          if (!Buffer.isBuffer(data) || data.length < 72 ||
+              !data.subarray(0, 32).equals(new PublicKey(mint).toBuffer()) ||
+              !info.owner?.equals(tokenProgram) || data.readBigUInt64LE(64) !== BigInt(entries[i].amount)) return false;
+          const owner = new PublicKey(data.subarray(32, 64)).toBase58();
+          byOwner.set(owner, (byOwner.get(owner) || 0n) + BigInt(entries[i].amount));
+          return true;
+        });
+        if (ownersVerified) {
+          amounts = [...byOwner.values()].sort((x, y) => x === y ? 0 : x > y ? -1 : 1);
+          uniqueHolderSample = byOwner.size;
+        }
+      }
+    }
+    const top10 = amounts.slice(0, 10).reduce((acc, n) => acc + n, 0n);
     return {
-      pass: true,
-      confidence: 'HEUR',
-      top10Pct,
+      pass: true, confidence: 'HEUR', ownersVerified,
+      top10Pct: pct(top10), // lower bound only
+      top10UpperPct: reserveAmount === null ? null : pct(minted - reserveAmount),
+      uniqueHolderSample,
       holderSample: entries.length,
-      largestHolderPct: entries[0] && total > 0n ? Number((entries[0].amount * 10000n) / total) / 100 : 0,
+      largestHolderPct: amounts.length ? pct(amounts[0]) : 0,
     };
   } catch (err) {
-    return { pass: true, confidence: 'HEUR', skipped: `distribution_unavailable:${err.message}` };
+    return { pass: false, confidence: 'INFRA',
+      skipped: isTransportError(err) ? `rpc_unavailable(${rpcFailureSummary(err)})` : 'distribution_unread' };
   }
 }
 
-/**
- * [HEUR] Dev-hold estimate.
- * The pump.fun `create` instruction does not expose the creator in the bonding
- * curve account, so we cannot read "the dev's balance" directly without an
- * indexer. We approximate with the single largest non-curve holder, which for
- * a fresh launch is normally the creator's initial buy.
- * If you wire in an indexer (Helius/SolanaTracker), replace this with the real
- * creator balance — this is the weakest check in the file and it is flagged so.
- */
-/** pump.fun supply per launch — the reference bot's constant, same derivation. */
+/** The create event measures the developer's OPENING PURCHASE, not their
+ * current balance. Do not rename a random largest token account "dev hold". */
 const PUMP_FUN_TOTAL_SUPPLY = 1_000_000_000;
+function openingDevBuyPct(candidate) {
+  const n = candidate?.initialBuy;
+  if (n === null || n === undefined || n === '' || !Number.isFinite(Number(n))) return null;
+  const amount = Number(n);
+  return amount >= 0 && amount <= PUMP_FUN_TOTAL_SUPPLY ? amount / PUMP_FUN_TOTAL_SUPPLY * 100 : null;
+}
 
-function estimateDevHold(distribution) {
-  if (!distribution || distribution.skipped) return null;
-  return distribution.largestHolderPct ?? null;
+/** Read the creator's token accounts BY OWNER; unlike getTokenLargestAccounts,
+ * this actually identifies the creator. Any unreadable result fails closed for
+ * entries. More than one account may belong to the same creator. */
+async function checkCreatorHold(conn, candidate, supply) {
+  if (!candidate?.creator || !conn?.getTokenAccountsByOwner || !supply) {
+    return { pct: null, reason: 'dev_hold_unread' };
+  }
+  try {
+    const owner = new PublicKey(candidate.creator);
+    const mint = new PublicKey(candidate.mint);
+    const accounts = await conn.getTokenAccountsByOwner(owner, { mint }, 'confirmed');
+    if (!Array.isArray(accounts?.value)) return { pct: null, reason: 'dev_hold_unread' };
+    let held = 0n;
+    for (const a of accounts.value) {
+      const raw = a.account?.data;
+      const data = Buffer.isBuffer(raw) ? raw
+        : Array.isArray(raw) && raw[1] === 'base64' ? Buffer.from(raw[0], 'base64')
+        : raw instanceof Uint8Array ? Buffer.from(raw) : null;
+      if (!data || data.length < 72 || !data.subarray(0, 32).equals(mint.toBuffer()) ||
+          !data.subarray(32, 64).equals(owner.toBuffer())) return { pct: null, reason: 'dev_hold_unread' };
+      held += data.readBigUInt64LE(64);
+    }
+    return { pct: Number((held * 10000n) / BigInt(supply)) / 100, reason: null };
+  } catch (err) {
+    return { pct: null, reason: isTransportError(err)
+      ? `rpc_unavailable(${rpcFailureSummary(err)})` : 'dev_hold_unread' };
+  }
 }
 
 /**
@@ -414,7 +472,12 @@ async function recon(candidate, ctx = {}) {
     ? null
     // A curve read that failed still gives us a mint report worth showing; a
     // distribution read that fails gives null and leaves the cell blank.
-    : await checkDistribution(conn, candidate.mint, bondingCurvePda(candidate.mint)).catch(() => null);
+    : await checkDistribution(conn, candidate.mint, bondingCurvePda(candidate.mint),
+      mintReport.supply,
+      mintReport.tokenProgram === TOKEN_2022_PROGRAM.toBase58() ? TOKEN_2022_PROGRAM : TOKEN_PROGRAM);
+
+  const creator = unreachable.length ? { pct: null } : await checkCreatorHold(conn, candidate,
+    mintReport.supply);
 
   // Risk is judged against the HARDEST reasonable reading of the mint account
   // (live freeze authority, live mint authority) — no wallet's preferences are
@@ -432,11 +495,10 @@ async function recon(candidate, ctx = {}) {
       virtualLiquiditySol: curveReport && curveReport.confidence !== 'INFRA' ? curveReport.virtualLiquiditySol ?? null : null,
       // The dev's own opening buy, straight off the launch event — the same
       // derivation the reference bot uses. Present even when the RPC is not.
-      devHoldPctFromEvent: Number.isFinite(Number(candidate.initialBuy)) && candidate.initialBuy !== null
-        ? (Number(candidate.initialBuy) / PUMP_FUN_TOTAL_SUPPLY) * 100
-        : null,
+      devHoldPctFromEvent: openingDevBuyPct(candidate),
       progressPct: curveReport && curveReport.confidence !== 'INFRA' ? curveReport.progressPct ?? null : null,
-      devHoldPct: distribution ? estimateDevHold(distribution) : null,
+      devHoldPct: creator.pct,
+      largestHolderPct: distribution?.largestHolderPct ?? null,
       top10Pct: distribution && distribution.top10Pct !== undefined ? distribution.top10Pct : null,
       holderSample: distribution ? distribution.holderSample ?? null : null,
       honeypot,
@@ -502,18 +564,23 @@ async function evaluate(candidate, cfg, ctx) {
   const liquiditySol = curveReport.liquiditySol;
   // User-configured dollar thresholds are FIXED dollars, not SOL numbers
   // labelled "$". Use the same live SOL/USD module as the launch feed; if all
-  // providers fail, the documented $150 fallback is used, never an invented
-  // "real" price. Legacy records with only SOL settings keep their semantics.
+  // providers fail or the quote is stale, a USD-gated entry must be skipped.
+  // A display-only fallback must never approve a trade. Legacy SOL limits keep
+  // their semantics.
   const quote = solprice.lastKnown();
-  const solUsd = quote.usd && !quote.stale ? quote.usd : (quote.usd || solprice.FALLBACK_USD);
-  const liquidityUsd = liquiditySol * solUsd;
+  // Display may show a clearly marked fallback, but a configured dollar gate
+  // cannot approve an entry using an unverified/stale exchange rate.
+  const priced = quote.ok && !quote.stale && Number.isFinite(quote.usd) && quote.usd > 0;
+  const liquidityUsd = priced ? liquiditySol * quote.usd : null;
   if (f.minLiquidityUsd !== undefined && f.minLiquidityUsd !== null) {
-    if (liquidityUsd < f.minLiquidityUsd) hardFails.push(`liquidity_below_min_usd($${liquidityUsd.toFixed(0)}<$${f.minLiquidityUsd})`);
+    if (!priced) hardFails.push('sol_usd_quote_unavailable');
+    else if (liquidityUsd < f.minLiquidityUsd) hardFails.push(`liquidity_below_min_usd($${liquidityUsd.toFixed(0)}<$${f.minLiquidityUsd})`);
   } else if (liquiditySol < f.minLiquiditySol) {
     hardFails.push(`liquidity_below_min(${liquiditySol.toFixed(2)})`);
   }
   if (f.maxLiquidityUsd !== undefined && f.maxLiquidityUsd !== null) {
-    if (f.maxLiquidityUsd > 0 && liquidityUsd > f.maxLiquidityUsd) hardFails.push(`liquidity_above_max_usd($${liquidityUsd.toFixed(0)}>$${f.maxLiquidityUsd})`);
+    if (f.maxLiquidityUsd > 0 && !priced && !hardFails.includes('sol_usd_quote_unavailable')) hardFails.push('sol_usd_quote_unavailable');
+    else if (priced && f.maxLiquidityUsd > 0 && liquidityUsd > f.maxLiquidityUsd) hardFails.push(`liquidity_above_max_usd($${liquidityUsd.toFixed(0)}>$${f.maxLiquidityUsd})`);
   } else if (f.maxLiquiditySol > 0 && liquiditySol > f.maxLiquiditySol) {
     hardFails.push(`liquidity_above_max(${liquiditySol.toFixed(2)}>${f.maxLiquiditySol})`);
   }
@@ -529,19 +596,33 @@ async function evaluate(candidate, cfg, ctx) {
   /* ---- HEUR / EXT scoring ---- */
   // Independent holder and metadata checks can run together; waiting for them
   // serially needlessly delays time-sensitive entries without changing filters.
-  const [distribution, metadata] = await Promise.all([
-    checkDistribution(conn, candidate.mint, bondingCurvePda(candidate.mint)),
+  const supply = mintReport.supply; // actual minted supply; curve configuration is NOT a substitute
+  const [distribution, metadata, creator] = await Promise.all([
+    checkDistribution(conn, candidate.mint, bondingCurvePda(candidate.mint), supply,
+      mintReport.tokenProgram === TOKEN_2022_PROGRAM.toBase58() ? TOKEN_2022_PROGRAM : TOKEN_PROGRAM),
     checkMetadata(candidate.mint, { blockCopycatNames: f.blockCopycatNames }),
+    checkCreatorHold(conn, candidate, supply),
   ]);
-  const devHoldPct = estimateDevHold(distribution);
-
-  if (devHoldPct !== null && devHoldPct > f.maxDevHoldPct) {
-    reasons.push(`dev_hold_high(${devHoldPct.toFixed(1)}%>${f.maxDevHoldPct}%)`);
-    score -= 25;
-  }
-  if (distribution.top10Pct !== undefined && distribution.top10Pct > f.maxTop10HoldersPct) {
-    reasons.push(`top10_concentrated(${distribution.top10Pct.toFixed(1)}%)`);
-    score -= 15;
+  const openingBuyPct = openingDevBuyPct(candidate);
+  const devHoldPct = creator.pct;
+  // The wallet's explicit ceilings are HARD, not score penalties that a strong
+  // liquidity/holder sample can cancel. Unread actual developer holdings cannot
+  // establish that a token is safe to buy.
+  if (openingBuyPct === null) hardFails.push('dev_opening_buy_unread');
+  else if (openingBuyPct > f.maxDevHoldPct) hardFails.push(`dev_opening_buy_high(${openingBuyPct.toFixed(1)}%>${f.maxDevHoldPct}%)`);
+  if (devHoldPct === null) hardFails.push(creator.reason || 'dev_hold_unread');
+  else if (devHoldPct > f.maxDevHoldPct) hardFails.push(`dev_hold_high(${devHoldPct.toFixed(1)}%>${f.maxDevHoldPct}%)`);
+  if (!distribution.pass) hardFails.push(distribution.skipped || 'distribution_unread');
+  else {
+    if (!distribution.ownersVerified) hardFails.push('holders_unverified');
+    else if (distribution.uniqueHolderSample < f.minHolders) {
+      hardFails.push(`holders_below_min(${distribution.uniqueHolderSample}<${f.minHolders})`);
+    }
+    if (distribution.top10Pct > f.maxTop10HoldersPct) {
+      hardFails.push(`top10_concentrated(${distribution.top10Pct.toFixed(1)}%>${f.maxTop10HoldersPct}%)`);
+    } else if (distribution.top10UpperPct === null || distribution.top10UpperPct > f.maxTop10HoldersPct) {
+      hardFails.push('top10_unverified');
+    }
   }
   if (f.requireSocial && metadata.socials && !metadata.hasSocial) {
     reasons.push('no_socials');
@@ -573,7 +654,7 @@ async function evaluate(candidate, cfg, ctx) {
   }
 
   if (hardFails.length) {
-    return { ok: false, score: 0, reasons: [...hardFails, ...reasons], hard: true, report: { mintReport, curveReport, distribution, metadata } };
+    return { ok: false, score: 0, reasons: [...hardFails, ...reasons], hard: true, report: { mintReport, curveReport, distribution, metadata, devHoldPct, openingBuyPct } };
   }
 
   // Base score rewards a healthy curve with real liquidity.
@@ -584,7 +665,7 @@ async function evaluate(candidate, cfg, ctx) {
     score,
     reasons,
     hard: false,
-    report: { mintReport, curveReport, distribution, metadata, devHoldPct, honeypot },
+    report: { mintReport, curveReport, distribution, metadata, devHoldPct, openingBuyPct, honeypot },
   };
 }
 
@@ -600,6 +681,9 @@ module.exports = {
   checkMintAuthorities,
   checkCurve,
   checkDistribution,
+  checkCreatorHold,
+  curveTokenAccount,
+  openingDevBuyPct,
   checkMetadata,
   assessHoneypotRisk,
   recon,
