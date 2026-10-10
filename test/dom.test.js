@@ -825,6 +825,5 @@ async function click(window, el) {
   });
 
   console.log(`\n  ${passed} passed, ${failed} failed\n`);
-  console.log(`  ${passed} passed, ${failed} failed\n`);
   process.exit(failed === 0 ? 0 : 1);
 })();

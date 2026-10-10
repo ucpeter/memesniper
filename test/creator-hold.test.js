@@ -17,9 +17,9 @@ const creatorAta = Keypair.generate().publicKey;
 const otherAta = Keypair.generate().publicKey;
 let realSol = 15_000_000_000n;
 let creatorBalance = 20_000_000_000_000n;
-let ownersAvailable = true;
 let creatorAvailable = true;
 let reserveBalance = 700_000_000_000_000n;
+let justLaunched = false;
 
 function tokenAccount(owner, amount) {
   const data = Buffer.alloc(165);
@@ -48,16 +48,14 @@ const conn = {
     }
     return null;
   },
-  getTokenLargestAccounts: async () => ({ value: [
-    { address: reserve, amount: String(reserveBalance) },
-    { address: otherAta, amount: '250000000000000' },
-    { address: creatorAta, amount: String(creatorBalance) },
-  ] }),
-  getMultipleAccountsInfo: async (addresses) => ownersAvailable ? addresses.map((address) => {
-    if (address.equals(creatorAta)) return tokenAccount(creator, creatorBalance);
-    if (address.equals(otherAta)) return tokenAccount(other, 250_000_000_000_000n);
-    return null;
-  }) : null,
+  getTokenLargestAccounts: async () => ({ value: justLaunched
+    ? [{ address: reserve, amount: String(reserveBalance) }]
+    : [
+      { address: reserve, amount: String(reserveBalance) },
+      { address: otherAta, amount: '250000000000000' },
+      { address: creatorAta, amount: String(creatorBalance) },
+    ] }),
+  getMultipleAccountsInfo: async () => { throw new Error('should not wait for other holders'); },
   getTokenAccountsByOwner: async (owner, { mint: requestedMint }) => {
     assert.ok(owner.equals(creator) && requestedMint.equals(mint));
     return creatorAvailable ? { value: [{ account: tokenAccount(creator, creatorBalance) }] } : null;
@@ -65,11 +63,12 @@ const conn = {
 };
 const candidate = { mint: mint.toBase58(), creator: creator.toBase58(), symbol: 'SAFE', initialBuy: 10_000_000 };
 const wallet = cfg.normaliseWallet(cfg.deepMerge(cfg.defaultWalletConfig('Creator'), { filters: {
-  minLiquidityUsd: 2000, maxDevHoldPct: 20, maxTop10HoldersPct: 35, minHolders: 2,
+  minLiquidityUsd: 2000, maxDevHoldPct: 20, maxTop10HoldersPct: 35, minHolders: 8,
 } }));
 const globalConfig = cfg.defaultGlobalConfig();
 const verdict = () => safety.evaluate(candidate, wallet, { conn, config: globalConfig });
-const test = async (label, fn) => { await fn(); console.log(`  ✓ ${label}`); };
+let passed = 0;
+const test = async (label, fn) => { await fn(); passed += 1; console.log(`  ✓ ${label}`); };
 
 (async () => {
   const oldFetch = global.fetch;
@@ -83,10 +82,7 @@ const test = async (label, fn) => { await fn(); console.log(`  ✓ ${label}`); }
           { address: otherAta, amount: '20000000000000' },
           { address: creatorAta, amount: '10000000000000' },
         ] }),
-        getMultipleAccountsInfo: async () => [
-          tokenAccount(other, 20_000_000_000_000n),
-          tokenAccount(creator, 10_000_000_000_000n),
-        ],
+        getMultipleAccountsInfo: async () => { throw new Error('not required'); },
       };
       const report = await safety.checkDistribution(closeToFullCurve, candidate.mint, curvePda, supply);
       assert.equal(report.largestHolderPct, 2);
@@ -99,7 +95,8 @@ const test = async (label, fn) => { await fn(); console.log(`  ✓ ${label}`); }
       assert.equal(out.report.devHoldPct, 2);
       assert.equal(out.report.openingBuyPct, 1);
       assert.equal(out.report.distribution.top10UpperPct, 30);
-      assert.equal(out.report.distribution.uniqueHolderSample, 2);
+      assert.equal(out.report.distribution.holderSample, 2);
+      assert.ok(!('minHolders' in wallet.filters), 'old preset 8-holder gate is removed');
     });
     await test('high current creator balance hard-blocks even when opening buy is low', async () => {
       creatorBalance = 250_000_000_000_000n;
@@ -116,13 +113,13 @@ const test = async (label, fn) => { await fn(); console.log(`  ✓ ${label}`); }
       assert.ok(out.reasons.some((r) => r.startsWith('dev_opening_buy_high(30.0%>20%)')));
       candidate.initialBuy = 10_000_000;
     });
-    await test('unread current creator balance or owner sample fails closed', async () => {
+    await test('creator balance remains required; no eight-holder or owner-sample wait', async () => {
       creatorAvailable = false;
       assert.ok((await verdict()).reasons.includes('dev_hold_unread'));
       creatorAvailable = true;
-      ownersAvailable = false;
-      assert.ok((await verdict()).reasons.includes('holders_unverified'));
-      ownersAvailable = true;
+      wallet.filters.minHolders = 8; // old saved field must not silently gate buys
+      assert.equal((await verdict()).ok, true);
+      delete wallet.filters.minHolders;
     });
     await test('top-ten lower bound and ambiguous upper bound cannot approve a buy', async () => {
       wallet.filters.maxTop10HoldersPct = 25;
@@ -130,9 +127,18 @@ const test = async (label, fn) => { await fn(); console.log(`  ✓ ${label}`); }
       wallet.filters.maxTop10HoldersPct = 29;
       assert.ok((await verdict()).reasons.includes('top10_unverified'));
       wallet.filters.maxTop10HoldersPct = 35;
-      wallet.filters.minHolders = 3;
-      assert.ok((await verdict()).reasons.includes('holders_below_min(2<3)'));
-      wallet.filters.minHolders = 2;
+    });
+    await test('an inputted floor is the only dollar floor: $992 real vs $0/$500/$2000', async () => {
+      realSol = 4_960_000_000n; // $992 actual; event virtual stays $6,000
+      safety._reportCache.clear();
+      wallet.filters.minLiquidityUsd = 0;
+      assert.equal((await verdict()).ok, true, '$0 user floor allows immediate entry');
+      wallet.filters.minLiquidityUsd = 500;
+      assert.equal((await verdict()).ok, true, '$500 user floor allows $992 real');
+      wallet.filters.minLiquidityUsd = 2000;
+      assert.ok((await verdict()).reasons.includes('liquidity_below_min_usd($992<$2000)'));
+      realSol = 15_000_000_000n;
+      safety._reportCache.clear();
     });
     await test('the saved real-dollar floor does not compare against virtual reserves', async () => {
       realSol = 8_000_000_000n; // virtual remains 30 SOL ($6,000)
@@ -143,10 +149,37 @@ const test = async (label, fn) => { await fn(); console.log(`  ✓ ${label}`); }
       realSol = 15_000_000_000n;
       safety._reportCache.clear();
     });
-    await test('unavailable SOL/USD quote cannot satisfy a saved dollar ceiling', async () => {
+    await test('at the first instant, zero other buyers and saved $0 do not impose a waiting period', async () => {
+      justLaunched = true;
+      reserveBalance = supply;
+      creatorBalance = 0n;
+      realSol = 0n;
+      candidate.initialBuy = 0;
+      wallet.filters.minLiquidityUsd = 0;
+      price.__reset();
+      safety._reportCache.clear();
+      const out = await verdict();
+      assert.equal(out.ok, true, out.reasons.join(','));
+      assert.equal(out.report.distribution.holderSample, 0);
+      assert.equal(out.report.distribution.top10UpperPct, 0);
+      assert.equal(out.report.devHoldPct, 0);
+      justLaunched = false;
+      reserveBalance = 700_000_000_000_000n;
+      creatorBalance = 20_000_000_000_000n;
+      realSol = 15_000_000_000n;
+      candidate.initialBuy = 10_000_000;
+      wallet.filters.minLiquidityUsd = 2000;
+      price.__setPrice(200);
+      safety._reportCache.clear();
+    });
+    await test('missing quote blocks a positive saved floor, not a user-saved $0 floor', async () => {
       price.__reset();
       assert.ok((await verdict()).reasons.includes('sol_usd_quote_unavailable'));
+      wallet.filters.minLiquidityUsd = 0;
+      assert.equal((await verdict()).ok, true, 'do not wait for price when USD min/max are disabled');
+      wallet.filters.minLiquidityUsd = 2000;
     });
+    console.log(`  ${passed} passed, 0 failed`);
   } finally {
     global.fetch = oldFetch;
     price.__reset();
