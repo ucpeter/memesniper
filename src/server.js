@@ -175,7 +175,8 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     res.json({ connected: Boolean(engine.scanner.ws && engine.scanner.ws.readyState === 1),
       rows: rows.map((r) => ({
         mint: r.mint, symbol: r.symbol, devWallet: r.devWallet,
-        devHoldPct: r.devHoldPct, liquidityUsd: r.liquidityUsd,
+        devHoldPct: r.devHoldPct, currentDevHoldPct: r.currentDevHoldPct,
+        largestHolderPct: r.largestHolderPct, liquidityUsd: r.liquidityUsd,
         virtualLiquiditySol: r.virtualLiquiditySol, virtualLiquidityUsd: r.virtualLiquidityUsd,
         realLiquiditySol: r.realLiquiditySol, realLiquidityUsd: r.realLiquidityUsd,
         liquidityApprox: r.solUsdSource === 'fallback' || Boolean(r.solUsdStale),
