@@ -38,7 +38,7 @@ const PRESETS = {
       stopLossPct: 15,
       trailing: { enabled: true, activationPct: 25, trailPct: 12 },
     },
-    filters: { maxDevHoldPct: 10, minLiquiditySol: 2, maxLiquiditySol: 0, maxTop10HoldersPct: 25, minHolders: 10 },
+    filters: { maxDevHoldPct: 10, minLiquiditySol: 2, maxLiquiditySol: 0, maxTop10HoldersPct: 25 },
   },
 
   balanced: {
@@ -54,7 +54,7 @@ const PRESETS = {
       stopLossPct: 25,
       trailing: { enabled: true, activationPct: 40, trailPct: 18 },
     },
-    filters: { maxDevHoldPct: 20, minLiquiditySol: 1, maxLiquiditySol: 0, maxTop10HoldersPct: 35, minHolders: 8 },
+    filters: { maxDevHoldPct: 20, minLiquiditySol: 1, maxLiquiditySol: 0, maxTop10HoldersPct: 35 },
   },
 
   aggressive: {
@@ -70,7 +70,7 @@ const PRESETS = {
       stopLossPct: 40,
       trailing: { enabled: true, activationPct: 80, trailPct: 25 },
     },
-    filters: { maxDevHoldPct: 30, minLiquiditySol: 0.5, maxLiquiditySol: 0, maxTop10HoldersPct: 50, minHolders: 5 },
+    filters: { maxDevHoldPct: 30, minLiquiditySol: 0.5, maxLiquiditySol: 0, maxTop10HoldersPct: 50 },
   },
 
   degen: {
@@ -86,7 +86,7 @@ const PRESETS = {
       stopLossPct: 60,
       trailing: { enabled: true, activationPct: 150, trailPct: 35 },
     },
-    filters: { maxDevHoldPct: 50, minLiquiditySol: 0.1, maxLiquiditySol: 0, maxTop10HoldersPct: 70, minHolders: 3 },
+    filters: { maxDevHoldPct: 50, minLiquiditySol: 0.1, maxLiquiditySol: 0, maxTop10HoldersPct: 70 },
   },
 
   scalper: {
@@ -102,7 +102,7 @@ const PRESETS = {
       stopLossPct: 10,
       trailing: { enabled: true, activationPct: 12, trailPct: 6 },
     },
-    filters: { maxDevHoldPct: 20, minLiquiditySol: 1, maxLiquiditySol: 0, maxTop10HoldersPct: 40, minHolders: 6 },
+    filters: { maxDevHoldPct: 20, minLiquiditySol: 1, maxLiquiditySol: 0, maxTop10HoldersPct: 40 },
   },
 };
 
@@ -176,7 +176,7 @@ function defaultGlobalConfig() {
      * not change depending on which wallet happens to be enabled. */
     risk: {
       maxDevHoldPct: 15,     // dev's opening buy, % of the 1e9 supply
-      minLiquidityUsd: 2000, // REAL deposited SOL floor in USD; never virtual curve SOL
+      minLiquidityUsd: 2000, // informational Risk reference ONLY; never a wallet trading floor
     },
   };
 }
@@ -240,7 +240,6 @@ function defaultWalletConfig(name) {
       minLiquidityUsd: Math.round(p.filters.minLiquiditySol * 150),
       maxLiquidityUsd: p.filters.maxLiquiditySol ? Math.round(p.filters.maxLiquiditySol * 150) : 0,
       maxTop10HoldersPct: p.filters.maxTop10HoldersPct,
-      minHolders: p.filters.minHolders,
       // ── metadata ──────────────────────────────────────────────────
       requireSocial: false,
       minNameLength: 2,
@@ -462,6 +461,10 @@ function normaliseWallet(cfg) {
    * that echoes that shape back on PUT would otherwise persist a second, dead
    * copy of the strategy here — edits to it would silently do nothing. */
   delete w.config;
+  // Legacy presets stored an eight-holder minimum even though the user did not
+  // request waiting for other buyers. Remove it from existing saved wallets as
+  // well as new defaults; no entry rule may depend on this hidden field.
+  delete w.filters.minHolders;
 
   w.buy.minAmountSol = clamp(w.buy.minAmountSol, 0.001, 100, 0.01);
   w.buy.maxAmountSol = clamp(w.buy.maxAmountSol, w.buy.minAmountSol, 100, w.buy.minAmountSol);
