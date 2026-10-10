@@ -3783,21 +3783,23 @@ function walletFeedTable(w, limit = 200) {
   }
   return `<table class="scan-tbl">
     <thead><tr>
-      <th>Token</th><th class="num">Dev hold</th><th class="num">Liquidity</th><th class="num">Risk</th>
+      <th>Token</th><th class="num" title="Creator's current on-chain token balance and their opening buy, separately">Dev hold</th><th class="num">Liquidity</th><th class="num" title="Informational global baseline; the saved wallet limits decide whether a buy is eligible">Risk</th>
       <th>What ${esc(w.name)} did</th>
     </tr></thead>
     <tbody>${rows.map((r) => {
       const v = walletVerdict(r, w);
       const liqUsd = r.liquidityUsd === null || r.liquidityUsd === undefined ? null : Number(r.liquidityUsd);
       const realUsd = r.realLiquidityUsd === null || r.realLiquidityUsd === undefined ? null : Number(r.realLiquidityUsd);
+      const currentDev = r.currentDevHoldPct === null || r.currentDevHoldPct === undefined ? null : Number(r.currentDevHoldPct);
       const risk = r.riskScore === null || r.riskScore === undefined ? null : Number(r.riskScore);
       return `<tr data-mint="${esc(r.mint)}">
         <td>
           <div class="scan-sym">${esc(r.symbol || 'unknown')}</div>
           <a class="scan-mint mono" href="https://pump.fun/coin/${esc(r.mint)}" target="_blank" rel="noopener noreferrer">${esc(short(r.mint, 4))}</a>
         </td>
-        <td class="num ${r.devHoldPct === null || r.devHoldPct === undefined ? 'mute' : ''}">
-          ${r.devHoldPct === null || r.devHoldPct === undefined ? 'unread' : `${Number(r.devHoldPct).toFixed(1)}%`}
+        <td class="num ${currentDev === null ? 'mute' : ''}">
+          <div title="Actual creator token accounts read on-chain">${currentDev === null ? 'current unread' : `${currentDev.toFixed(1)}% current`}</div>
+          <div class="scan-liq-real" title="Creator's opening buy from the launch event, not their current holdings">${r.devHoldPct === null || r.devHoldPct === undefined ? 'opening unread' : `${Number(r.devHoldPct).toFixed(1)}% opening`}</div>
         </td>
         <td class="num ${liqUsd === null ? 'mute' : ''}">
           <div class="scan-liq-main" title="Virtual curve SOL — pricing liquidity, not deposited SOL">${liqUsd === null ? 'virtual unread' : `${liqUsd === 0 && Number(r.virtualLiquiditySol ?? r.liquiditySol) > 0 ? '<$1' : `${liqUsd.toLocaleString('en-US')}`} virtual`}</div>
@@ -3858,6 +3860,10 @@ function openWalletDetail(walletId) {
   const st = w.stats || {};
   const open = w.openPositions || [];
   const closed = (w.recentPositions || []).filter((p) => p.status === 'CLOSED').slice(0, 40);
+  const rules = w.config?.filters || {};
+  const realFloor = rules.minLiquidityUsd != null
+    ? `${Number(rules.minLiquidityUsd).toLocaleString('en-US')}`
+    : `${Number(rules.minLiquiditySol || 0).toLocaleString('en-US')} SOL (legacy)`;
 
   const stat = (k, v, c) => `<div class="wstat"><div class="wstat-k">${k}</div><div class="wstat-v ${c || ''}">${v}</div></div>`;
 
@@ -3910,6 +3916,7 @@ function openWalletDetail(walletId) {
         </div>
 
         <div class="section-label">What ${esc(w.name)} did with the launches it saw (<span data-live-wallet-count="${esc(w.id)}">${walletFeed(w).length}</span>)</div>
+        <div class="dim" style="font-size:11px;margin-bottom:7px">Saved wallet rules: real liquidity ≥ ${esc(realFloor)} · creator ≤ ${esc(rules.maxDevHoldPct ?? '—')}% · top 10 ≤ ${esc(rules.maxTop10HoldersPct ?? '—')}%. Risk is informational; these wallet rules decide eligibility.</div>
         <div class="tbl-wrap" data-live-wallet-feed="${esc(w.id)}">${walletFeedTable(w)}</div>
 
         <div class="section-label">Open positions (${open.length})</div>
@@ -4426,7 +4433,7 @@ function renderEditorPanes(root) {
     </div>
     <div class="section-label">Distribution</div>
     <div class="grid3">
-      <div class="field"><label>Max dev hold (%)</label><input type="number" id="f_devhold" value="${c.filters.maxDevHoldPct}"/></div>
+      <div class="field"><label>Max dev holding and opening buy (%)</label><input type="number" id="f_devhold" value="${c.filters.maxDevHoldPct}"/></div>
       <div class="field"><label>Max top-10 holders (%)</label><input type="number" id="f_top10" value="${c.filters.maxTop10HoldersPct}"/>
         <div class="hint">Measured excluding the bonding curve itself.</div></div>
       <div class="field"><label>Liquidity range (USD)</label>
