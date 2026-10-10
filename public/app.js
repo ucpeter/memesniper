@@ -2224,8 +2224,11 @@ function renderWallets() {
  * scrollbar on every launch, exactly what made the user's swipe spring back. */
 function reconcileWalletTable(wrap, w, limit) {
   if (!wrap) return;
+  const markup = walletFeedTable(w, limit);
+  if (wrap._lastMarkup === markup && (wrap.querySelector('table') || wrap.querySelector('.empty'))) return;
+  wrap._lastMarkup = markup;
   const template = document.createElement('template');
-  template.innerHTML = walletFeedTable(w, limit);
+  template.innerHTML = markup;
   const fresh = template.content.querySelector('table');
   const old = wrap.querySelector('table');
   if (!old || !fresh) {
@@ -2274,7 +2277,7 @@ function renderWalletFeeds() {
     // Keep their scroll containers alive; refresh only table rows and counts.
     for (const wrap of document.querySelectorAll('[data-live-wallet-feed]')) {
       if (wrap.getAttribute('data-live-wallet-feed') !== w.id) continue;
-      reconcileWalletTable(wrap, w, 40);
+      reconcileWalletTable(wrap, w, 200);
     }
     const liveCount = document.querySelector('[data-live-wallet-count]');
     if (liveCount && liveCount.getAttribute('data-live-wallet-count') === w.id) {
@@ -2308,12 +2311,15 @@ function walletVerdict(row, w) {
   if (!mine) return { label: 'not evaluated', cls: 'sim', reason: 'the engine had not reached this launch for this wallet' };
   if (mine.action === 'filtered') return { label: 'filtered', cls: 'sim', reason: mine.reason || 'its filters ruled the token out' };
   if (mine.action === 'rpc_error') return { label: 'RPC unavailable', cls: 'lost', reason: 'Connection/rate limit — token not checked. Check RPC settings.' };
-  if (mine.action === 'checking') return { label: 'evaluating…', cls: 'paper', reason: null };
+  if (mine.action === 'checking') return { label: 'evaluating…', cls: 'paper', reason: mine.stage || 'Checking token on-chain' };
+  if (mine.action === 'slow') return { label: 'SLOW / PENDING', cls: 'paper', reason: mine.reason };
+  if (mine.action === 'timed_out') return { label: 'TIMED OUT', cls: 'lost', reason: mine.reason };
+  if (mine.action === 'unconfirmed' || mine.action === 'error') return { label: 'NOT CONFIRMED', cls: 'lost', reason: mine.reason, txSignature: mine.txSignature };
   return { label: 'skipped', cls: 'sim', reason: mine.reason || row.skipReason || 'declined' };
 }
 
 /** The per-wallet launch table, shared by the 📄 Trades dialog and 📡 Feed. */
-function walletFeedTable(w, limit = 40) {
+function walletFeedTable(w, limit = 200) {
   const rows = walletFeed(w).slice(0, limit);
   if (!rows.length) {
     return `<div class="empty" style="padding:18px"><div class="empty-sub">No launch has reached ${esc(w.name)} yet. Press ▶ Start on its card and they will appear here as they are scanned.</div></div>`;
@@ -2346,6 +2352,7 @@ function walletFeedTable(w, limit = 40) {
         <td>
           <span class="badge ${v.cls}" style="padding:1px 7px;font-size:9.5px">${esc(v.label)}</span>
           ${v.reason ? `<div class="scan-reason" title="${esc(v.reason)}">${esc(shortReason(v.reason))}</div>` : ''}
+          ${v.txSignature ? `<a href="https://solscan.io/tx/${esc(v.txSignature)}" target="_blank" rel="noopener noreferrer">Check transaction ↗</a>` : ''}
         </td>
       </tr>`;
     }).join('')}</tbody>
