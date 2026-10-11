@@ -632,7 +632,18 @@ html, body { max-width: 100%; overflow-x: hidden; }
 @media (max-width: 420px) {
   .wallet-stats { grid-template-columns: 1fr !important; }
   .stats { grid-template-columns: 1fr !important; }
-  .modal-foot .btn { min-width: 100%; }
+  /* Compact two-up controls: dangerous actions last in the wallet detail. */
+  .modal-foot.wallet-detail-actions,
+  .modal-foot.wallet-config-actions { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .modal-foot.wallet-detail-actions > div { display:none; }
+  .modal-foot.wallet-detail-actions #wdFund { order:1; }
+  .modal-foot.wallet-detail-actions #wdWithdraw { order:2; }
+  .modal-foot.wallet-detail-actions #wdConfig { order:3; }
+  .modal-foot.wallet-detail-actions #wdKill { order:4; }
+  .modal-foot.wallet-detail-actions #wdDelete { order:5; grid-column:1/-1; }
+  .modal-foot.wallet-detail-actions .btn,
+  .modal-foot.wallet-config-actions .btn { min-width:0; width:100%; flex:none; white-space:normal; overflow-wrap:anywhere; }
+  .modal-foot:not(.wallet-detail-actions):not(.wallet-config-actions) .btn { min-width:0; flex:1 1 0; overflow-wrap:anywhere; white-space:normal; }
 }
 
 /* ---------------------- Burner-wallet framing ---------------------- */
@@ -895,3 +906,13 @@ html, body { max-width: 100%; overflow-x: hidden; }
 .browser-only-lock { flex-wrap:wrap; border:1px solid var(--border-hi);border-radius:9px;padding:8px;margin-bottom:12px; }
 .browser-only-lock .badge { flex:1 1 100%; }
 .browser-only-lock input { flex:1 1 140px;min-width:0; }
+
+/* Modal buttons stay in view; the content scrolls inside the dialog. */
+@media(max-width:760px) {
+  .modal-bg { overflow-y:auto; -webkit-overflow-scrolling:touch; padding-bottom:max(8px, env(safe-area-inset-bottom)); }
+  .modal { min-width:0; max-height:calc(100dvh - 16px) !important; }
+  .modal-body { min-height:0; overflow-y:auto; padding-bottom:calc(18px + env(safe-area-inset-bottom)); }
+  .modal-foot { min-width:0; flex-shrink:0; }
+  .modal-head { min-width:0; }
+  .modal-title { min-width:0; overflow-wrap:anywhere; }
+}

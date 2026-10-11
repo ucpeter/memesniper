@@ -14,6 +14,7 @@ const S = {
   ws: null,
   demo: false,
   status: null,
+  serverRestarted: false, // shown only after observing an actual change of process ID
   wallets: [],
   positions: [],
   prices: {},
@@ -377,15 +378,29 @@ async function boot() {
  * token and keystore state do not, and those are exactly what every button
  * needs. One cheap GET each, only when the tab is actually looked at.
  */
-function resyncAfterRestart() {
+/** Observe a fresh server process without assuming that a disconnected socket
+ * or a stopped engine means a restart. No automatic trading or key replay. */
+function acceptServerStatus(next) {
+  if (S.status?.instanceId && next?.instanceId && S.status.instanceId !== next.instanceId) {
+    S.serverRestarted = true;
+    S.browserUnlocked.clear();
+    toast('The bot restarted. Check this wallet’s key and saved configuration before starting it again.', 'warn');
+  }
+  S.status = next;
+}
+
+async function resyncAfterRestart() {
   if (S.demo || !S.token) return;
-  syncKeystoreState();
-  api('/api/status').then((st) => {
-    S.status = st.engine;
+  try {
+    const st = await api('/api/status');
+    acceptServerStatus(st.engine);
     S.keystore = st.keystore;
     S.presets = st.presets;
-    renderChips(); renderStats(); renderWallets();
-  }).catch(() => { /* the next action will report it */ });
+    // A focus event after a restart must refresh the wallet list as well as
+    // keystore status. Otherwise an old card can falsely look armed.
+    await refreshAll();
+    renderAll();
+  } catch { /* the next action will report it */ }
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -429,7 +444,7 @@ function upsertScanRow(row) {
 function handleWs(msg) {
   switch (msg.type) {
     case 'snapshot':
-      S.status = msg.data.status;
+      acceptServerStatus(msg.data.status);
       S.wallets = msg.data.wallets;
       S.positions = msg.data.positions.filter((p) => p.status === 'OPEN');
       S.prices = msg.data.prices || {};
@@ -442,7 +457,7 @@ function handleWs(msg) {
       renderAll();
       break;
     case 'tick':
-      S.status = msg.data.status;
+      acceptServerStatus(msg.data.status);
       mergeWallets(msg.data.wallets);
       S.prices = msg.data.prices || {};
       renderChips(); renderStats(); renderOverall(); renderWallets(); renderPositions();
@@ -1738,6 +1753,16 @@ function renderNotices() {
       Run <code class="mono">npm start</code> for the real bot.
     </div></div>`);
   }
+  if (S.serverRestarted) {
+    out.push(`<div class="notice warn"><span class="ico">⚠</span><div>
+      <b>The bot process restarted.</b> Browser-sealed keys are safe here, but a key held
+      only in the old process must be reopened with that wallet’s passphrase before
+      trading resumes. If a card says “Register again,” the server has also lost its
+      wallet record: restore your saved config/backup and verify that Render’s
+      <code>DATA_DIR</code> points to an attached persistent disk. Check Render Logs
+      for why the process stopped. No wallet is restarted automatically.
+    </div></div>`);
+  }
   if (S.status && S.status.dryRun === false) {
     out.push(`<div class="notice danger"><span class="ico">⚠</span><div><b>LIVE — real funds.</b> Every buy and sell is a real transaction.</div></div>`);
   }
@@ -1764,9 +1789,10 @@ function renderNotices() {
   const st = S.status && S.status.storage;
   if (st && st.ephemeral) {
     out.push(`<div class="notice warn"><span class="ico">⚠</span><div>
-      <b>This host rebuilds its disk when it sleeps.</b> Your <b>wallets are safe</b> — their keys are
-      sealed in this browser. What it forgets is each wallet's strategy and position history, and every
-      wallet has to be unlocked again after it wakes.
+      <b>No persistent disk is confirmed for this Render service.</b> Setting <code>DATA_DIR</code>
+      alone does not mount a disk. Your browser-sealed keys remain on this device, but wallet records,
+      strategy and position history may vanish when the service restarts. Verify the disk attachment
+      and mount path in Render before relying on unattended trading.
       <div class="row-flex" style="margin-top:10px;gap:8px;flex-wrap:wrap">
         <button class="btn btn-sm" data-backup="1">⬇ Download a backup now</button>
         <button class="btn btn-sm" data-restore="1">⬆ Restore from a backup</button>
@@ -2184,7 +2210,19 @@ function renderWallets() {
       const wrap = el.querySelector('.tbl-wrap');
       return [el.getAttribute('data-wallet-feed'), { left: wrap?.scrollLeft || 0, top: wrap?.scrollTop || 0 }];
     }));
+    const active = cards.ownerDocument?.activeElement || null;
+    const inputId = active && cards.contains(active) && active.matches('input[type="password"]') ? active.id : null;
+    const passValue = inputId ? active.value : null;
+    const selection = inputId ? active.selectionStart : null;
     cards.innerHTML = walletCardsHtml;
+    // Status can change while Android's password keyboard is open. Keep that
+    // field in place across updates, without persisting or sending its contents.
+    const restored = inputId ? cards.ownerDocument.getElementById(inputId) : null;
+    if (restored && restored.type === 'password') {
+      restored.value = passValue;
+      restored.focus({ preventScroll: true });
+      try { restored.setSelectionRange(selection, selection); } catch { /* unsupported */ }
+    }
     renderWallets.lastHtml = walletCardsHtml;
     renderWalletFeeds();
     for (const el of cards.querySelectorAll('[data-wallet-feed]')) {
@@ -2462,7 +2500,7 @@ function openWalletDetail(walletId) {
           total across every wallet.
         </div></div>
       </div>
-      <div class="modal-foot">
+      <div class="modal-foot wallet-detail-actions">
         <button class="btn btn-danger" id="wdDelete">Delete</button>
         <div style="flex:1"></div>
         <button class="btn btn-fund" id="wdFund">💸 Fund</button>
@@ -2765,7 +2803,7 @@ function openWallet(walletId, opts = {}) {
         <div class="tabpane" data-pane="filters" id="paneFilters"></div>
         <div class="tabpane" data-pane="ai" id="paneAi"></div>
       </div>
-      <div class="modal-foot">
+      <div class="modal-foot wallet-config-actions">
         <button class="btn" data-close-modal="1">Cancel</button>
         ${!isNew ? `<button class="btn btn-danger" id="edDelete">Delete wallet</button>` : ''}
         ${justCreated || !isNew ? `<button class="btn btn-fund" id="edFund">💸 Fund</button>` : ''}
