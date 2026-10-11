@@ -107,18 +107,33 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
   function storageStatus() {
     const dir = path.dirname(keystore.KEYSTORE_PATH);
     const onRender = Boolean(process.env.RENDER);
-    // Render sets RENDER=true for every service. A persistent disk is the answer,
-    // and the documented path for it is /var/data, which arrives as DATA_DIR.
-    const usingVolume = Boolean(process.env.DATA_DIR);
-    const ephemeral = onRender && !usingVolume;
+    // Setting DATA_DIR=/var/data does NOT mount a disk. Verify the mount exists
+    // in this process before promising persistence (particularly on Render).
+    // Linux mountinfo escapes spaces as \040; avoid shelling out or reading keys.
+    let volumeMounted = false;
+    if (onRender && process.env.DATA_DIR) {
+      try {
+        const dest = path.resolve(dir);
+        const mounts = fs.readFileSync('/proc/self/mountinfo', 'utf8');
+        volumeMounted = mounts.split('\n').some((line) => {
+          const point = line.split(' ')[4]?.replace(/\\040/g, ' ');
+          const fsType = line.split(' - ')[1]?.split(' ')[0];
+          const volatile = ['tmpfs', 'overlay', 'aufs', 'squashfs', 'proc', 'sysfs', 'devtmpfs'];
+          return point && point !== '/' && !volatile.includes(fsType)
+            && (dest === point || dest.startsWith(`${point}/`));
+        });
+      } catch { /* cannot verify => warn rather than assume safe */ }
+    }
+    const ephemeral = onRender && !volumeMounted;
     return {
       dataDir: dir,
+      volumeMounted: onRender ? volumeMounted : null,
       ephemeral,
       reason: ephemeral
-        ? 'This host rebuilds its disk when the service sleeps or redeploys, so the keystore and wallet list are destroyed each time. Attach a persistent disk and set DATA_DIR to its mount path, or restore from a backup after each wake.'
-        : (usingVolume
-          ? 'DATA_DIR is set, so this host is expected to keep its disk across restarts.'
-          : 'Storing data next to the app. It survives a restart only if the directory does.'),
+        ? 'No mounted persistent disk is visible at DATA_DIR on this Render process. Setting DATA_DIR alone does not attach one. Wallet records, strategy and position snapshots can be lost on restart. Check this service’s disk attachment, mount path and Render Logs.'
+        : (onRender
+          ? 'A volume mount is visible at DATA_DIR; confirm the disk persists after deploy in your Render service.'
+          : 'Storage persistence depends on this machine and DATA_DIR; no Render mount check was performed.'),
     };
   }
 
