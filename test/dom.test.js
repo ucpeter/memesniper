@@ -204,6 +204,18 @@ async function click(window, el) {
     assert.doesNotMatch(css, /\.modal-foot \.btn\s*\{\s*min-width:\s*100%/);
   });
 
+  await test('terminal toolbar wraps before desktop-site mobile width clips its last button', async () => {
+    const css = fs.readFileSync(path.join(ROOT, 'public', 'styles.css'), 'utf8');
+    assert.match(css, /@media \(max-width: 1280px\)\s*\{\s*\.topbar\s*\{[^}]*flex-wrap: wrap/s,
+      'desktop-site mode uses a wider breakpoint, not just the phone media query');
+    assert.match(css, /\.topbar\s*\{[^}]*height: auto[^}]*flex-wrap: wrap/s,
+      'the toolbar cannot remain a fixed-height clipped row');
+    assert.match(css, /\.brand-mark\s*\{[^}]*flex: 0 0 26px/s,
+      'the icon must not shrink away from the name');
+    assert.match(css, /\.brand > div:last-child > div:first-child\s*\{[^}]*white-space: nowrap/s,
+      'the logo/name remains aligned');
+  });
+
   await test('landing nav and both logo instances keep their green viewing rim', async () => {
     const landing = fs.readFileSync(path.join(ROOT, 'public', 'landing.html'), 'utf8');
     const index = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
