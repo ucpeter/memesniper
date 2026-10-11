@@ -311,18 +311,19 @@ async function click(window, el) {
     assert.ok(!inKeystore.querySelector('button[data-arm]'), 'nor is a passphrase field, which is for the browser-sealed case');
   });
 
-  await test('the wallet card separates REAL money from the simulation', async () => {
-    // The card used to show "PAPER BAL. 10.000" for a wallet holding 0 SOL on chain,
-    // and there was no way to tell which number was real. Real balance first, and
-    // the simulated one named as simulated.
-    const { $ } = await bootDashboard({ wallets: 2, keystoreUnlocked: true });
+  await test('wallet cards show real money, not a fabricated simulated balance', async () => {
+    const { $, window } = await bootDashboard({ wallets: 2, keystoreUnlocked: true });
     const card = $('.wallet');
     const text = card.textContent;
-
-    assert.match(text, /Real bal\./i, 'the real balance must be on the card');
-    assert.match(text, /Sim\. balance/i, 'the simulated balance must be named as such');
-    assert.match(text, /SIMULATED/i, 'and tagged SIMULATED, not "PAPER"');
-    assert.ok(!/Paper bal/i.test(text), 'the old unreadable label must be gone');
+    assert.match(text, /Real bal\./i, 'actual on-chain balance remains visible');
+    assert.doesNotMatch(text, /Sim\. balance|PAPER BAL|paper balance/i,
+      'wallet cards must not display a second notional balance');
+    assert.equal(card.querySelectorAll('.wallet-stats .wstat').length, 5,
+      'retain real balance, bought, realised, win rate and open positions');
+    assert.match(card.textContent, /paper trading|not started/i,
+      'mode/armed state still tells the user when trading is simulated');
+    assert.match(window.document.querySelector('#modeText').textContent, /DRY RUN/i,
+      'the global dry-run distinction remains visible');
   });
 
   await test('the dashboard states what dry run does and does not cover', async () => {
