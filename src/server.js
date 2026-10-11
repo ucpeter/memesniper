@@ -25,6 +25,14 @@ const { PRESETS, defaultWalletConfig, normaliseWallet, applyPreset } = cfg;
 /** Per-boot session token. Printed to the console; required for writes. */
 const SESSION_TOKEN = process.env.SESSION_TOKEN || crypto.randomBytes(16).toString('hex');
 
+/** WebSocket JSON cannot encode BigInt. The price poller stores reserve and
+ * price figures as BigInts, and a heartbeat after the first BUY includes them.
+ * JSON.stringify without this replacer threw inside setInterval and killed the
+ * entire bot, leaving both paper and real positions unmanaged. Decimal strings
+ * retain exact precision for clients that need to read those reserves. */
+const wireJson = (payload) => JSON.stringify(payload, (_key, value) =>
+  typeof value === 'bigint' ? value.toString() : value);
+
 function maskSecret(s) {
   if (!s) return '';
   const str = String(s);
@@ -1354,7 +1362,7 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
 
   wss.on('connection', (ws) => {
     // Prime the client with current state so the UI paints instantly.
-    ws.send(JSON.stringify({
+    try { ws.send(wireJson({
       type: 'snapshot',
       data: {
         status: engine.status(),
@@ -1368,11 +1376,15 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
         logs: log.history(120),
         prices: Object.fromEntries(engine.priceCache),
       },
-    }));
+    })); } catch (err) {
+      log.error(`WebSocket snapshot failed: ${err.message}`);
+      ws.close();
+      return;
+    }
 
     const forward = (type) => (payload) => {
       if (ws.readyState !== 1) return;
-      try { ws.send(JSON.stringify({ type, data: payload })); } catch { /* client gone */ }
+      try { ws.send(wireJson({ type, data: payload })); } catch { /* client gone */ }
     };
 
     const channels = [
@@ -1408,14 +1420,19 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     // even if an individual event is missed.
     const beat = setInterval(() => {
       if (ws.readyState !== 1) return;
-      ws.send(JSON.stringify({
+      try { ws.send(wireJson({
         type: 'tick',
         data: {
           status: engine.status(),
           wallets: walletRows(),
           prices: Object.fromEntries(engine.priceCache),
         },
-      }));
+      })); } catch (err) {
+        // A client/serializer failure must never bring down the trading process.
+        // Close this one socket so the browser can reconnect; exits keep running.
+        log.warn(`WebSocket tick failed; closing this connection: ${err.message}`);
+        ws.terminate();
+      }
     }, 2000);
 
     ws.on('close', () => {
