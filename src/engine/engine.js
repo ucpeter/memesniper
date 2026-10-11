@@ -24,6 +24,7 @@ const { LiveFeed } = require('./livefeed');
 const solprice = require('./solprice');
 const safety = require('./safety');
 const curve = require('./curve');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const configStore = require('../config');
@@ -49,6 +50,7 @@ class Engine {
   constructor({ config, keystore }) {
     this.config = config;
     this.keystore = keystore;
+    this.instanceId = crypto.randomBytes(8).toString('hex'); // changes only on process restart
     this.traders = new Map(); // walletId -> Trader
     this.scanner = new Scanner(config.global);
     this.executor = new Executor(config.global, keystore);
@@ -798,6 +800,7 @@ class Engine {
   status() {
     return {
       running: this.running,
+      instanceId: this.instanceId,
       dryRun: this.executor.dryRun,
       wallets: this.traders.size,
       // One card's worth of answers, computed where the counts actually live.

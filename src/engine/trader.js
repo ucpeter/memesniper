@@ -41,7 +41,7 @@ class Trader {
     this.lastEntryAt = 0;
     this.publicKey = null;
     this.balanceSol = 0; // real on-chain balance (always truthful)
-    this.paperBalanceSol = 0; // notional, dry-run only
+    this.paperBalanceSol = 0; // internal sizing notional, not a displayed wallet balance
     this.balanceKnown = false; // false = last read failed; do not trust the number
     this._rolloverDay();
   }
@@ -78,8 +78,8 @@ class Trader {
    *
    * In dry run an unfunded wallet would otherwise size every position to zero
    * and never trade, which makes paper trading useless for validating the exit
-   * rules. So dry run falls back to a NOTIONAL balance — surfaced separately as
-   * `paperBalanceSol` so the real balance is never misrepresented.
+   * rules. Dry run falls back to an internal NOTIONAL sizing amount, never
+   * displayed as a wallet balance or used as actual spendable SOL.
    */
   effectiveBalanceSol() {
     if (!this.isPaperTrading) return this.balanceSol;
