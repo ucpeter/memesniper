@@ -1914,10 +1914,9 @@ function renderStats() {
   const totalPnl = ws.reduce((a, w) => a + (w.stats?.realisedPnlSol || 0), 0);
   const unrealised = open.reduce((a, p) => a + (p.pnlSol || 0), 0);
   const exposure = ws.reduce((a, w) => a + (w.exposureSol || 0), 0);
-  // In dry run the wallet has no real funds; show the notional balance and tag it
-  // so a paper number is never mistaken for a real one.
-  const paper = ws.some((w) => w.paperTrading);
-  const balance = ws.reduce((a, w) => a + (w.paperTrading ? (w.paperBalanceSol || 0) : (w.balanceSol || 0)), 0);
+  // Keep the *actual* balance available for live-mode context. Dry-run sizing
+  // uses an internal notional amount, not a displayable account balance.
+  const realBalance = ws.reduce((a, w) => a + (w.balanceSol || 0), 0);
   const wins = ws.reduce((a, w) => a + (w.stats?.wins || 0), 0);
   const losses = ws.reduce((a, w) => a + (w.stats?.losses || 0), 0);
   const winRate = wins + losses > 0 ? (wins / (wins + losses)) * 100 : 0;
@@ -1936,8 +1935,8 @@ function renderStats() {
     [dry ? 'Unrealised · paper' : 'Unrealised', `${fmtSol(unrealised)} SOL`,
       [usdOf(unrealised), `${open.length} open${dry ? ' · simulated' : ''}`].filter(Boolean).join(' · '), cls(unrealised), 'blue'],
     ['Win rate', wins + losses ? `${winRate.toFixed(1)}%` : '—', `${wins}W / ${losses}L${dry ? ' · paper' : ''}`, winRate >= 50 ? 'pos' : 'dim', ''],
-    ['Exposure', `${fmtSol(exposure, 2)} SOL`,
-      [usdOf(exposure), dry ? 'of ' + fmtSol(balance, 2) + ' paper balance' : 'of ' + fmtSol(balance, 2) + ' balance'].filter(Boolean).join(' · '), 'dim', 'amber'],
+    [dry ? 'Exposure · paper' : 'Exposure', `${fmtSol(exposure, 2)} SOL`,
+      [usdOf(exposure), dry ? 'simulated positions' : 'of ' + fmtSol(realBalance, 2) + ' balance'].filter(Boolean).join(' · '), 'dim', 'amber'],
     ['Tokens scanned', detected.toLocaleString(),
       `${bought} bought · ${detected ? ((bought / detected) * 100).toFixed(1) : '0'}% hit · ${feedRows} launches scanned`, 'dim', ''],
   ];
@@ -2129,24 +2128,14 @@ function renderWallets() {
         <span class="wallet-preset">${esc(cfg.preset || 'custom')}</span>
       </div>
 
-      <!--
-        This card used to show the PAPER balance alone, so a wallet holding
-        0 SOL on chain displayed "PAPER BAL. 10.000" and there was no way to tell
-        whether the bot was looking at real money. The real balance is now the
-        headline, always; the simulated balance is named as a simulation and is
-        visibly secondary.
-      -->
+      <!-- Show only the wallet's real on-chain balance. Paper-trade P&L is
+           identified by the DRY RUN mode and SIM tags on positions; the internal
+           notional sizing budget is not a second wallet balance. -->
       <div class="wallet-stats">
         <div class="wstat">
           <div class="wstat-k">Real bal.</div>
           <div class="wstat-v ${w.balanceSol === null || w.balanceSol === undefined ? 'mute' : ''}" title="The SOL this wallet actually holds on Solana. Funding adds to it, withdrawing takes from it. In dry run it stays untouched by trades. Read from the address, so it is shown even while the wallet is locked.">${w.balanceSol === null || w.balanceSol === undefined ? (w.keyLocked ? 'unknown' : '—') : fmtSol(w.balanceSol, 3)}</div>
           <div class="wstat-sub">${w.balanceSol === null || w.balanceSol === undefined ? 'on chain' : `${usdOf(w.balanceSol)} on chain`}</div>
-        </div>
-        <div class="wstat">
-          <div class="wstat-k">Sim. balance</div>
-          <div class="wstat-v mute" title="A pretend balance, used only because the bot is in dry run. Simulated trades add and subtract here and nowhere else.">${fmtSol(w.paperBalanceSol || 0, 2)}</div>
-          <div class="wstat-sub">${usdOf(w.paperBalanceSol || 0)}</div>
-          <div class="wstat-sub"><span class="paper-tag">SIMULATED</span></div>
         </div>
         <div class="wstat"><div class="wstat-k" title="Tokens this wallet BOUGHT. Won and lost are the ones that have CLOSED — a position still open counts as bought and nothing else yet.">Bought</div><div class="wstat-v">${st.bought || 0}</div><div class="wstat-sub">${(st.wins || 0)}W / ${(st.losses || 0)}L</div></div>
         <div class="wstat"><div class="wstat-k">Realised</div><div class="wstat-v ${cls(pnl)}" title="Profit and loss booked from CLOSED trades on this wallet.">${fmtSol(pnl, 3)}</div><div class="wstat-sub">${usdOf(pnl)} · ${(st.wins || 0)}W / ${(st.losses || 0)}L</div></div>
@@ -2174,7 +2163,7 @@ function renderWallets() {
         <div style="flex:1"></div>
         ${browserLocked ? (armed ? `<button class="btn btn-sm btn-warn" data-stop="${esc(w.id)}">⏸ Stop</button>` : '') : (armed
           ? `<button class="btn btn-sm btn-warn" data-stop="${esc(w.id)}" title="Stop new entries for this wallet. Open positions are still managed, so your stops keep working.">⏸ Stop</button>`
-          : `<button class="btn btn-sm btn-primary" data-start="${esc(w.id)}" title="Start this wallet${paperMode ? ' — it is in DRY RUN, so its trades will be simulated (paper trades on a paper balance)' : ''}. This also starts the engine if it is stopped.">▶ Start</button>`)}
+          : `<button class="btn btn-sm btn-primary" data-start="${esc(w.id)}" title="Start this wallet${paperMode ? ' — DRY RUN: trades are simulated using an internal notional sizing amount' : ''}. This also starts the engine if it is stopped.">▶ Start</button>`)}
         <button class="btn btn-sm" data-detail="${esc(w.id)}" title="This wallet's open positions, its own trade history, and the launches it saw">📄 Trades</button>
 
         ${browserLocked ? '' : `<button class="btn btn-sm" data-edit="${esc(w.id)}" title="Strategy, limits, exits and filters for this wallet">⚙ Config</button>

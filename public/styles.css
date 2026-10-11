@@ -773,7 +773,7 @@ html, body { max-width: 100%; overflow-x: hidden; }
 
 /* Per-wallet stats: a 4th cell so each wallet shows its own realised SOL and
    win rate, with the board at the top staying the all-wallet aggregate. */
-/* Five stats per card (real balance, simulated balance, realised, win rate, open).
+/* Five stats per card (real balance, bought, realised, win rate, open).
    auto-fit keeps all of them visible at any width instead of silently dropping
    the overflow past the edge of the card. */
 .wallet-stats { grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); }
