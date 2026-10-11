@@ -75,13 +75,15 @@ body {
 
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; letter-spacing: -.4px; font-size: 17px; }
 .brand-mark {
-  width: 26px; height: 26px; border-radius: 7px;
+  width: 26px; height: 26px; flex: 0 0 26px; border-radius: 7px;
   background: linear-gradient(135deg, var(--accent), var(--accent-dk));
   display: grid; place-items: center;
   color: #04140a; font-weight: 900; font-size: 15px;
   box-shadow: var(--glow);
 }
-.brand-sub { color: var(--text-mute); font-size: 11px; font-weight: 600; letter-spacing: .8px; text-transform: uppercase; }
+.brand > div:last-child { min-width: 0; text-align: left; }
+.brand > div:last-child > div:first-child { white-space: nowrap; line-height: 1.2; }
+.brand-sub { color: var(--text-mute); font-size: 11px; font-weight: 600; letter-spacing: .8px; text-transform: uppercase; line-height: 1.2; }
 
 .topbar-spacer { flex: 1; }
 
@@ -739,6 +741,16 @@ html, body { max-width: 100%; overflow-x: hidden; }
   color: #7cc4ff;
   background: rgba(124, 196, 255, .12);
   border-color: rgba(124, 196, 255, .34);
+}
+
+/* At desktop-site/tablet widths the toolbar used to stay a fixed 60px row.
+   Its controls exceeded the viewport and the last button was clipped. Allow
+   intact controls to move to a second row instead of shrinking the logo. */
+@media (max-width: 1280px) {
+  .topbar { height: auto; min-height: 60px; flex-wrap: wrap; gap: 8px 12px; padding: 9px 16px; }
+  .topbar-spacer { display: none; }
+  .topbar .btn { flex: 0 0 auto; white-space: nowrap; min-width: 0; }
+  .brand { flex: 0 0 auto; white-space: nowrap; }
 }
 
 /* ------------------------- Phone header ------------------------- */
