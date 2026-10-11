@@ -164,6 +164,55 @@ async function click(window, el) {
     assert.strictEqual(field.value, 'test passphrase', 'what the owner typed survives the tick');
   });
 
+  await test('a genuine process restart is distinguished from a normal paper tick', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1 });
+    window.eval(`S.status.instanceId='process-one'; S.browserUnlocked.add(S.wallets[0].id);
+      handleWs({type:'tick',data:{status:{...S.status,instanceId:'process-one'},wallets:S.wallets,prices:{}}});`);
+    assert.strictEqual(window.eval('S.serverRestarted'), false, 'a normal tick is not a restart');
+    window.eval(`handleWs({type:'snapshot',data:{status:{...S.status,instanceId:'process-two'},
+      wallets:S.wallets,positions:[],prices:{},logs:[]}});`);
+    assert.strictEqual(window.eval('S.serverRestarted'), true, 'different process marker is a restart');
+    assert.strictEqual(window.eval('S.browserUnlocked.size'), 0, 'an old session must not look unlocked');
+    assert.match($('#notices').textContent, /bot process restarted/i);
+  });
+
+  await test('wallet passphrase entry survives a changing heartbeat without saving it', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1 });
+    window.eval(`S.wallets[0].id='w_phone'; S.wallets[0].keyLocked=true;
+      S.wallets[0].publicKey='PhoneAddress';
+      window.WalletStore={supported:()=>true,record:()=>({address:'PhoneAddress'}),
+        list:()=>[{address:'PhoneAddress'}]}; renderWallets();`);
+    const field = $('[id^="armpass-"]');
+    assert.ok(field);
+    field.focus(); field.value = 'my temporary passphrase';
+    window.eval(`S.wallets[0].stats.bought+=1; renderWallets();`);
+    const current = $('[id^="armpass-"]');
+    assert.strictEqual(current.value, 'my temporary passphrase');
+    assert.strictEqual(window.document.activeElement, current, 'keyboard focus remains on the field');
+  });
+
+  await test('wallet dialogs have explicit compact mobile action groups', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1 });
+    await click(window, $('[data-detail]'));
+    assert.ok($('.modal-foot.wallet-detail-actions'));
+    assert.strictEqual($('.modal-foot.wallet-detail-actions').querySelectorAll('button').length, 5);
+    await click(window, $('#wdConfig'));
+    assert.ok($('.modal-foot.wallet-config-actions'));
+    const css = fs.readFileSync(path.join(ROOT, 'public', 'styles.css'), 'utf8');
+    assert.match(css, /wallet-detail-actions.*?grid-template-columns:\s*repeat\(2/s);
+    assert.match(css, /wallet-config-actions.*?grid-template-columns:\s*repeat\(2/s);
+    assert.doesNotMatch(css, /\.modal-foot \.btn\s*\{\s*min-width:\s*100%/);
+  });
+
+  await test('landing nav and both logo instances keep their green viewing rim', async () => {
+    const landing = fs.readFileSync(path.join(ROOT, 'public', 'landing.html'), 'utf8');
+    const index = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
+    assert.match(landing, /\.brand\{[^}]*white-space:nowrap/);
+    assert.match(landing, /\.nav-in \.btn\{[^}]*padding:9px 10px/);
+    assert.match(landing, /<circle cx="32" cy="32" r="30" fill="#00ff66"\/>/);
+    assert.match(index, /<circle cx="32" cy="32" r="30" fill="#00ff66"\/>/);
+  });
+
   await test('a wallet card offers Fund, and tapping it OPENS the fund dialog', async () => {
     const { window, $, $$ } = await bootDashboard({ wallets: 1 });
     const fundBtn = $$('.wallet button[data-fund]')[0];
@@ -352,7 +401,7 @@ async function click(window, el) {
     // dashboard has to say so too — and offer the way out.
     const { window, $ } = await bootDashboard({ wallets: 1, keystoreUnlocked: true });
     const before = $('#notices').textContent;
-    assert.ok(!/rebuilds its disk/i.test(before), 'no warning when the host keeps its disk');
+    assert.ok(!/No persistent disk is confirmed/i.test(before), 'no warning without the host reporting storage risk');
 
     const storage = {
       dataDir: '/tmp/wherever',
@@ -362,9 +411,9 @@ async function click(window, el) {
     await window.eval(`S.status = Object.assign({}, S.status, { storage: ${JSON.stringify(storage)} }); renderAll();`);
 
     const after = $('#notices').textContent;
-    assert.match(after, /rebuilds its disk/i, 'the warning must appear');
-    assert.match(after, /wallets are safe/i, 'and say plainly that the wallets themselves are not at risk');
-    assert.match(after, /sealed in this browser/i, 'because their keys live in the browser, not on that disk');
+    assert.match(after, /No persistent disk is confirmed/i, 'the warning must appear');
+    assert.match(after, /browser-sealed keys remain on this device/i, 'identify only browser-held keys as safe here');
+    assert.match(after, /wallet records/i, 'and warn about the server state at risk');
     assert.ok($('#notices').querySelector('[data-backup]'), 'and offer a Backup button');
     assert.ok($('#notices').querySelector('[data-restore]'), 'and a Restore button');
   });

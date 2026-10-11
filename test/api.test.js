@@ -153,6 +153,23 @@ const api = async (method, url, body) => {
     assert.ok(st.scan, 'status must carry the feed tally, or the UI cannot reconcile the counters');
     assert.strictEqual(st.scan.rows, 2, 'two launches have been seen by now');
     assert.strictEqual(typeof st.scan.seen, 'number');
+    assert.match(st.instanceId, /^[0-9a-f]{16}$/, 'per-process marker makes restarts distinguishable from a wallet stopping');
+  });
+
+  await test('Render requires an actual mounted disk, not just a DATA_DIR setting', async () => {
+    const original = process.env.RENDER;
+    try {
+      process.env.RENDER = 'true';
+      const r = await get('/api/status');
+      assert.strictEqual(r.status, 200);
+      assert.strictEqual(r.body.storage.volumeMounted, false, 'the test temp directory is not a mounted disk');
+      assert.strictEqual(r.body.storage.ephemeral, true,
+        'DATA_DIR alone cannot imply persistence');
+      assert.match(r.body.storage.reason, /mounted persistent disk/);
+    } finally {
+      if (original === undefined) delete process.env.RENDER;
+      else process.env.RENDER = original;
+    }
   });
 
   await test('GET /api/scan serves the rows instead of an empty list', async () => {
@@ -431,6 +448,20 @@ const api = async (method, url, body) => {
     const w = list.body.find((x) => x.id === id);
     assert.ok(w, 'the wallet is now a live trader, not a locked record');
     assert.strictEqual(w.keyArmed, true, 'and the API says it is armed');
+
+    // Reproduce the owner's sequence: arm the browser wallet, Start in DRY RUN,
+    // then read it again. A normal paper Start must not lose its server record
+    // or require a second passphrase unless the whole process has restarted.
+    const bootId = (await get('/api/status')).body.engine.instanceId;
+    const started = await post(`/api/wallets/${id}/start`, {});
+    assert.strictEqual(started.status, 200, JSON.stringify(started.body));
+    assert.strictEqual(started.body.dryRun, true);
+    const after = (await get('/api/wallets')).body.find((x) => x.id === id);
+    assert.ok(after, 'the registered wallet must still be on the server after Start');
+    assert.strictEqual(after.keyArmed, true, 'the session key remains armed after paper Start');
+    assert.strictEqual(after.armed, true, 'paper wallet remains running');
+    assert.strictEqual((await get('/api/status')).body.engine.instanceId, bootId,
+      'a normal Start cannot masquerade as a process restart');
 
     // The whole point: the key is in MEMORY. Nothing anywhere under DATA_DIR may
     // contain it — not the config, not any keystore file.
