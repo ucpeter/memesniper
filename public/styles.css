@@ -854,6 +854,12 @@ html, body { max-width: 100%; overflow-x: hidden; }
 .panel-sub { font-size: 10.5px; color: var(--text-mute); }
 /* One row per wallet plus a totals row: the "how many trades / wins / losses"
    answer for the whole bot and for each wallet at once. */
+/* Main-terminal "Trades per wallet" summary (not the wallet's 📄 Trades modal).
+   Keep the header/counts live and reachable while the table is collapsed. */
+#overall .panel-body[hidden] { display: none; }
+#overall .overall-head { flex-wrap: wrap; }
+#overall .overall-head .panel-sub { flex: 1 1 190px; min-width: 0; }
+#overall .overall-toggle { margin-left: auto; white-space: nowrap; }
 .overall-tbl { width: 100%; min-width: 630px; border-collapse: collapse; font-size: 12px; }
 .overall-tbl thead th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .4px; color: var(--text-mute); padding: 6px 10px; border-bottom: 1px solid rgba(30, 36, 45, .8); }
 .overall-tbl thead th.num { text-align: right; }
