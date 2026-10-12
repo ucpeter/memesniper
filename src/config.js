@@ -225,7 +225,6 @@ function defaultWalletConfig(name) {
     limits: {
       dailyLossLimitSol: 2, // stop trading for the day at this loss
       dailyProfitTargetSol: 0, // 0 = disabled
-      maxTradesPerDay: 100,
       maxExposureSol: 3,
       stopAfterConsecutiveLosses: 5,
     },
@@ -316,7 +315,14 @@ function load() {
       const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
       state = {
         global: deepMerge(defaultGlobalConfig(), raw.global || {}),
-        wallets: raw.wallets || [],
+        // Old saved wallets may still have a trade-count limit. Drop only that
+        // obsolete field; leave every other saved strategy value untouched.
+        wallets: (raw.wallets || []).map((w) => {
+          if (!w.limits || !Object.hasOwn(w.limits, 'maxTradesPerDay')) return w;
+          const limits = { ...w.limits };
+          delete limits.maxTradesPerDay;
+          return { ...w, limits };
+        }),
       };
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -500,7 +506,7 @@ function normaliseWallet(cfg) {
     .sort((a, b) => a.gainPct - b.gainPct);
 
   w.limits.dailyLossLimitSol = clamp(w.limits.dailyLossLimitSol, 0.01, 10000, 2);
-  w.limits.maxTradesPerDay = Math.round(clamp(w.limits.maxTradesPerDay, 1, 100000, 100));
+  delete w.limits.maxTradesPerDay; // obsolete saved limit: never enforce or re-save
   w.limits.maxExposureSol = clamp(w.limits.maxExposureSol, 0.01, 10000, 3);
   w.limits.stopAfterConsecutiveLosses = Math.round(clamp(w.limits.stopAfterConsecutiveLosses, 1, 1000, 5));
 
