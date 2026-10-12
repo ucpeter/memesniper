@@ -21,6 +21,7 @@ const risk = require('./risk');
 const safety = require('./safety');
 const ai = require('./ai');
 const curve = require('./curve');
+const lossCooldown = require('./loss-cooldown');
 
 const todayKey = () => new Date().toISOString().slice(0, 10);
 
@@ -60,11 +61,25 @@ class Trader {
       if (this.stats.day !== null && this.stats.day !== undefined) {
         log.info('New trading day — resetting daily counters', { wallet: this.cfg.name });
       }
+      // A configured timed breaker may span UTC midnight. Do not grant a buy
+      // before its wait AND the wallet's explicit Start. With 0, preserve the
+      // original UTC-day streak reset. Never undo manual Stop/Panic at midnight.
+      const timed = lossCooldown.status(this, this.getConfig()).tripped &&
+        lossCooldown.durationMs(this.getConfig()) > 0;
+      const manualPause = /^(panic:|stopped from|killed all trades)/.test(this.stats.pauseReason || '');
+      const keepPaused = manualPause || timed;
       this.stats = {
         day: today, tradesToday: 0, realisedPnlSol: 0,
-        consecutiveLosses: 0, wins: this.stats.wins, losses: this.stats.losses,
-        paused: false, pauseReason: null,
+        consecutiveLosses: timed ? this.stats.consecutiveLosses : 0,
+        consecutiveLossCooldownAt: timed ? this.stats.consecutiveLossCooldownAt : 0,
+        lossCooldownPending: timed,
+        wins: this.stats.wins, losses: this.stats.losses,
+        paused: keepPaused, pauseReason: keepPaused ? this.stats.pauseReason : null,
       };
+      // The old stats object was in cfg.stats. Keep persistence and the trader
+      // looking at the same object after a UTC-day reset.
+      this.cfg.stats = this.stats;
+      if (this.publicKey) bus.safeEmit('wallet:stats', this.toJSON());
     }
   }
 
@@ -535,9 +550,17 @@ class Trader {
     if (pnlSol >= 0) {
       this.stats.wins += 1;
       this.stats.consecutiveLosses = 0;
+      if (!this.stats.lossCooldownPending) this.stats.consecutiveLossCooldownAt = 0;
     } else {
       this.stats.losses += 1;
       this.stats.consecutiveLosses += 1;
+      // If another open bag closes at a loss while already paused, the wait
+      // starts from this most recent loss. Each wallet owns its own timestamp.
+      if (this.stats.consecutiveLosses >= this.cfg.limits.stopAfterConsecutiveLosses ||
+          this.stats.lossCooldownPending) {
+        this.stats.consecutiveLossCooldownAt = Date.now();
+        this.stats.lossCooldownPending = true;
+      }
     }
 
     this.byMint.delete(position.mint);
@@ -548,8 +571,10 @@ class Trader {
       this.pause(`daily_loss_limit (${this.stats.realisedPnlSol.toFixed(3)} SOL)`);
     } else if (lim.dailyProfitTargetSol > 0 && this.stats.realisedPnlSol >= lim.dailyProfitTargetSol) {
       this.pause(`daily_profit_target (+${this.stats.realisedPnlSol.toFixed(3)} SOL)`);
-    } else if (this.stats.consecutiveLosses >= lim.stopAfterConsecutiveLosses) {
-      this.pause(`${this.stats.consecutiveLosses} consecutive losses`);
+    } else if (lossCooldown.status(this, this.getConfig()).tripped) {
+      this.pause(lossCooldown.durationMs(this.getConfig())
+        ? 'consecutive-loss cooldown; press Start after the wait'
+        : `${this.stats.consecutiveLosses} consecutive losses`);
     }
 
     log.info(

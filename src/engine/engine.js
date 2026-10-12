@@ -449,7 +449,12 @@ class Engine {
   async panic(reason = 'manual_panic') {
     log.warn(`🚨 PANIC — liquidating all positions (${reason})`);
     const out = await this.killAll(reason);
-    for (const t of this.traders.values()) t.pause(`panic: ${reason}`);
+    for (const t of this.traders.values()) {
+      t.pause(`panic: ${reason}`);
+      // Persist the manual emergency stop even if no position was open to
+      // close (and hence no trade-close stats event occurred).
+      bus.safeEmit('wallet:stats', t.toJSON());
+    }
     bus.safeEmit('engine:panic', { reason, ts: Date.now(), ...out });
     this.persistPositions();
     return out;

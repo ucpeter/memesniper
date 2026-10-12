@@ -1,4 +1,5 @@
 'use strict';
+const lossCooldown = require('./loss-cooldown');
 /**
  * Risk engine — decides what to do with an open position on every price tick.
  *
@@ -178,7 +179,8 @@ function canOpenNewPosition(trader) {
   if (cfg.limits.dailyProfitTargetSol > 0 && stats.realisedPnlSol >= cfg.limits.dailyProfitTargetSol) {
     return { ok: false, reason: 'daily_profit_target_reached' };
   }
-  if (stats.consecutiveLosses >= cfg.limits.stopAfterConsecutiveLosses) {
+  if (lossCooldown.status(trader, typeof trader.getConfig === 'function'
+    ? trader.getConfig() : null).tripped) {
     return { ok: false, reason: 'consecutive_loss_circuit_breaker' };
   }
 
