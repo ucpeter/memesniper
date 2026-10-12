@@ -169,7 +169,8 @@ function canOpenNewPosition(trader) {
   const openCount = [...positions.values()].filter((p) => p.isOpen).length;
   if (openCount >= cfg.buy.maxConcurrentPositions) return { ok: false, reason: 'max_concurrent_positions' };
 
-  if (stats.tradesToday >= cfg.limits.maxTradesPerDay) return { ok: false, reason: 'max_trades_per_day' };
+  // Trades today is an informational counter, not an entry limit.
+  // Realised daily SOL profit/loss targets remain enforced below.
 
   // Daily loss limit — the hard stop.
   if (stats.realisedPnlSol <= -Math.abs(cfg.limits.dailyLossLimitSol)) {
