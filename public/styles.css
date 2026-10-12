@@ -929,7 +929,14 @@ html, body { max-width: 100%; overflow-x: hidden; }
   .modal-title { min-width:0; overflow-wrap:anywhere; }
 }
 
-/* 📄 Trades only: the launch scanner must not push positions/history off-screen.
-   The outer modal and the two trade tables keep their previous layout. */
-.trades-launches { max-height: min(340px, 36vh); overflow: auto; overscroll-behavior: contain; }
+/* 📄 Trades only: JS measures its first 20 painted rows and sets the inner
+   viewport to that height; the rest scroll inside. Collapse exposes positions
+   quickly on narrow phones. Do not cap this at 36vh (only ~5 visible rows). */
+.wallet-detail-head { gap: 8px; flex-wrap: wrap; }
+.wallet-detail-head [data-header-toggle] { margin-left: auto; }
+.trades-launches-section { position: relative; }
+.trades-launches-heading { display:flex; align-items:center; justify-content:space-between;
+  flex-wrap:wrap; gap:8px; position:sticky; top:0; z-index:3; background:var(--panel); }
+.trades-launches { max-height: none; overflow: auto; overscroll-behavior: auto; }
+.trades-launches[hidden], [data-trades-launches-rules][hidden], [data-trades-launches-hint][hidden] { display:none; }
 .trades-launches .scan-tbl { min-width: 560px; }
