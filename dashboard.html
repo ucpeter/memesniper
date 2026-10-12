@@ -862,6 +862,12 @@ html, body { max-width: 100%; overflow-x: hidden; }
 .panel-sub { font-size: 10.5px; color: var(--text-mute); }
 /* One row per wallet plus a totals row: the "how many trades / wins / losses"
    answer for the whole bot and for each wallet at once. */
+/* Main-terminal "Trades per wallet" summary (not the wallet's 📄 Trades modal).
+   Keep the header/counts live and reachable while the table is collapsed. */
+#overall .panel-body[hidden] { display: none; }
+#overall .overall-head { flex-wrap: wrap; }
+#overall .overall-head .panel-sub { flex: 1 1 190px; min-width: 0; }
+#overall .overall-toggle { margin-left: auto; white-space: nowrap; }
 .overall-tbl { width: 100%; min-width: 630px; border-collapse: collapse; font-size: 12px; }
 .overall-tbl thead th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .4px; color: var(--text-mute); padding: 6px 10px; border-bottom: 1px solid rgba(30, 36, 45, .8); }
 .overall-tbl thead th.num { text-align: right; }
@@ -3355,6 +3361,9 @@ function renderNotices() {
 function renderOverall() {
   const mount = $('overall');
   if (!mount) return;
+  // Keep this UI preference on the stable panel node; WebSocket heartbeats
+  // replace its contents but must not force an expanded table back into view.
+  const collapsed = mount.dataset.collapsed === 'true';
 
   const ws = (S.wallets || []).slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
   const row = (name, bought, wins, losses, realised, open, closed, muted) => {
@@ -3393,11 +3402,12 @@ function renderOverall() {
   const dry = S.status ? S.status.dryRun !== false : true;
 
   const html = `
-    <div class="panel-head">
+    <div class="panel-head overall-head">
       <span class="panel-title">Trades per wallet <span class="count" id="overallCount">${ws.length}</span></span>
       <span class="panel-sub">${dry ? 'simulated trades (DRY RUN)' : 'real trades'} · ${closedTotal} closed in total${totals.locked ? ' · locked wallets show their last saved figures' : ''}</span>
+      <button type="button" class="btn btn-sm overall-toggle" data-overall-toggle aria-expanded="${!collapsed}" aria-controls="overallDetails">${collapsed ? 'Expand table ▾' : 'Collapse table ▴'}</button>
     </div>
-    <div class="panel-body">
+    <div class="panel-body" id="overallDetails" ${collapsed ? 'hidden' : ''}>
       <div class="tbl-wrap">
         <table class="overall-tbl">
           <thead><tr>
@@ -3433,16 +3443,42 @@ function renderOverall() {
         own card and 📄 Trades dialog show only its own.
       </div></div>
     </div>`;
+  // Bind on the stable mount, NOT the replaced button. Always preserve its
+  // horizontal/vertical position, including when new live totals arrive while
+  // the table is collapsed (a hidden scroller reports zero scrollLeft).
+  if (!mount._overallToggleBound) {
+    mount._overallToggleBound = true;
+    mount.addEventListener('click', (event) => {
+      if (!event.target.closest('[data-overall-toggle]')) return;
+      const closing = mount.dataset.collapsed !== 'true';
+      const current = mount.querySelector('.tbl-wrap');
+      // A recent phone swipe marks the table "touching" for 300ms to protect
+      // its scrollbar from heartbeats. A deliberate button press must still work.
+      if (current) { clearTimeout(current._touchTimer); delete current.dataset.touching; }
+      if (closing) {
+        mount.dataset.overallLeft = String(current?.scrollLeft || 0);
+        mount.dataset.overallTop = String(current?.scrollTop || 0);
+      }
+      mount.dataset.collapsed = String(closing);
+      renderOverall.lastHtml = null;
+      renderOverall();
+    });
+  }
   // Heartbeats must not replace the scrolling trade board while the user swipes.
   if (mount.querySelector('.tbl-wrap[data-touching="1"]')) return;
   if (renderOverall.lastHtml === html && mount.querySelector('.overall-tbl')) return;
   const wrap = mount.querySelector('.tbl-wrap');
-  const left = wrap?.scrollLeft || 0;
-  const top = wrap?.scrollTop || 0;
+  const wasHidden = Boolean(mount.querySelector('#overallDetails[hidden]'));
+  const left = !wasHidden && wrap ? wrap.scrollLeft : Number(mount.dataset.overallLeft || 0);
+  const top = !wasHidden && wrap ? wrap.scrollTop : Number(mount.dataset.overallTop || 0);
+  if (!wasHidden && wrap) {
+    mount.dataset.overallLeft = String(left);
+    mount.dataset.overallTop = String(top);
+  }
   mount.innerHTML = html;
   renderOverall.lastHtml = html;
   const next = mount.querySelector('.tbl-wrap');
-  if (next) { next.scrollLeft = left; next.scrollTop = top; }
+  if (next && !collapsed) { next.scrollLeft = left; next.scrollTop = top; }
 }
 
 function renderStats() {
