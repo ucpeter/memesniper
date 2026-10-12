@@ -937,9 +937,16 @@ html, body { max-width: 100%; overflow-x: hidden; }
   .modal-title { min-width:0; overflow-wrap:anywhere; }
 }
 
-/* 📄 Trades only: the launch scanner must not push positions/history off-screen.
-   The outer modal and the two trade tables keep their previous layout. */
-.trades-launches { max-height: min(340px, 36vh); overflow: auto; overscroll-behavior: contain; }
+/* 📄 Trades only: JS measures its first 20 painted rows and sets the inner
+   viewport to that height; the rest scroll inside. Collapse exposes positions
+   quickly on narrow phones. Do not cap this at 36vh (only ~5 visible rows). */
+.wallet-detail-head { gap: 8px; flex-wrap: wrap; }
+.wallet-detail-head [data-header-toggle] { margin-left: auto; }
+.trades-launches-section { position: relative; }
+.trades-launches-heading { display:flex; align-items:center; justify-content:space-between;
+  flex-wrap:wrap; gap:8px; position:sticky; top:0; z-index:3; background:var(--panel); }
+.trades-launches { max-height: none; overflow: auto; overscroll-behavior: auto; }
+.trades-launches[hidden], [data-trades-launches-rules][hidden], [data-trades-launches-hint][hidden] { display:none; }
 .trades-launches .scan-tbl { min-width: 560px; }
 
 </style>
@@ -1748,7 +1755,7 @@ function startDemo() {
       config: { preset: 'balanced', buy: { minAmountSol: 0.1, maxAmountSol: 1.0, slippageBps: 1200, maxConcurrentPositions: 4 },
         exits: { takeProfitTiers: [{ gainPct: 50, sellPct: 33 }, { gainPct: 120, sellPct: 33 }, { gainPct: 300, sellPct: 100 }], stopLossPct: 25,
           trailing: { enabled: true, activationPct: 40, trailPct: 18 }, maxHoldMs: 1800000 },
-        limits: { dailyLossLimitSol: 2, maxTradesPerDay: 100, maxExposureSol: 3 },
+        limits: { dailyLossLimitSol: 2, maxExposureSol: 3 },
         filters: { maxDevHoldPct: 20, minLiquiditySol: 1, maxLiquiditySol: 0 } } },
 
     { id: 'w_b', name: 'Scalper', publicKey: 'DEMO-Scalper-not-a-real-address', enabled: true, armed: true,
@@ -1765,7 +1772,7 @@ function startDemo() {
       config: { preset: 'scalper', buy: { minAmountSol: 0.05, maxAmountSol: 0.25, slippageBps: 1500, maxConcurrentPositions: 10 },
         exits: { takeProfitTiers: [{ gainPct: 15, sellPct: 50 }, { gainPct: 30, sellPct: 30 }, { gainPct: 60, sellPct: 100 }], stopLossPct: 10,
           trailing: { enabled: true, activationPct: 12, trailPct: 6 }, maxHoldMs: 600000 },
-        limits: { dailyLossLimitSol: 1, maxTradesPerDay: 300, maxExposureSol: 2 },
+        limits: { dailyLossLimitSol: 1, maxExposureSol: 2 },
         filters: { maxDevHoldPct: 20, minLiquiditySol: 1, maxLiquiditySol: 0 } } },
 
     { id: 'w_c', name: 'Degen', publicKey: 'DEMO-Degen-not-a-real-address', enabled: false, armed: false,
@@ -1776,7 +1783,7 @@ function startDemo() {
       config: { preset: 'degen', buy: { minAmountSol: 0.5, maxAmountSol: 3.0, slippageBps: 2500, maxConcurrentPositions: 8 },
         exits: { takeProfitTiers: [{ gainPct: 300, sellPct: 25 }, { gainPct: 900, sellPct: 50 }, { gainPct: 2000, sellPct: 100 }], stopLossPct: 60,
           trailing: { enabled: true, activationPct: 150, trailPct: 35 }, maxHoldMs: 1800000 },
-        limits: { dailyLossLimitSol: 5, maxTradesPerDay: 50, maxExposureSol: 8 },
+        limits: { dailyLossLimitSol: 5, maxExposureSol: 8 },
         filters: { maxDevHoldPct: 50, minLiquiditySol: 0.1, maxLiquiditySol: 0 } } },
   ];
 
@@ -3784,6 +3791,31 @@ function reconcileWalletTable(wrap, w, limit) {
   for (const row of original.values()) row.remove();
 }
 
+/** Size the Trades launch viewport by its first twenty REAL rendered rows.
+ * Never use a vh cap: on a phone 36vh showed only four or five rows.
+ * Keep the height unchanged as older rows arrive, so they scroll INSIDE.
+ * If there are <=20 rows, let the table take its natural height. */
+function sizeTradesLaunches(wrap) {
+  if (!wrap || wrap.hidden) return;
+  const table = wrap.querySelector('table');
+  const rows = table ? [...table.tBodies[0].rows] : [];
+  if (rows.length <= 20) { wrap.style.height = ''; return; }
+  const head = table.tHead?.getBoundingClientRect().height || 0;
+  const firstTwenty = rows.slice(0, 20).reduce((n, row) =>
+    n + row.getBoundingClientRect().height, 0);
+  // jsdom/offline tests have no layout. In a real browser dimensions are known.
+  if (head && firstTwenty) {
+    const scrollbar = Math.max(0, wrap.offsetHeight - wrap.clientHeight);
+    wrap.style.height = `${Math.ceil(head + firstTwenty + scrollbar + 2)}px`;
+  }
+}
+
+// Phone orientation/desktop-site width can change row wrapping without any new
+// launches; remeasure so the first twenty are still fully visible.
+window.addEventListener('resize', () => {
+  for (const wrap of document.querySelectorAll('[data-trades-launches]')) sizeTradesLaunches(wrap);
+});
+
 function renderWalletFeeds() {
   for (const w of S.wallets || []) {
     const mount = [...$('wallets').querySelectorAll('[data-wallet-feed]')]
@@ -3804,12 +3836,12 @@ function renderWalletFeeds() {
       if (count) count.textContent = String(rows.length);
       reconcileWalletTable(mount.querySelector('.tbl-wrap'), w, 8);
     }
-    // Keep both dialogs' scrollers alive. Only 📄 Trades uses a bounded,
-    // progressively revealed launches viewport; the standalone feed is unchanged.
+    // Keep both dialogs' scrollers alive. In 📄 Trades the viewport is the
+    // HEIGHT of 20 actual rows, not 20 rows jammed into a five-row box.
     for (const wrap of document.querySelectorAll('[data-live-wallet-feed]')) {
       if (wrap.getAttribute('data-live-wallet-feed') !== w.id) continue;
-      reconcileWalletTable(wrap, w, wrap.hasAttribute('data-trades-launches')
-        ? (wrap._visibleCount || 20) : 200);
+      reconcileWalletTable(wrap, w, 200);
+      if (wrap.hasAttribute('data-trades-launches')) sizeTradesLaunches(wrap);
     }
     const liveCount = document.querySelector('[data-live-wallet-count]');
     if (liveCount && liveCount.getAttribute('data-live-wallet-count') === w.id) {
@@ -4017,9 +4049,10 @@ function openWalletDetail(walletId) {
 
   openModal(`
     <div class="modal" style="max-width:820px">
-      <div class="modal-head">
+      <div class="modal-head wallet-detail-head">
         <span class="modal-title">📄 ${esc(w.name)}</span>
         <span class="wallet-preset">${esc(w.config?.preset || 'custom')}</span>
+        <button class="btn btn-sm" data-toggle-trades-launches aria-controls="tradesLaunches" aria-expanded="true" data-header-toggle>Hide launches</button>
         <button class="btn btn-ghost btn-sm" data-close-modal="1" title="Close this dialog (Esc also works)">Close</button>
       </div>
       <div class="modal-body">
@@ -4032,10 +4065,15 @@ function openWalletDetail(walletId) {
           ${stat('Real balance', `${fmtSol(w.balanceSol, 3)} SOL${usdOf(w.balanceSol) ? ` · ${usdOf(w.balanceSol)}` : ''}`)}
         </div>
 
-        <div class="section-label">What ${esc(w.name)} did with the launches it saw (<span data-live-wallet-count="${esc(w.id)}">${walletFeed(w).length}</span>)</div>
-        <div class="dim" style="font-size:11px;margin-bottom:7px">Saved wallet rules: real liquidity ≥ ${esc(realFloor)} · creator ≤ ${esc(rules.maxDevHoldPct ?? '—')}% · top 10 ≤ ${esc(rules.maxTop10HoldersPct ?? '—')}%. Risk is informational; these wallet rules decide eligibility.</div>
-        <div class="tbl-wrap trades-launches" data-trades-launches data-live-wallet-feed="${esc(w.id)}" tabindex="0" aria-label="Scrollable Pump.fun launches for ${esc(w.name)}">${walletFeedTable(w, 20)}</div>
-        <div class="hint">Scroll inside launches for older tokens (20 loaded at a time); Open positions and Trade history remain below.</div>
+        <section class="trades-launches-section" aria-label="Pump.fun launches">
+          <div class="section-label trades-launches-heading">
+            <span>What ${esc(w.name)} did with the launches it saw (<span data-live-wallet-count="${esc(w.id)}">${walletFeed(w).length}</span>)</span>
+            <button type="button" class="btn btn-sm" data-toggle-trades-launches aria-controls="tradesLaunches" aria-expanded="true">Collapse launches</button>
+          </div>
+          <div data-trades-launches-rules class="dim" style="font-size:11px;margin-bottom:7px">Saved wallet rules: real liquidity ≥ ${esc(realFloor)} · creator ≤ ${esc(rules.maxDevHoldPct ?? '—')}% · top 10 ≤ ${esc(rules.maxTop10HoldersPct ?? '—')}%. Risk is informational; these wallet rules decide eligibility.</div>
+          <div id="tradesLaunches" class="tbl-wrap trades-launches" data-trades-launches data-live-wallet-feed="${esc(w.id)}" tabindex="0" aria-label="Scrollable Pump.fun launches for ${esc(w.name)}">${walletFeedTable(w, 200)}</div>
+          <div data-trades-launches-hint class="hint">The first 20 launches fit in this list; scroll inside it for older tokens. Collapse launches to reach positions and history quickly.</div>
+        </section>
 
         <div class="section-label">Open positions (<span data-wallet-open-count>${open.length}</span>)</div>
         <div class="tbl-wrap" data-wallet-open-rows>${openRows}</div>
@@ -4059,14 +4097,21 @@ function openWalletDetail(walletId) {
     </div>`, (root) => {
     S.detailWallet = w.id; // so a kill from inside here re-renders this view
     const launches = root.querySelector('[data-trades-launches]');
-    launches._visibleCount = 20;
-    launches.addEventListener('scroll', () => {
-      if (launches.scrollTop + launches.clientHeight < launches.scrollHeight - 48) return;
-      const current = (S.wallets || []).find((x) => x.id === w.id);
-      if (!current || launches._visibleCount >= Math.min(walletFeed(current).length, 200)) return;
-      launches._visibleCount = Math.min(200, launches._visibleCount + 20);
-      reconcileWalletTable(launches, current, launches._visibleCount);
-    });
+    sizeTradesLaunches(launches);
+    const toggles = [...root.querySelectorAll('[data-toggle-trades-launches]')];
+    for (const toggle of toggles) toggle.onclick = () => {
+      const collapsed = !launches.hidden;
+      launches.hidden = collapsed;
+      root.querySelector('[data-trades-launches-rules]').hidden = collapsed;
+      root.querySelector('[data-trades-launches-hint]').hidden = collapsed;
+      for (const btn of toggles) {
+        btn.textContent = btn.hasAttribute('data-header-toggle')
+          ? (collapsed ? 'Show launches' : 'Hide launches')
+          : (collapsed ? 'Show launches' : 'Collapse launches');
+        btn.setAttribute('aria-expanded', String(!collapsed));
+      }
+      if (!collapsed) sizeTradesLaunches(launches);
+    };
     root.querySelector('[data-wallet-open-rows]')._lastMarkup = openRows;
     root.querySelector('[data-wallet-closed-rows]')._lastMarkup = closedRows;
     root.querySelector('#wdFund').onclick = () => openFund(w.id);
@@ -4285,6 +4330,7 @@ function openWallet(walletId, opts = {}) {
   // INSIDE the dialog's mount handler — and the user sees a Config button that
   // does nothing at all. One merge makes that impossible.
   const cfg = withDefaultCfg(existing?.config);
+  if (cfg.limits) delete cfg.limits.maxTradesPerDay;
   const rate = Number(S.status?.solUsd) || 150;
   if (cfg.filters.minLiquidityUsd == null) cfg.filters.minLiquidityUsd = Math.round((cfg.filters.minLiquiditySol || 0) * rate);
   if (cfg.filters.maxLiquidityUsd == null) cfg.filters.maxLiquidityUsd = Math.round((cfg.filters.maxLiquiditySol || 0) * rate);
@@ -4435,7 +4481,7 @@ function defaultCfg() {
       stopLossPct: 25, trailing: { enabled: true, activationPct: 40, trailPct: 18, stepPct: 0 },
       breakEven: { enabled: true, activationPct: 30, offsetPct: 2 }, maxHoldMs: 1800000, liquidityDropExitPct: 55,
     },
-    limits: { dailyLossLimitSol: 2, dailyProfitTargetSol: 0, maxTradesPerDay: 100, maxExposureSol: 3, stopAfterConsecutiveLosses: 5 },
+    limits: { dailyLossLimitSol: 2, dailyProfitTargetSol: 0, maxExposureSol: 3, stopAfterConsecutiveLosses: 5 },
     filters: {
       maxDevHoldPct: 20, requireMintAuthorityRevoked: true, requireFreezeAuthorityRevoked: true, maxBuyTaxPct: 10, maxSellTaxPct: 10,
       minLiquiditySol: 1, maxLiquiditySol: 0, minLiquidityUsd: 150, maxLiquidityUsd: 0, maxTop10HoldersPct: 35, requireSocial: false, minNameLength: 2, blockCopycatNames: true,
@@ -4545,7 +4591,6 @@ function renderEditorPanes(root) {
         <div class="hint">0 = disabled. Stop trading once this is banked.</div></div>
     </div>
     <div class="grid3">
-      <div class="field"><label>Max trades per day</label><input type="number" id="f_dtrades" value="${c.limits.maxTradesPerDay}"/></div>
       <div class="field"><label>Max exposure (SOL)</label><input type="number" step="0.1" id="f_exposure" value="${c.limits.maxExposureSol}"/>
         <div class="hint">Cap on SOL tied up in open positions.</div></div>
       <div class="field"><label>Stop after N consecutive losses</label><input type="number" id="f_consec" value="${c.limits.stopAfterConsecutiveLosses}"/></div>
@@ -4680,7 +4725,6 @@ function wireEditor(root) {
   // limits
   num('#f_dloss', (v) => { c().limits.dailyLossLimitSol = v; });
   num('#f_dprofit', (v) => { c().limits.dailyProfitTargetSol = v; });
-  num('#f_dtrades', (v) => { c().limits.maxTradesPerDay = v; });
   num('#f_exposure', (v) => { c().limits.maxExposureSol = v; });
   num('#f_consec', (v) => { c().limits.stopAfterConsecutiveLosses = v; });
 
@@ -5424,7 +5468,10 @@ async function demoApi(path, opts = {}) {
       if (body.resumeAfterRestart !== undefined) w.config.resumeAfterRestart = body.resumeAfterRestart !== false;
       if (body.buy) Object.assign(w.config.buy = w.config.buy || {}, body.buy);
       if (body.exits) Object.assign(w.config.exits = w.config.exits || {}, body.exits);
-      if (body.limits) Object.assign(w.config.limits = w.config.limits || {}, body.limits);
+      if (body.limits) {
+        Object.assign(w.config.limits = w.config.limits || {}, body.limits);
+        delete w.config.limits.maxTradesPerDay;
+      }
       if (body.filters) Object.assign(w.config.filters = w.config.filters || {}, body.filters);
       if (body.ai) Object.assign(w.config.ai = w.config.ai || {}, body.ai);
       if (body.preset) w.config.preset = body.preset;
