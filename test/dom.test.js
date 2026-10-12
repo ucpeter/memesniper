@@ -786,6 +786,52 @@ async function click(window, el) {
     assert.match(text, /20/, 'and the overall bought count');
   });
 
+  await test('the main Trades per wallet table collapses/expands without losing live totals or scroll', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 2 });
+    const card = $('#overall');
+    const btn = card.querySelector('[data-overall-toggle]');
+    const wrap = card.querySelector('.tbl-wrap');
+    assert.match(card.querySelector('.panel-title').textContent, /Trades per wallet/);
+    assert.strictEqual(btn.getAttribute('aria-expanded'), 'true');
+    assert.strictEqual(card.querySelector('#overallDetails').hidden, false);
+    wrap.scrollLeft = 128;
+    wrap.scrollTop = 17;
+    wrap.dataset.touching = '1'; // button must work immediately after a phone swipe
+    btn.click();
+    assert.strictEqual($('#overall'), card, 'panel itself stays on the terminal');
+    assert.strictEqual(card.querySelector('#overallDetails').hidden, true);
+    assert.strictEqual(card.querySelector('[data-overall-toggle]').getAttribute('aria-expanded'), 'false');
+    assert.match(card.querySelector('[data-overall-toggle]').textContent, /Expand/);
+    assert.match(fs.readFileSync(path.join(ROOT, 'public/styles.css'), 'utf8'),
+      /#overall \.panel-body\[hidden\]\s*\{\s*display:\s*none/,
+      'hidden must really hide the panel body despite its CSS styles');
+
+    window.eval(`S.wallets[0].stats.bought = 11;
+      S.wallets.push(demoNewWallet('New wallet', 'balanced'));
+      renderAll(); renderOverall();`);
+    assert.strictEqual(card.querySelector('#overallDetails').hidden, true,
+      'refresh/heartbeat must not force it open');
+    assert.strictEqual(card.querySelector('#overallCount').textContent, '3');
+    assert.match(card.querySelector('.panel-sub').textContent, /closed in total/);
+    assert.strictEqual(card.querySelectorAll('.overall-tbl tbody tr').length, 4,
+      'live rows keep updating, including the total, even when hidden');
+
+    card.querySelector('[data-overall-toggle]').click();
+    assert.strictEqual(card.querySelector('#overallDetails').hidden, false);
+    assert.strictEqual(card.querySelector('[data-overall-toggle]').getAttribute('aria-expanded'), 'true');
+    assert.match(card.querySelector('.overall-tbl').textContent, /New wallet/);
+    assert.match(card.querySelector('.overall-tbl').textContent, /11/);
+    assert.strictEqual(card.querySelector('.tbl-wrap').scrollLeft, 128);
+    assert.strictEqual(card.querySelector('.tbl-wrap').scrollTop, 17);
+    window.eval('renderOverall()');
+    assert.strictEqual(card.querySelector('.tbl-wrap').scrollLeft, 128);
+
+    // This control is for the terminal summary, not the separate wallet dialog.
+    window.eval('openWalletDetail(S.wallets[0].id)');
+    assert.ok($('[data-wallet-open-rows]') && $('[data-wallet-closed-rows]'));
+    assert.strictEqual(card.querySelector('#overallDetails').hidden, false);
+  });
+
   await test('the wallet card counts what it BOUGHT, and its wins and losses', async () => {
     // "Add card to display how many token was bought how many win trade and loss
     // trade" — a wallet that bought eight tokens, closed ten trades of which four
