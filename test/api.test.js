@@ -896,6 +896,185 @@ const api = async (method, url, body) => {
     } finally { engine.executor.probeRpc = realProbe; }
   });
 
+  /* ── r27: global duration, isolated server-enforced per-wallet waits ── */
+  await test('one global cooldown defaults OFF, validates integer minutes 0–1440 without changing saved settings on error', async () => {
+    assert.strictEqual(cfg.defaultGlobalConfig().lossStreakCooldownMinutes, 0);
+    const before = saves;
+    for (const invalid of [-1, 1.5, 1441, '30', null, {}, true]) {
+      const r = await api('PUT', '/api/config', { lossStreakCooldownMinutes: invalid });
+      assert.strictEqual(r.status, 400, String(invalid));
+      assert.strictEqual(saves, before);
+      assert.strictEqual(config.global.lossStreakCooldownMinutes, 0);
+    }
+    const r = await api('PUT', '/api/config', { lossStreakCooldownMinutes: 30 });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual((await get('/api/config')).body.lossStreakCooldownMinutes, 30);
+  });
+
+  Object.assign(keystore, { has: STUBBED_KEYSTORE.has,
+    getKeypair: STUBBED_KEYSTORE.getKeypair, isUnlocked: STUBBED_KEYSTORE.isUnlocked });
+  const risk = require('../src/engine/risk');
+  const Trader = require('../src/engine/trader');
+  const lossCooldown = require('../src/engine/loss-cooldown');
+  const safetyWallet = (name) => {
+    const w = cfg.defaultWalletConfig(name);
+    w.id = `cooldown_${name}`;
+    w.limits.stopAfterConsecutiveLosses = 2;
+    w.limits.dailyLossLimitSol = 1;
+    w.stats.day = new Date().toISOString().slice(0, 10);
+    config.wallets.push(w);
+    engine.hydrate();
+    return engine.traders.get(w.id);
+  };
+  const alpha = safetyWallet('alpha');
+  const beta = safetyWallet('beta');
+  const lose = (t) => t._onPositionClosed({ mint: `mint_${Date.now()}`, symbol: 'TEST', exitReason: 'test', pnlLamports: () => -10000000n });
+
+  await test('two closing losses stamp/persist ONLY that wallet; direct entry guard remains closed', async () => {
+    const before = saves;
+    lose(alpha); lose(alpha);
+    assert.ok(saves >= before + 2, 'stats must save on position close, without HTTP requests');
+    assert.strictEqual(config.wallets.find((w) => w.id === alpha.cfg.id).stats.consecutiveLossCooldownAt, alpha.stats.consecutiveLossCooldownAt);
+    assert.ok(alpha.stats.consecutiveLossCooldownAt > 0);
+    assert.strictEqual(alpha.stats.consecutiveLosses, 2);
+    assert.strictEqual(alpha.stats.paused, true);
+    assert.strictEqual(beta.stats.consecutiveLosses, 0);
+    assert.strictEqual(beta.stats.paused, false);
+    alpha.cfg.enabled = true;
+    assert.strictEqual(risk.canOpenNewPosition(alpha).ok, false);
+    alpha.cfg.enabled = false;
+  });
+
+  await test('early HTTP Start refuses before engine starts, never unpauses or enables; another wallet starts', async () => {
+    const before = startCalls;
+    const r = await post(`/api/wallets/${alpha.cfg.id}/start`, {});
+    assert.strictEqual(r.status, 409);
+    assert.strictEqual(r.body.error, 'consecutive_loss_cooldown');
+    assert.ok(r.body.remainingMs > 0 && r.body.remainingMs <= 30 * 60000);
+    assert.strictEqual(alpha.cfg.enabled, false);
+    assert.strictEqual(alpha.stats.paused, true);
+    assert.strictEqual(startCalls, before);
+    const other = await post(`/api/wallets/${beta.cfg.id}/start`, {});
+    assert.strictEqual(other.status, 200);
+    assert.strictEqual(beta.cfg.enabled, true);
+    assert.strictEqual(beta.stats.paused, false);
+  });
+
+  await test('a winner resets consecutive count, NOT an already active timed stop; Resume also rejects early', async () => {
+    const gamma = safetyWallet('gamma');
+    lose(gamma); lose(gamma);
+    const firstStamp = gamma.stats.consecutiveLossCooldownAt;
+    gamma._onPositionClosed({ mint: 'winning_mint', symbol: 'WIN', exitReason: 'test',
+      pnlLamports: () => 10000000n });
+    assert.strictEqual(gamma.stats.consecutiveLosses, 0);
+    assert.strictEqual(gamma.stats.lossCooldownPending, true);
+    assert.strictEqual(gamma.stats.consecutiveLossCooldownAt, firstStamp);
+    assert.strictEqual(gamma.stats.paused, true);
+    assert.strictEqual((await post(`/api/wallets/${gamma.cfg.id}/start`, {})).status, 409);
+    assert.strictEqual((await post(`/api/wallets/${gamma.cfg.id}/resume`, {})).status, 409);
+    gamma.cfg.enabled = true; gamma.resume();
+    assert.strictEqual(risk.canOpenNewPosition(gamma).ok, false,
+      'even direct resume cannot bypass the latched entry gate');
+    gamma.cfg.enabled = false; gamma.stats.paused = true;
+    gamma.stats.consecutiveLossCooldownAt = Date.now() - 31 * 60000;
+    assert.strictEqual(risk.canOpenNewPosition(gamma).ok, false);
+    const notResume = await post(`/api/wallets/${gamma.cfg.id}/resume`, {});
+    assert.strictEqual(notResume.status, 409, 'only wallet Start can clear the expired breaker');
+    assert.strictEqual(gamma.stats.lossCooldownPending, true);
+    const recovered = await post(`/api/wallets/${gamma.cfg.id}/start`, {});
+    assert.strictEqual(recovered.status, 200);
+    assert.strictEqual(gamma.stats.lossCooldownPending, false);
+    assert.strictEqual(risk.canOpenNewPosition(gamma).ok, true);
+  });
+
+  await test('changing global minutes recalculates existing wait from recorded loss without resetting it', async () => {
+    const timestamp = alpha.stats.consecutiveLossCooldownAt;
+    const longer = await api('PUT', '/api/config', { lossStreakCooldownMinutes: 90 });
+    assert.strictEqual(longer.status, 200);
+    assert.strictEqual(alpha.stats.consecutiveLossCooldownAt, timestamp);
+    const blocked = await post(`/api/wallets/${alpha.cfg.id}/start`, {});
+    assert.strictEqual(blocked.status, 409);
+    assert.ok(blocked.body.remainingMs > 89 * 60000);
+    await api('PUT', '/api/config', { lossStreakCooldownMinutes: 30 });
+    assert.strictEqual(alpha.stats.consecutiveLossCooldownAt, timestamp);
+  });
+
+  await test('legacy tripped wallet without timestamp starts a new persisted wait, never skips it', async () => {
+    const legacy = safetyWallet('legacy');
+    legacy.stats.consecutiveLosses = 2;
+    legacy.stats.consecutiveLossCooldownAt = 0;
+    legacy.stats.paused = true;
+    const before = saves;
+    const first = await post(`/api/wallets/${legacy.cfg.id}/start`, {});
+    assert.strictEqual(first.status, 409);
+    assert.ok(legacy.stats.consecutiveLossCooldownAt > 0);
+    assert.ok(saves > before);
+    assert.strictEqual(legacy.stats.paused, true);
+    assert.strictEqual(legacy.cfg.enabled, false);
+    assert.strictEqual(config.wallets.find((w) => w.id === legacy.cfg.id).stats.consecutiveLossCooldownAt,
+      legacy.stats.consecutiveLossCooldownAt);
+  });
+
+  await test('loss breaker spans UTC midnight; expiry alone does NOT unpause or grant entry', async () => {
+    alpha.stats.day = '2000-01-01';
+    alpha._rolloverDay();
+    assert.strictEqual(alpha.stats.consecutiveLosses, 2);
+    assert.strictEqual(alpha.stats.paused, true);
+    assert.ok(alpha.stats.consecutiveLossCooldownAt);
+    alpha.cfg.enabled = true;
+    alpha.stats.consecutiveLossCooldownAt = Date.now() - 31 * 60000;
+    assert.strictEqual(lossCooldown.status(alpha, config.global).ready, true);
+    assert.strictEqual(risk.canOpenNewPosition(alpha).ok, false);
+    alpha.cfg.enabled = false;
+  });
+
+  await test('persisted/reloaded streak stays blocked, then only that wallet Start clears an expired timer', async () => {
+    const snapshot = JSON.parse(JSON.stringify(config.wallets.find((w) => w.id === alpha.cfg.id)));
+    const restored = new Trader({ cfg: snapshot, keystore, executor: engine.executor,
+      getConfig: () => config.global, priceCache: engine.priceCache });
+    restored.init();
+    engine.traders.set(snapshot.id, restored);
+    assert.strictEqual(restored.stats.consecutiveLosses, 2);
+    assert.strictEqual(restored.stats.paused, true);
+    assert.strictEqual(risk.canOpenNewPosition(restored).ok, false);
+    const started = await post(`/api/wallets/${snapshot.id}/start`, {});
+    assert.strictEqual(started.status, 200, JSON.stringify(started.body));
+    assert.strictEqual(restored.stats.consecutiveLosses, 0);
+    assert.strictEqual(restored.stats.consecutiveLossCooldownAt, 0);
+    assert.strictEqual(restored.stats.paused, false);
+    assert.strictEqual(config.wallets.find((w) => w.id === snapshot.id).stats.consecutiveLosses, 0);
+    assert.strictEqual(beta.cfg.enabled, true, 'other wallet untouched');
+    assert.strictEqual(risk.canOpenNewPosition(restored).ok, true);
+  });
+
+  await test('daily loss, manual Stop/Panic and between-entry cooldown still block after loss recovery', async () => {
+    const t = engine.traders.get(alpha.cfg.id);
+    t.stats.realisedPnlSol = -2;
+    assert.strictEqual(risk.canOpenNewPosition(t).reason, 'daily_loss_limit_reached');
+    t.stats.realisedPnlSol = 0;
+    await post(`/api/wallets/${t.cfg.id}/stop`, {});
+    assert.strictEqual(risk.canOpenNewPosition(t).reason, 'wallet_disabled');
+    t.stats.day = '2000-01-01'; t._rolloverDay();
+    assert.strictEqual(t.stats.paused, true, 'manual stop survives midnight');
+    t.cfg.enabled = true;
+    t.pause('panic: test');
+    t.stats.day = '2000-01-01'; t._rolloverDay();
+    assert.strictEqual(risk.canOpenNewPosition(t).ok, false, 'panic survives midnight');
+    t.resume();
+    t.lastEntryAt = Date.now();
+    assert.strictEqual(risk.canOpenNewPosition(t).reason, 'cooldown');
+    t.lastEntryAt = 0;
+    const off = await api('PUT', '/api/config', { lossStreakCooldownMinutes: 0 });
+    assert.strictEqual(off.status, 200);
+    t.stats.consecutiveLosses = t.cfg.limits.stopAfterConsecutiveLosses;
+    t.stats.consecutiveLossCooldownAt = Date.now() - 24 * 3600000;
+    t.stats.paused = true;
+    const old = await post(`/api/wallets/${t.cfg.id}/start`, {});
+    assert.strictEqual(old.status, 409, '0 preserves UTC-day wait even after elapsed wall time');
+    t.stats.day = '2000-01-01'; t._rolloverDay();
+    assert.strictEqual(t.stats.consecutiveLosses, 0);
+  });
+
   Object.assign(keystore, { has: STUBBED_KEYSTORE.has, getKeypair: STUBBED_KEYSTORE.getKeypair, isUnlocked: STUBBED_KEYSTORE.isUnlocked });
 
   /* ───────────────────────────────────────────────────────────────────── */

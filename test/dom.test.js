@@ -927,6 +927,61 @@ async function click(window, el) {
     assert.doesNotMatch(dialog.querySelector('tbody tr').textContent, /evaluating/i);
   });
 
+  await test('Settings saves one global loss cooldown and rejects fractional/empty values', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 2 });
+    window.eval('openSettings()');
+    const input = $('#g_loss_cooldown');
+    assert.strictEqual(input.value, '0');
+    assert.match(input.closest('.field').textContent, /press that wallet.s Start/i);
+    input.value = '12.5';
+    await click(window, $('#g_save'));
+    assert.notStrictEqual(window.eval('S.config.lossStreakCooldownMinutes'), 12.5);
+    assert.match($('#toasts').textContent, /whole cooldown duration/i);
+    input.value = '45';
+    await click(window, $('#g_save'));
+    assert.strictEqual(window.eval('S.config.lossStreakCooldownMinutes'), 45);
+    assert.strictEqual(window.eval('S.wallets.length'), 2);
+  });
+
+  await test('Trades launches load 20 at a time in their own viewport; trade sections remain full-size', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 2 });
+    window.eval(`S.scanFeed = Array.from({length: 55}, (_, i) => ({
+      mint: 'BOUND_MINT_' + i, symbol: 'TOKEN_' + i, liquidityUsd: 3000,
+      wallets: [{ walletId: S.wallets[0].id, name: S.wallets[0].name,
+        action: 'filtered', reason: 'test' }]
+    })); openWalletDetail(S.wallets[0].id);`);
+    const wrap = $('[data-trades-launches]');
+    assert.ok(wrap.classList.contains('trades-launches'));
+    assert.match(fs.readFileSync(path.join(ROOT, 'public', 'styles.css'), 'utf8'),
+      /\.trades-launches\s*\{[^}]*max-height:\s*min\(340px, 36vh\);[^}]*overflow:\s*auto/,
+      'the launch table alone has a bounded, phone-aware inner scroll');
+    assert.strictEqual(wrap.querySelectorAll('tbody tr').length, 20);
+    assert.strictEqual($('[data-wallet-open-rows]').classList.contains('trades-launches'), false);
+    assert.strictEqual($('[data-wallet-closed-rows]').classList.contains('trades-launches'), false);
+    assert.strictEqual($('[data-wallet-open-rows]').getAttribute('data-trades-launches'), null);
+    assert.match(window.document.querySelector('.modal-body').textContent, /Open positions.*Trade history/s);
+    wrap.scrollLeft = 75;
+    wrap.scrollTop = 100;
+    wrap.dispatchEvent(new window.Event('scroll'));
+    assert.strictEqual(wrap.querySelectorAll('tbody tr').length, 40);
+    assert.strictEqual(wrap.scrollLeft, 75);
+    wrap.scrollTop = 200;
+    wrap.dispatchEvent(new window.Event('scroll'));
+    assert.strictEqual(wrap.querySelectorAll('tbody tr').length, 55);
+    window.eval(`S.scanFeed.unshift({ mint: 'BOUND_NEW', symbol: 'NEWEST',
+      wallets: [{ walletId: S.wallets[0].id, name: S.wallets[0].name,
+        action: 'bought' }] }); renderWalletFeeds();`);
+    assert.strictEqual($('[data-trades-launches]'), wrap, 'live update preserves the scroll container');
+    assert.strictEqual(wrap.querySelectorAll('tbody tr').length, 56);
+    assert.match(wrap.querySelector('tbody tr').textContent, /NEWEST/);
+    assert.strictEqual(wrap.scrollLeft, 75);
+    window.eval(`openWalletFeed(S.wallets[0].id);`);
+    assert.strictEqual($('[data-trades-launches]'), null, 'standalone launch feed is not constrained');
+    assert.strictEqual($('[data-live-wallet-feed] tbody').rows.length, 56);
+    window.eval(`openWalletDetail(S.wallets[1].id)`);
+    assert.strictEqual(window.document.querySelectorAll('[data-trades-launches] tbody tr').length, 0, 'other wallet has no shared rows');
+  });
+
   /* ────────────── withdrawing: who signs it, in plain words ────────────── */
 
   console.log('\nWithdrawing — signed here, or signed by the bot\n');
