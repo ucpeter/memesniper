@@ -20,6 +20,7 @@ const log = require('./util/logger');
 const cfg = require('./config');
 const keystore = require('./wallets/keystore');
 const ai = require('./engine/ai');
+const lossCooldown = require('./engine/loss-cooldown');
 const { PRESETS, defaultWalletConfig, normaliseWallet, applyPreset } = cfg;
 
 /** Per-boot session token. Printed to the console; required for writes. */
@@ -347,6 +348,14 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
       }
     }
     if (patch.rpc && patch.rpc.wsEndpoint === wsPlaceholder) patch.rpc.wsEndpoint = g.rpc.wsEndpoint;
+    if (Object.prototype.hasOwnProperty.call(patch, 'lossStreakCooldownMinutes') &&
+        (typeof patch.lossStreakCooldownMinutes !== 'number' ||
+         !Number.isInteger(patch.lossStreakCooldownMinutes) ||
+         patch.lossStreakCooldownMinutes < 0 ||
+         patch.lossStreakCooldownMinutes > lossCooldown.MAX_MINUTES)) {
+      return res.status(400).json({ error: 'invalid_loss_cooldown',
+        hint: 'Use a whole number of minutes from 0 to 1440. 0 keeps the UTC-day reset.' });
+    }
     Object.assign(g, cfg.deepMerge(g, patch));
     // Configuration is live: refresh the Connection's URL/fetch closure NOW.
     // Existing traders keep their executor reference, so their next read uses
@@ -862,7 +871,19 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
   app.post('/api/wallets/:id/resume', requireToken, (req, res) => {
     const t = engine.traders.get(req.params.id);
     if (!t) return res.status(404).json({ error: 'wallet_not_found' });
+    const recovery = lossCooldown.status(t, getGlobal());
+    if (recovery.tripped) {
+      return res.status(409).json({ error: 'consecutive_loss_cooldown',
+        hint: recovery.durationMs
+          ? recovery.ready
+            ? 'The wait is over. Press this wallet’s Start to clear its loss breaker; Resume cannot do it.'
+            : `This wallet is cooling down. Wait ${Math.max(1, Math.ceil(recovery.remainingMs / 60000))} more minute(s), then press its Start.`
+          : 'Wait for the next UTC-day reset; this loss streak cannot be resumed early.',
+        remainingMs: recovery.remainingMs });
+    }
     t.resume();
+    saveConfig();
+    bus.safeEmit('wallet:stats', t.toJSON());
     res.json({ ok: true, stats: t.stats });
   });
 
@@ -1174,6 +1195,23 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
       return res.status(404).json({ error: 'wallet_not_found' });
     }
 
+    // Enforce the timer here, not just in the page: direct API callers cannot
+    // clear the pause and trade early. A missing timestamp on an old record
+    // starts a conservative new wait and is saved even on a rejected Start.
+    const recovery = lossCooldown.requireManualRecovery(t, getGlobal());
+    if (!recovery.allowed) {
+      if (recovery.startedAt) saveConfig();
+      return res.status(409).json({
+        error: 'consecutive_loss_cooldown',
+        hint: recovery.durationMs
+          ? `This wallet reached its loss streak limit. Wait ${Math.max(1, Math.ceil(recovery.remainingMs / 60000))} more minute(s), then press this wallet's Start again. Other limits still apply.`
+          : 'This wallet reached its loss streak limit. The duration is 0; wait until the next UTC-day reset. Start does not clear the streak.',
+        remainingMs: recovery.remainingMs,
+        readyAt: recovery.until,
+      });
+    }
+    // A recovered wallet is eligible for its own manual Start; daily loss,
+    // panic/Stop and every other gate retain their existing checks.
     if (!engine.running) engine.start();
 
     /* Arming a wallet means TWO things, and only doing the first was the bug the
@@ -1356,6 +1394,20 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
 
   /* ------------------------------- HTTP ---------------------------------- */
   const server = http.createServer(app);
+  // A trade can close without any HTTP request. Persist the resulting loss
+  // timestamp/streak immediately, including dry-run, so a restart cannot
+  // erase the server-side guard. Subscribe once per server, remove on close.
+  const persistWalletStats = (row) => {
+    const t = row?.id && engine.traders.get(row.id);
+    const stored = t && getFull().wallets.find((w) => w.id === t.cfg.id);
+    if (!stored) return;
+    stored.stats = t.stats;
+    try { saveConfig(); } catch (err) {
+      log.error(`Could not save wallet safety state: ${err.message}`);
+    }
+  };
+  bus.on('wallet:stats', persistWalletStats);
+  server.once('close', () => bus.off('wallet:stats', persistWalletStats));
 
   /* -------------------------- WebSocket stream --------------------------- */
   const wss = new WebSocketServer({ server, path: '/ws' });

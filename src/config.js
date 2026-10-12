@@ -116,6 +116,9 @@ function defaultGlobalConfig() {
      * sizes every position to 0 and paper trading never runs, so there is no
      * safe way to validate trailing stops / partial sells before going live. */
     dryRunBalanceSol: 10,
+    // One duration for all wallets; loss streaks/timers remain independent.
+    // 0 preserves the old UTC-day reset until the owner saves a duration.
+    lossStreakCooldownMinutes: 0,
     rpc: {
       // Set Alchemy RPC_URL and Helius RPC_URL_FALLBACK on the host for live reads.
       endpoints: [process.env.RPC_URL || 'https://api.mainnet-beta.solana.com'],
@@ -263,6 +266,8 @@ function defaultWalletConfig(name) {
       tradesToday: 0,
       realisedPnlSol: 0,
       consecutiveLosses: 0,
+      consecutiveLossCooldownAt: 0,
+      lossCooldownPending: false,
       wins: 0,
       losses: 0,
       paused: false,
