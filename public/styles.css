@@ -928,3 +928,8 @@ html, body { max-width: 100%; overflow-x: hidden; }
   .modal-head { min-width:0; }
   .modal-title { min-width:0; overflow-wrap:anywhere; }
 }
+
+/* 📄 Trades only: the launch scanner must not push positions/history off-screen.
+   The outer modal and the two trade tables keep their previous layout. */
+.trades-launches { max-height: min(340px, 36vh); overflow: auto; overscroll-behavior: contain; }
+.trades-launches .scan-tbl { min-width: 560px; }

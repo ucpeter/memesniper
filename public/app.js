@@ -138,7 +138,9 @@ async function api(path, opts = {}) {
     if (res.status === 401) {
       throw new Error('The bot restarted, so this page\'s session expired. Reload the page to continue.');
     }
-    throw new Error(detail.error || detail.hint || `HTTP ${res.status}`);
+    throw new Error(detail.error === 'consecutive_loss_cooldown' || detail.error === 'invalid_loss_cooldown'
+      ? (detail.hint || 'This wallet is cooling down; press Start after its wait.')
+      : (detail.error || detail.hint || `HTTP ${res.status}`));
   }
   return res.json();
 }
@@ -2307,11 +2309,12 @@ function renderWalletFeeds() {
       if (count) count.textContent = String(rows.length);
       reconcileWalletTable(mount.querySelector('.tbl-wrap'), w, 8);
     }
-    // Both the standalone feed dialog and 📄 Trades reuse the same live stream.
-    // Keep their scroll containers alive; refresh only table rows and counts.
+    // Keep both dialogs' scrollers alive. Only 📄 Trades uses a bounded,
+    // progressively revealed launches viewport; the standalone feed is unchanged.
     for (const wrap of document.querySelectorAll('[data-live-wallet-feed]')) {
       if (wrap.getAttribute('data-live-wallet-feed') !== w.id) continue;
-      reconcileWalletTable(wrap, w, 200);
+      reconcileWalletTable(wrap, w, wrap.hasAttribute('data-trades-launches')
+        ? (wrap._visibleCount || 20) : 200);
     }
     const liveCount = document.querySelector('[data-live-wallet-count]');
     if (liveCount && liveCount.getAttribute('data-live-wallet-count') === w.id) {
@@ -2536,7 +2539,8 @@ function openWalletDetail(walletId) {
 
         <div class="section-label">What ${esc(w.name)} did with the launches it saw (<span data-live-wallet-count="${esc(w.id)}">${walletFeed(w).length}</span>)</div>
         <div class="dim" style="font-size:11px;margin-bottom:7px">Saved wallet rules: real liquidity ≥ ${esc(realFloor)} · creator ≤ ${esc(rules.maxDevHoldPct ?? '—')}% · top 10 ≤ ${esc(rules.maxTop10HoldersPct ?? '—')}%. Risk is informational; these wallet rules decide eligibility.</div>
-        <div class="tbl-wrap" data-live-wallet-feed="${esc(w.id)}">${walletFeedTable(w)}</div>
+        <div class="tbl-wrap trades-launches" data-trades-launches data-live-wallet-feed="${esc(w.id)}" tabindex="0" aria-label="Scrollable Pump.fun launches for ${esc(w.name)}">${walletFeedTable(w, 20)}</div>
+        <div class="hint">Scroll inside launches for older tokens (20 loaded at a time); Open positions and Trade history remain below.</div>
 
         <div class="section-label">Open positions (<span data-wallet-open-count>${open.length}</span>)</div>
         <div class="tbl-wrap" data-wallet-open-rows>${openRows}</div>
@@ -2559,6 +2563,15 @@ function openWalletDetail(walletId) {
       </div>
     </div>`, (root) => {
     S.detailWallet = w.id; // so a kill from inside here re-renders this view
+    const launches = root.querySelector('[data-trades-launches]');
+    launches._visibleCount = 20;
+    launches.addEventListener('scroll', () => {
+      if (launches.scrollTop + launches.clientHeight < launches.scrollHeight - 48) return;
+      const current = (S.wallets || []).find((x) => x.id === w.id);
+      if (!current || launches._visibleCount >= Math.min(walletFeed(current).length, 200)) return;
+      launches._visibleCount = Math.min(200, launches._visibleCount + 20);
+      reconcileWalletTable(launches, current, launches._visibleCount);
+    });
     root.querySelector('[data-wallet-open-rows]')._lastMarkup = openRows;
     root.querySelector('[data-wallet-closed-rows]')._lastMarkup = closedRows;
     root.querySelector('#wdFund').onclick = () => openFund(w.id);
@@ -3346,6 +3359,12 @@ function openSettings() {
         </div>
         <button class="btn btn-sm" id="g_probe">Test AI connection</button>
 
+        <div class="section-label">Consecutive-loss safety · all wallets</div>
+        <div class="field"><label for="g_loss_cooldown">Cooldown after a wallet reaches its consecutive-loss limit (minutes)</label>
+          <input id="g_loss_cooldown" type="number" min="0" max="1440" step="1" value="${Number(g.lossStreakCooldownMinutes ?? 0)}"/>
+          <div class="hint">One duration for every wallet; each wallet's saved loss limit and timer are independent. 0 (default) keeps the next-UTC-day reset. A nonzero value starts at the latest qualifying loss; after it expires, press that wallet's Start — it never resumes itself. Saving a new duration recalculates existing waits from their original loss times. Daily loss, manual Stop/Panic and other limits still apply. This is not the between-entry cooldown in each wallet's Buy settings.</div>
+        </div>
+
         <div class="section-label">Global risk ceiling</div>
         <div class="grid2">
           <div class="field"><label>Max total exposure (SOL)</label><input type="number" id="g_gexp" value="${g.riskGlobal?.maxTotalExposureSol ?? 20}"/></div>
@@ -3393,7 +3412,14 @@ function openSettings() {
 
     q('#g_save').onclick = async () => {
       const key = q('#g_aikey').value.trim();
+      const rawDuration = q('#g_loss_cooldown').value.trim();
+      const minutes = Number(rawDuration);
+      if (!rawDuration || !Number.isInteger(minutes) || minutes < 0 || minutes > 1440) {
+        toast('Enter a whole cooldown duration from 0 to 1440 minutes.', 'err');
+        return;
+      }
       const body = {
+        lossStreakCooldownMinutes: minutes,
         dryRun: S.config?.dryRun,
         rpc: { endpoints: q('#g_rpc').value.split('\n').map((s) => s.trim()).filter(Boolean), wsEndpoint: q('#g_rpcws').value.trim() },
         jito: { enabled: q('#g_jito').checked, tipLamports: Number(q('#g_tip').value) },
@@ -3562,7 +3588,14 @@ function demoSellPosition(w, p, reason) {
   if (pnl >= 0) { st.wins = (st.wins || 0) + 1; st.consecutiveLosses = 0; } else {
     st.losses = (st.losses || 0) + 1;
     st.consecutiveLosses = (st.consecutiveLosses || 0) + 1;
+    if (st.consecutiveLosses >= Number(w.config?.limits?.stopAfterConsecutiveLosses) ||
+        st.lossCooldownPending) {
+      st.consecutiveLossCooldownAt = Date.now();
+      st.lossCooldownPending = true;
+      st.paused = true; st.pauseReason = 'consecutive-loss cooldown';
+    }
   }
+  if (pnl >= 0 && !st.lossCooldownPending) st.consecutiveLossCooldownAt = 0;
   w.exposureSol = Math.max(0, (w.exposureSol || 0) - (Number(p.solSpent) / 1e9));
   w.balanceSol = Number((w.balanceSol + returned).toFixed(6));
 
@@ -3948,6 +3981,19 @@ async function demoApi(path, opts = {}) {
     }
 
     if (action === 'start' || action === 'resume') {
+      const threshold = Number(w.config?.limits?.stopAfterConsecutiveLosses);
+      const streak = Number(w.stats?.consecutiveLosses || 0);
+      const minutes = Number(S.config?.lossStreakCooldownMinutes || 0);
+      if ((threshold > 0 && streak >= threshold || w.stats.lossCooldownPending) && minutes > 0) {
+        const since = Number(w.stats.consecutiveLossCooldownAt) || Date.now();
+        w.stats.consecutiveLossCooldownAt = since;
+        const remaining = since + minutes * 60000 - Date.now();
+        if (remaining > 0) throw new Error(`This wallet reached its loss streak limit. Wait ${Math.max(1, Math.ceil(remaining / 60000))} more minute(s), then press this wallet's Start again.`);
+        w.stats.consecutiveLosses = 0;
+        w.stats.consecutiveLossCooldownAt = 0;
+        w.stats.lossCooldownPending = false;
+      }
+      if (minutes === 0 && streak < threshold) w.stats.lossCooldownPending = false;
       w.enabled = true; w.armed = true;
       w.stats.paused = false; w.stats.pauseReason = null;
       S.status.running = true;
