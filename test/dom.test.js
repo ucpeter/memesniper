@@ -248,6 +248,64 @@ async function click(window, el) {
     assert.match($(MODAL).textContent, /Withdraw/i, 'and it must be the withdraw dialog');
   });
 
+  await test('a BUY updates an already-open Trades dialog, scoped to that wallet, without scrolling it away', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 2 });
+    await click(window, $('[data-detail]'));
+    const body = $('#modalRoot .modal-body');
+    const openWrap = $('[data-wallet-open-rows]');
+    body.scrollTop = 117;
+    assert.strictEqual($('[data-wallet-open-count]').textContent, '0');
+    const walletId = window.eval('S.detailWallet');
+    window.eval(`(function () {
+      const other = S.wallets.find((w) => w.id !== S.detailWallet);
+      const otherPos = { id:'other-pos', walletId:other.id, status:'OPEN', symbol:'OTHER',
+        mint:'other-mint',solSpent:'100000000',pnlSol:0,pnlPct:0,simulated:true };
+      handleWs({type:'position',data:otherPos});
+    })()`);
+    assert.strictEqual($('[data-wallet-open-count]').textContent, '0', 'another wallet must not leak into this dialog');
+    window.eval(`(function () {
+      const pos={ id:'fresh-buy', walletId:S.detailWallet,status:'OPEN', symbol:'FRESH',
+        mint:'fresh-mint',solSpent:'200000000',pnlSol:0,pnlPct:0,simulated:true };
+      handleWs({type:'position',data:pos});
+    })()`);
+    assert.strictEqual($('[data-wallet-open-count]').textContent, '1');
+    assert.match(openWrap.textContent, /FRESH/);
+    assert.match(openWrap.textContent, /SIM/);
+    assert.strictEqual($('#modalRoot .modal-body'), body, 'do not remount the modal');
+    assert.strictEqual(body.scrollTop, 117, 'do not throw away its scroll position');
+    assert.strictEqual(window.eval('S.detailWallet'), walletId);
+    assert.strictEqual($('[data-wallet-closed-count]').textContent, '0', 'an open buy is not a closed trade');
+    window.eval(`(function () {
+      S.wallets.find((w) => w.id === S.detailWallet).openPositions = S.positions.filter((p) => p.walletId === S.detailWallet);
+      handleWs({type:'tick',data:{status:S.status,wallets:S.wallets,prices:{}}});
+    })()`);
+    assert.strictEqual($('[data-wallet-open-count]').textContent, '1', 'still visible on heartbeat');
+    const table = openWrap.querySelector('table');
+    openWrap.scrollLeft = 45;
+    window.eval(`handleWs({type:'tick',data:{status:S.status,wallets:S.wallets,prices:{}}});`);
+    assert.strictEqual(openWrap.querySelector('table'), table, 'unchanged rows keep the same table node');
+    assert.strictEqual(openWrap.scrollLeft, 45, 'horizontal position survives heartbeats');
+  });
+
+  await test('the same Trades dialog moves a confirmed closed position into history live', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1 });
+    await click(window, $('[data-detail]'));
+    window.eval(`(function () {
+      const p={id:'round-trip',walletId:S.detailWallet,status:'OPEN',symbol:'ROUND',
+        mint:'round-mint',solSpent:'100000000',realisedSol:'0',pnlSol:0,pnlPct:0,
+        openedAt:Date.now()-1000,simulated:true};
+      handleWs({type:'position',data:p});
+      handleWs({type:'exit',data:{position:{...p,status:'CLOSED',
+        closedAt:Date.now(),realisedSol:'120000000',exitReason:'take_profit'},
+        decision:{reason:'take_profit'}}});
+    })()`);
+    assert.strictEqual($('[data-wallet-open-count]').textContent, '0');
+    assert.strictEqual($('[data-wallet-closed-count]').textContent, '1');
+    assert.match($('[data-wallet-closed-rows]').textContent, /ROUND/);
+    assert.match($('[data-wallet-closed-rows]').textContent, /SIM/);
+    assert.strictEqual($('#histCount').textContent, '1', 'the aggregate history updates too');
+  });
+
   await test('every dialog can be CLOSED by its own button', async () => {
     const { window, $, $$ } = await bootDashboard({ wallets: 1 });
 
@@ -576,6 +634,16 @@ async function click(window, el) {
     assert.strictEqual(window.eval(`S.wallets.find((w) => w.id === '${id}').enabled`), true, 'the wallet is armed');
     assert.strictEqual(window.eval(`S.wallets.find((w) => w.id === '${id}').armed`), true);
     assert.ok($$('[data-stop]').length > 0, 'and its card now offers Stop');
+  });
+
+  await test('Start does not claim a consecutive-loss breaker has expired', async () => {
+    const { window, $, $$ } = await bootDashboard({ wallets: 1 });
+    window.eval(`S.wallets[0].stats.consecutiveLosses = 3;
+      S.wallets[0].config.limits.stopAfterConsecutiveLosses = 3;
+      S.wallets[0].stats.paused = true; renderWallets();`);
+    await click(window, $$('[data-start]')[0]);
+    assert.match($('#toasts').textContent, /new buys remain blocked by 3 consecutive losses/i);
+    assert.match($('#toasts').textContent, /no timed cooldown/i);
   });
 
   /* ── paper trades are visibly paper ──────────────────────────────────── */
