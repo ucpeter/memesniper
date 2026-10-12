@@ -460,7 +460,7 @@ function handleWs(msg) {
       acceptServerStatus(msg.data.status);
       mergeWallets(msg.data.wallets);
       S.prices = msg.data.prices || {};
-      renderChips(); renderStats(); renderOverall(); renderWallets(); renderPositions();
+      renderChips(); renderStats(); renderOverall(); renderWallets(); renderPositions(); refreshOpenWalletDetail();
       break;
     case 'scan':
       // One launch changed state. Patch that row in place: a full re-render on every
@@ -481,7 +481,7 @@ function handleWs(msg) {
     case 'wallet':
       if (msg.data && typeof msg.data === 'object' && msg.data.id) mergeWallet(msg.data);
       else api('/api/wallets').then((rows) => {
-        if (Array.isArray(rows)) { S.wallets = rows; renderWallets(); renderOverall(); }
+        if (Array.isArray(rows)) { S.wallets = rows; renderWallets(); renderOverall(); refreshOpenWalletDetail(); }
       }).catch(() => {});
       break;
     case 'status':
@@ -828,15 +828,22 @@ async function openBrowserWallet(id, passphrase) {
 function mergeWallet(w) {
   const i = S.wallets.findIndex((x) => x.id === (w.id || w.walletId));
   if (i >= 0) S.wallets[i] = w; else S.wallets.push(w);
-  renderWallets(); renderStats(); renderPositions();
+  renderWallets(); renderStats(); renderPositions(); refreshOpenWalletDetail();
 }
 
 function mergePositionsFromWallet(pos) {
   const i = S.positions.findIndex((p) => p.id === pos.id);
   if (pos.status === 'OPEN') {
     if (i >= 0) S.positions[i] = pos; else S.positions.push(pos);
-  } else if (i >= 0) S.positions.splice(i, 1);
-  renderPositions(); renderStats();
+  } else {
+    if (i >= 0) S.positions.splice(i, 1);
+    if (pos.status === 'CLOSED') {
+      S.history = (S.history || []).filter((p) => p.id !== pos.id);
+      S.history.unshift(pos);
+      renderHistory();
+    }
+  }
+  renderPositions(); renderStats(); refreshOpenWalletDetail();
 }
 
 function upsertPosition(pos) {
@@ -875,7 +882,7 @@ const logLine = (r) => {
 /* ============================================================
    RENDER
    ============================================================ */
-function renderAll() { renderNotices(); renderChips(); renderStats(); renderOverall(); renderWallets(); renderPositions(); renderHistory(); renderLog(); }
+function renderAll() { renderNotices(); renderChips(); renderStats(); renderOverall(); renderWallets(); renderPositions(); renderHistory(); renderLog(); refreshOpenWalletDetail(); }
 
 function renderChips() {
   const running = S.status?.running;
@@ -2424,25 +2431,15 @@ function winRateOf(st) {
  * wallets; this is the per-wallet view, so "which wallet bought and sold what"
  * always has an answer.
  */
-function openWalletDetail(walletId) {
-  const w = (S.wallets || []).find((x) => x.id === walletId);
-  if (!w) return;
-  const st = w.stats || {};
-  const open = w.openPositions || [];
-  const closed = (w.recentPositions || []).filter((p) => p.status === 'CLOSED').slice(0, 40);
-  const rules = w.config?.filters || {};
-  const realFloor = rules.minLiquidityUsd != null
-    ? `$${Number(rules.minLiquidityUsd).toLocaleString('en-US')}`
-    : `${Number(rules.minLiquiditySol || 0).toLocaleString('en-US')} SOL (legacy)`;
-
-  const stat = (k, v, c) => `<div class="wstat"><div class="wstat-k">${k}</div><div class="wstat-v ${c || ''}">${v}</div></div>`;
-
+/** Both the initial modal and subsequent heartbeats use exactly these rows.
+ * Replacing only changed sections leaves the modal body/scrollbar untouched. */
+function walletDetailRows(w, open, closed) {
   const openRows = open.length
     ? `<table><thead><tr><th>Token</th><th class="num">Spent</th><th class="num">Value</th><th class="num">P&amp;L</th><th></th></tr></thead>
         <tbody>${open.map((p) => {
           const val = (Number(p.solSpent) / 1e9) + (p.pnlSol || 0);
           return `<tr>
-            <td class="sym">${esc(p.symbol)}<div class="mute" style="font-size:10px;font-weight:400">${esc(short(p.mint, 5))}</div></td>
+            <td class="sym">${esc(p.symbol)}${p.simulated ? '<span class="badge sim">SIM</span>' : ''}<div class="mute" style="font-size:10px;font-weight:400">${esc(short(p.mint, 5))}</div></td>
             <td class="num">${esc((Number(p.solSpent) / 1e9).toFixed(3))}</td>
             <td class="num">${esc(val.toFixed(3))}</td>
             <td class="num ${cls(p.pnlPct ?? 0)}"><b>${fmtPct(p.pnlPct ?? 0)}</b><div class="mute" style="font-size:10px">${fmtSol(p.pnlSol, 4)}</div></td>
@@ -2458,15 +2455,67 @@ function openWalletDetail(walletId) {
           const returned = Number(p.realisedSol || 0) / 1e9;
           const pnl = returned - spent;
           return `<tr>
-            <td class="sym">${esc(p.symbol || short(p.mint, 4))}</td>
+            <td class="sym">${esc(p.symbol || short(p.mint, 4))}${p.simulated ? '<span class="badge sim">SIM</span>' : ''}</td>
             <td class="num">${esc(spent.toFixed(3))}</td>
             <td class="num">${esc(returned.toFixed(3))}</td>
             <td class="num ${cls(pnl)}"><b>${fmtSol(pnl, 4)}</b></td>
-            <td><span class="badge sim">${esc(p.exitReason || '—')}</span></td>
+            <td><span class="badge ${pnl >= 0 ? 'won' : 'lost'}">${esc(p.exitReason || '—')}</span></td>
             <td class="num">${esc(fmtAge(p.closedAt && p.openedAt ? p.closedAt - p.openedAt : 0))}</td>
           </tr>`;
         }).join('')}</tbody></table>`
     : `<div class="empty" style="padding:22px"><div class="empty-sub">No closed trades for ${esc(w.name)} yet.</div></div>`;
+
+  return { openRows, closedRows };
+}
+
+function walletDetailClosed(w) {
+  const byId = new Map();
+  for (const p of [...(w.recentPositions || []), ...(S.history || [])]) {
+    if (p.status === 'CLOSED' && p.walletId === w.id && p.id) byId.set(p.id, p);
+  }
+  return [...byId.values()].sort((a, b) => (b.closedAt || 0) - (a.closedAt || 0)).slice(0, 40);
+}
+
+/** Refresh the open Trades dialog without replacing it or losing its scroll.
+ * A wallet's launch rows were already live, but the position/history markup was
+ * frozen when Trades opened — exactly the screenshot with BOUGHT and OPEN (0). */
+function refreshOpenWalletDetail() {
+  const id = S.detailWallet;
+  const modal = $('modalRoot')?.querySelector('.modal');
+  const w = id && (S.wallets || []).find((x) => x.id === id);
+  if (!w || !modal) return;
+  const open = (S.positions || []).filter((p) => p.walletId === id && p.status === 'OPEN');
+  const closed = walletDetailClosed(w);
+  const { openRows, closedRows } = walletDetailRows(w, open, closed);
+  const patch = (countSel, rowsSel, count, html) => {
+    const n = modal.querySelector(countSel);
+    const wrap = modal.querySelector(rowsSel);
+    if (n) n.textContent = String(count);
+    if (wrap && wrap._lastMarkup !== html && wrap.dataset.touching !== '1') {
+      const x = wrap.scrollLeft, y = wrap.scrollTop;
+      wrap.innerHTML = html;
+      wrap._lastMarkup = html;
+      wrap.scrollLeft = x; wrap.scrollTop = y;
+    }
+  };
+  patch('[data-wallet-open-count]', '[data-wallet-open-rows]', open.length, openRows);
+  patch('[data-wallet-closed-count]', '[data-wallet-closed-rows]', closed.length, closedRows);
+}
+
+function openWalletDetail(walletId) {
+  const w = (S.wallets || []).find((x) => x.id === walletId);
+  if (!w) return;
+  const st = w.stats || {};
+  const open = (S.positions || []).filter((p) => p.walletId === w.id && p.status === 'OPEN');
+  const closed = walletDetailClosed(w);
+  const rules = w.config?.filters || {};
+  const realFloor = rules.minLiquidityUsd != null
+    ? `$${Number(rules.minLiquidityUsd).toLocaleString('en-US')}`
+    : `${Number(rules.minLiquiditySol || 0).toLocaleString('en-US')} SOL (legacy)`;
+
+  const stat = (k, v, c) => `<div class="wstat"><div class="wstat-k">${k}</div><div class="wstat-v ${c || ''}">${v}</div></div>`;
+
+  const { openRows, closedRows } = walletDetailRows(w, open, closed);
 
   openModal(`
     <div class="modal" style="max-width:820px">
@@ -2489,11 +2538,11 @@ function openWalletDetail(walletId) {
         <div class="dim" style="font-size:11px;margin-bottom:7px">Saved wallet rules: real liquidity ≥ ${esc(realFloor)} · creator ≤ ${esc(rules.maxDevHoldPct ?? '—')}% · top 10 ≤ ${esc(rules.maxTop10HoldersPct ?? '—')}%. Risk is informational; these wallet rules decide eligibility.</div>
         <div class="tbl-wrap" data-live-wallet-feed="${esc(w.id)}">${walletFeedTable(w)}</div>
 
-        <div class="section-label">Open positions (${open.length})</div>
-        <div class="tbl-wrap">${openRows}</div>
+        <div class="section-label">Open positions (<span data-wallet-open-count>${open.length}</span>)</div>
+        <div class="tbl-wrap" data-wallet-open-rows>${openRows}</div>
 
-        <div class="section-label">Trade history (${closed.length})</div>
-        <div class="tbl-wrap">${closedRows}</div>
+        <div class="section-label">Trade history (<span data-wallet-closed-count>${closed.length}</span>)</div>
+        <div class="tbl-wrap" data-wallet-closed-rows>${closedRows}</div>
 
         <div class="notice info" style="margin-top:14px"><span class="ico">ℹ</span><div>
           Only <b>${esc(w.name)}</b>'s trades are shown here. The board at the top of the page is the
@@ -2510,6 +2559,8 @@ function openWalletDetail(walletId) {
       </div>
     </div>`, (root) => {
     S.detailWallet = w.id; // so a kill from inside here re-renders this view
+    root.querySelector('[data-wallet-open-rows]')._lastMarkup = openRows;
+    root.querySelector('[data-wallet-closed-rows]')._lastMarkup = closedRows;
     root.querySelector('#wdFund').onclick = () => openFund(w.id);
     root.querySelector('#wdWithdraw').onclick = () => openWithdraw(w.id);
     root.querySelector('#wdConfig').onclick = () => openWallet(w.id);
@@ -2645,6 +2696,7 @@ function openModal(html, onMount) {
 }
 function closeModal() {
   $('modalRoot').innerHTML = '';
+  S.detailWallet = null;
   document.removeEventListener('keydown', escClose);
 }
 function escClose(e) { if (e.key === 'Escape') closeModal(); }
@@ -4316,6 +4368,12 @@ document.addEventListener('click', async (e) => {
       await refreshAll(); renderAll();
       const nm = (S.wallets || []).find((x) => x.id === start);
       const label = nm ? nm.name : 'Wallet';
+      const lossLimit = Number(nm?.config?.limits?.stopAfterConsecutiveLosses);
+      const lossStreak = Number(nm?.stats?.consecutiveLosses || 0);
+      if (Number.isFinite(lossLimit) && lossLimit > 0 && lossStreak >= lossLimit) {
+        toast(`▶ ${label} started, but new buys remain blocked by ${lossStreak} consecutive losses. There is no timed cooldown; review the limit and wait for the next UTC trading day or a later winning close.`, 'warn');
+        return;
+      }
       toast(
         r.dryRun === false
           ? `▶ ${label} armed — LIVE: real funds`
