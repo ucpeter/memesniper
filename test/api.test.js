@@ -1075,6 +1075,40 @@ const api = async (method, url, body) => {
     assert.strictEqual(t.stats.consecutiveLosses, 0);
   });
 
+  await test('legacy max-trades config is stripped on wallet PUT; realised SOL target remains saved and enforced', async () => {
+    const t = engine.traders.get(beta.cfg.id);
+    t.stats.tradesToday = 100000;
+    t.stats.realisedPnlSol = 0.1;
+    const edited = await api('PUT', `/api/wallets/${beta.cfg.id}`, {
+      limits: { maxTradesPerDay: 1, dailyProfitTargetSol: 0.2 },
+    });
+    assert.strictEqual(edited.status, 200, JSON.stringify(edited.body));
+    assert.strictEqual(edited.body.limits.maxTradesPerDay, undefined);
+    assert.strictEqual(t.cfg.limits.maxTradesPerDay, undefined);
+    assert.strictEqual(t.cfg.limits.dailyProfitTargetSol, 0.2);
+    assert.strictEqual(config.wallets.find((w) => w.id === beta.cfg.id).limits.maxTradesPerDay, undefined);
+    assert.strictEqual(risk.canOpenNewPosition(t).ok, true,
+      'old one-trade cap cannot silently block a wallet with 100000 recorded buys');
+    t.stats.realisedPnlSol = 0.2;
+    assert.strictEqual(risk.canOpenNewPosition(t).reason, 'daily_profit_target_reached');
+  });
+
+  await test('disk reload removes only obsolete daily trade-count key and retains other wallet settings', () => {
+    const file = path.join(TMP, 'config.json');
+    fs.writeFileSync(file, JSON.stringify({ global: cfg.defaultGlobalConfig(),
+      wallets: [{ id: 'legacy_limit', name: 'Legacy', limits: {
+        maxTradesPerDay: 1, dailyProfitTargetSol: 0.7, maxExposureSol: 3,
+      }, stats: { tradesToday: 54321 } }] }));
+    const loaded = cfg.load();
+    assert.strictEqual(loaded.wallets[0].limits.maxTradesPerDay, undefined);
+    assert.strictEqual(loaded.wallets[0].limits.dailyProfitTargetSol, 0.7);
+    assert.strictEqual(loaded.wallets[0].limits.maxExposureSol, 3);
+    assert.strictEqual(loaded.wallets[0].stats.tradesToday, 54321);
+    cfg.save();
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.strictEqual(saved.wallets[0].limits.maxTradesPerDay, undefined);
+  });
+
   Object.assign(keystore, { has: STUBBED_KEYSTORE.has, getKeypair: STUBBED_KEYSTORE.getKeypair, isUnlocked: STUBBED_KEYSTORE.isUnlocked });
 
   /* ───────────────────────────────────────────────────────────────────── */

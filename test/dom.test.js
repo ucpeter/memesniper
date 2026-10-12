@@ -943,7 +943,7 @@ async function click(window, el) {
     assert.strictEqual(window.eval('S.wallets.length'), 2);
   });
 
-  await test('Trades launches load 20 at a time in their own viewport; trade sections remain full-size', async () => {
+  await test('Trades shows 20 whole launch rows before inner scrolling; collapse exposes full trade sections', async () => {
     const { window, $ } = await bootDashboard({ wallets: 2 });
     window.eval(`S.scanFeed = Array.from({length: 55}, (_, i) => ({
       mint: 'BOUND_MINT_' + i, symbol: 'TOKEN_' + i, liquidityUsd: 3000,
@@ -951,23 +951,38 @@ async function click(window, el) {
         action: 'filtered', reason: 'test' }]
     })); openWalletDetail(S.wallets[0].id);`);
     const wrap = $('[data-trades-launches]');
-    assert.ok(wrap.classList.contains('trades-launches'));
-    assert.match(fs.readFileSync(path.join(ROOT, 'public', 'styles.css'), 'utf8'),
-      /\.trades-launches\s*\{[^}]*max-height:\s*min\(340px, 36vh\);[^}]*overflow:\s*auto/,
-      'the launch table alone has a bounded, phone-aware inner scroll');
-    assert.strictEqual(wrap.querySelectorAll('tbody tr').length, 20);
+    const css = fs.readFileSync(path.join(ROOT, 'public', 'styles.css'), 'utf8');
+    assert.match(css, /\.trades-launches\s*\{[^}]*max-height:\s*none;[^}]*overflow:\s*auto/);
+    assert.match(css, /\.trades-launches-heading\s*\{[^}]*position:sticky/);
+    assert.doesNotMatch(css, /\.trades-launches\s*\{[^}]*36vh/,
+      'the old 36vh cap showed just a handful of rows on the phone');
+    assert.strictEqual(wrap.querySelectorAll('tbody tr').length, 55,
+      'older launches are ready when the user scrolls, not hidden until a dead-end');
     assert.strictEqual($('[data-wallet-open-rows]').classList.contains('trades-launches'), false);
     assert.strictEqual($('[data-wallet-closed-rows]').classList.contains('trades-launches'), false);
-    assert.strictEqual($('[data-wallet-open-rows]').getAttribute('data-trades-launches'), null);
     assert.match(window.document.querySelector('.modal-body').textContent, /Open positions.*Trade history/s);
+
+    // jsdom cannot lay out cells; supply measured header/row heights to test
+    // the SAME sizing function run in the browser after the modal is mounted.
+    const head = wrap.querySelector('thead');
+    head.getBoundingClientRect = () => ({ height: 32 });
+    [...wrap.querySelectorAll('tbody tr')].forEach((row) => {
+      row.getBoundingClientRect = () => ({ height: 90 });
+    });
+    window.eval('sizeTradesLaunches(document.querySelector("[data-trades-launches]"))');
+    assert.ok(parseFloat(wrap.style.height) >= 32 + 20 * 90,
+      'height accommodates all 20 complete rows, not 5');
+    assert.ok(parseFloat(wrap.style.height) < 32 + 21 * 90,
+      'older rows live below the inner scroll fold');
+    head.getBoundingClientRect = () => ({ height: 40 });
+    window.dispatchEvent(new window.Event('resize'));
+    assert.ok(parseFloat(wrap.style.height) >= 40 + 20 * 90,
+      'font/phone resize recalculates the 20-row height');
     wrap.scrollLeft = 75;
-    wrap.scrollTop = 100;
-    wrap.dispatchEvent(new window.Event('scroll'));
-    assert.strictEqual(wrap.querySelectorAll('tbody tr').length, 40);
-    assert.strictEqual(wrap.scrollLeft, 75);
-    wrap.scrollTop = 200;
+    wrap.scrollTop = 1000;
     wrap.dispatchEvent(new window.Event('scroll'));
     assert.strictEqual(wrap.querySelectorAll('tbody tr').length, 55);
+    assert.strictEqual(wrap.scrollLeft, 75);
     window.eval(`S.scanFeed.unshift({ mint: 'BOUND_NEW', symbol: 'NEWEST',
       wallets: [{ walletId: S.wallets[0].id, name: S.wallets[0].name,
         action: 'bought' }] }); renderWalletFeeds();`);
@@ -975,11 +990,45 @@ async function click(window, el) {
     assert.strictEqual(wrap.querySelectorAll('tbody tr').length, 56);
     assert.match(wrap.querySelector('tbody tr').textContent, /NEWEST/);
     assert.strictEqual(wrap.scrollLeft, 75);
+
+    const headerToggle = $('[data-header-toggle]');
+    const toggle = $('.trades-launches-heading [data-toggle-trades-launches]');
+    headerToggle.click(); // stays in the always-visible modal header on a phone
+    assert.strictEqual(wrap.hidden, true);
+    assert.strictEqual(toggle.getAttribute('aria-expanded'), 'false');
+    assert.strictEqual(headerToggle.getAttribute('aria-expanded'), 'false');
+    assert.ok($('[data-wallet-open-rows]') && $('[data-wallet-closed-rows]'));
+    assert.strictEqual($('[data-wallet-open-rows]').hidden, false);
+    assert.strictEqual($('[data-wallet-closed-rows]').hidden, false);
+    window.eval(`S.scanFeed.unshift({ mint: 'WHILE_HIDDEN', symbol: 'HIDDEN_NEW',
+      wallets: [{ walletId: S.wallets[0].id, name: S.wallets[0].name,
+        action: 'filtered', reason: 'test' }] }); renderWalletFeeds();`);
+    toggle.click();
+    assert.strictEqual(wrap.hidden, false);
+    assert.strictEqual(toggle.getAttribute('aria-expanded'), 'true');
+    assert.strictEqual(headerToggle.getAttribute('aria-expanded'), 'true');
+    assert.match(wrap.querySelector('tbody tr').textContent, /HIDDEN_NEW/);
+    assert.strictEqual(wrap.scrollLeft, 75);
     window.eval(`openWalletFeed(S.wallets[0].id);`);
-    assert.strictEqual($('[data-trades-launches]'), null, 'standalone launch feed is not constrained');
-    assert.strictEqual($('[data-live-wallet-feed] tbody').rows.length, 56);
+    assert.strictEqual($('[data-trades-launches]'), null, 'standalone feed stays separate');
+    assert.strictEqual($('[data-live-wallet-feed] tbody').rows.length, 57);
     window.eval(`openWalletDetail(S.wallets[1].id)`);
-    assert.strictEqual(window.document.querySelectorAll('[data-trades-launches] tbody tr').length, 0, 'other wallet has no shared rows');
+    assert.strictEqual(window.document.querySelectorAll('[data-trades-launches] tbody tr').length, 0,
+      'another wallet has no shared launches');
+  });
+
+  await test('wallet Limits form removes max trades per day, retains daily SOL target and other limits', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1 });
+    window.eval(`S.wallets[0].config.limits.maxTradesPerDay = 1;
+      openWallet(S.wallets[0].id);`);
+    assert.strictEqual($('#f_dtrades'), null);
+    assert.ok($('#f_dprofit') && $('#f_dloss') && $('#f_exposure') && $('#f_consec'));
+    assert.strictEqual(window.eval('S.editing.cfg.limits.maxTradesPerDay'), undefined);
+    window.eval('S.editing.cfg.limits.dailyProfitTargetSol = 0.5;');
+    await click(window, $('#edSave'));
+    assert.strictEqual(window.eval('S.wallets[0].config.limits.maxTradesPerDay'), undefined,
+      'offline preview also strips a saved legacy cap');
+    assert.strictEqual(window.eval('S.wallets[0].config.limits.dailyProfitTargetSol'), 0.5);
   });
 
   /* ────────────── withdrawing: who signs it, in plain words ────────────── */

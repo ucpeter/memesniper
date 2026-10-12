@@ -393,6 +393,28 @@ test('consecutive-loss circuit breaker trips', () => {
   assert.strictEqual(g.reason, 'consecutive_loss_circuit_breaker');
 });
 
+test('no maximum trade count blocks entries, even if a saved legacy wallet says one', () => {
+  const initial = cfg.defaultWalletConfig('No count cap');
+  assert.strictEqual(initial.limits.maxTradesPerDay, undefined);
+  const normalised = cfg.normaliseWallet(cfg.deepMerge(initial, {
+    limits: { maxTradesPerDay: 1, dailyProfitTargetSol: 0.25 },
+  }));
+  assert.strictEqual(normalised.limits.maxTradesPerDay, undefined, 'old saved cap is stripped');
+  const t = makeTrader();
+  t.cfg.enabled = true;
+  t.cfg.limits.maxTradesPerDay = 1; // even an un-migrated in-memory wallet
+  t.stats.tradesToday = 12345;
+  t.cfg.limits.dailyProfitTargetSol = 0;
+  assert.strictEqual(risk.canOpenNewPosition(t).ok, true, 'no profit target: count still unlimited');
+  t.cfg.limits.dailyProfitTargetSol = 0.25;
+  t.stats.realisedPnlSol = 0.24;
+  assert.strictEqual(risk.canOpenNewPosition(t).ok, true, 'under the realised SOL target');
+  t.stats.realisedPnlSol = 0.25;
+  assert.strictEqual(risk.canOpenNewPosition(t).reason, 'daily_profit_target_reached');
+  t.stats.realisedPnlSol = -2.1;
+  assert.strictEqual(risk.canOpenNewPosition(t).reason, 'daily_loss_limit_reached');
+});
+
 test('a healthy wallet passes all guardrails', () => {
   const t = makeTrader();
   t.cfg.enabled = true;
