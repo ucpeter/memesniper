@@ -336,6 +336,15 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
   app.put('/api/config', requireToken, (req, res) => {
     const g = getGlobal();
     const patch = { ...req.body };
+    // Mode changes belong to the confirmed endpoint, not the generic settings
+    // merge. Settings currently sends the unchanged dryRun value as well.
+    if (Object.prototype.hasOwnProperty.call(patch, 'dryRun')) {
+      if (patch.dryRun !== g.dryRun) {
+        return res.status(400).json({ error: 'use_mode_switch',
+          hint: 'Change trading mode with the Dry run / LIVE switch, not Save settings.' });
+      }
+      delete patch.dryRun;
+    }
     // Never let a masked placeholder overwrite a real key.
     if (patch.ai && typeof patch.ai.apiKey === 'string' && patch.ai.apiKey.includes('••••')) {
       patch.ai.apiKey = g.ai.apiKey;
@@ -1345,6 +1354,17 @@ function createServer(engine, { getGlobal, getFull, save: saveConfig }) {
     const want = req.body.dryRun === true;
     if (!want && req.body.confirm !== 'I_UNDERSTAND_THE_RISK') {
       return res.status(400).json({ error: 'live_confirmation_required', hint: 'Disabling dry-run means real funds. Send confirm:"I_UNDERSTAND_THE_RISK".' });
+    }
+    // An open paper bag must not be submitted as a LIVE sell, and a real bag
+    // must not be recorded as sold on paper. Stop a wallet to halt new entries;
+    // keep its current mode for exit management until every position closes.
+    const pendingInCurrentMode = Object.values(engine._unresolved || {}).some((snaps) =>
+      Array.isArray(snaps) && snaps.some((snap) => Boolean(snap.meta?.simulated) === g.dryRun));
+    if (want !== g.dryRun && ([...engine.traders.values()].some((t) => t.openPositions().length) ||
+        pendingInCurrentMode || engine._evalQueue > 0 ||
+        [...engine.traders.values()].some((t) => t._inFlightBuy > 0))) {
+      return res.status(409).json({ error: 'mode_change_blocked',
+        hint: 'Open or unrecovered positions, or an entry in progress: stop wallets to halt new buys; recover and close positions in their current mode before switching. LIVE positions need real exits; paper positions need simulated exits.' });
     }
     g.dryRun = want;
     saveConfig();
