@@ -363,6 +363,21 @@ test('a price gap can trigger trailing at a loss despite a positive stop floor',
     'a stop is a trigger, not a guaranteed exit price');
 });
 
+test('integer token-price rounding can show spot +0% with a marked loss and no fills', () => {
+  const tokens = 18_351_351n * 1_000_000n;
+  const spent = 697_000_000n;
+  const truncatedEntry = (spent * 1_000_000n) / tokens;
+  const p = new Position({ walletId: 'w', mint: 'JIP', symbol: 'JIP',
+    entryPrice: truncatedEntry, tokensHeld: tokens, solSpent: spent });
+  p.mark(truncatedEntry);
+  assert.equal(truncatedEntry, 37n);
+  assert.equal(p.priceGainPct(), 0, 'ratio of two quantised prices displays zero');
+  assert.equal(p.remainingFraction, 1);
+  assert.deepStrictEqual(p.exits, []);
+  assert.ok(p.pnlLamports() < -17_000_000n && p.pnlLamports() > -19_000_000n,
+    'whole-position mark is about 0.679 SOL vs 0.697 SOL spent');
+});
+
 console.log('\n── time & liquidity stops ────────────────────────────────');
 
 test('time stop fires after maxHoldMs', () => {

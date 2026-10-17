@@ -246,6 +246,23 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
     assert.strictEqual(p.realisedSol > 0n, true, 'should have banked SOL');
   });
 
+  await test('Activity BUY, SELL and CLOSED logs identify the mint, not just a reusable symbol', async () => {
+    const log = require('../src/util/logger');
+    const { trader, priceCache } = makeTrader('balanced', { exits: {
+      takeProfitTiers: [{ gainPct: 20, sellPct: 100 }],
+    } });
+    const mint = require('@solana/web3.js').Keypair.generate().publicKey.toBase58();
+    const ref = `${mint.slice(0, 5)}…${mint.slice(-5)}`;
+    await trader.consider({ ...CANDIDATE, mint, symbol: 'TRUMP' }, { engine: ENGINE });
+    const p = trader.openPositions()[0];
+    assert.ok(log.history(10).some((x) => x.message.includes(`BOUGHT TRUMP [${ref}]`)));
+    await tick(trader, priceCache, 25);
+    const tail = log.history(10).map((x) => x.message).join('\n');
+    assert.ok(tail.includes(`SOLD 100.0% TRUMP [${ref}]`));
+    assert.ok(tail.includes(`Closed TRUMP [${ref}]:`));
+    assert.equal(p.toJSON().markFreshnessMs, Math.max(5000, Number(process.env.PRICE_POLL_MS || 1200) * 3));
+  });
+
   await test('stale cache price cannot trigger a take-profit; fresh mark can', async () => {
     const { trader, executor, priceCache } = makeTrader('balanced', { exits: {
       takeProfitTiers: [{ gainPct: 20, sellPct: 15 }],

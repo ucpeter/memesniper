@@ -1042,20 +1042,30 @@ async function click(window, el) {
     })()`);
     const openText = $('[data-wallet-open-rows]').textContent;
     assert.match(openText, /Marked total/);
-    assert.match(openText, /P&L \/ spot gain/);
-    assert.match(openText, /\+20%: 15\.0% sold/);
-    assert.match(openText, /85\.0% held/);
+    assert.match(openText, /Marked P&L \/ spot gain/);
+    assert.match(openText, /TP \+20%: 15\.0% of original sold/);
+    assert.match(openText, /Held: 85\.0% of original tokens/);
     assert.match(openText, /\+25\.2%/);
     assert.match(openText, /spot \+18\.0%/);
-    assert.match(openText, /trigger \+40\.0%/);
-    assert.match(openText, /stale; price exits need a fresh read/);
+    assert.match(openText, /stop trigger \+40\.0%/);
+    assert.match(openText, /PRICE OLD \(15s\): automatic price exits await a fresh read/);
+    assert.match(openText, /OLD MARK · not live/);
+    assert.equal($('[data-wallet-open-rows] td.sym [data-mark-state]').dataset.markState, 'stale');
+    const css = fs.readFileSync(path.join(ROOT, 'public', 'styles.css'), 'utf8');
+    assert.match(css, /\.mark-stale\s*\{[^}]*color:\s*var\(--amber\)/,
+      'the warning must not inherit a green profit colour');
     const closedText = $('[data-wallet-closed-rows]').textContent;
     assert.match(closedText, /trailing_stop/);
-    assert.match(closedText, /\+20%: 15\.0% sold/);
+    assert.match(closedText, /TP \+20%: 15\.0% of original sold/);
+    assert.match(closedText, /Time held/);
+    assert.match(closedText, /OLD_M…_MINT/);
     assert.match(closedText, /peak \+60\.0%/);
     assert.match(closedText, /final spot -12\.0%/);
     assert.match(window.document.querySelector('.modal-body').textContent,
-      /A stop is a trigger, not a guaranteed execution price/);
+      /automatic price exits wait for a fresh read/);
+    window.eval('S.positions[0].lastUpdated = Date.now(); refreshOpenWalletDetail();');
+    assert.equal($('[data-wallet-open-rows] td.sym [data-mark-state]').dataset.markState, 'fresh');
+    assert.doesNotMatch($('[data-wallet-open-rows]').textContent, /PRICE OLD/);
   });
 
   await test('Trades shows 20 whole launch rows before inner scrolling; collapse exposes full trade sections', async () => {
