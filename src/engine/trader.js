@@ -256,6 +256,18 @@ class Trader {
       aiConfidence: aiResult.confidence,
     });
     if (sizeSol <= 0.001) return 'skip:size_too_small';
+    // Check the proposed order as well as existing positions. Without this,
+    // a wallet at 2.9 SOL could send another 1 SOL buy past a 3 SOL ceiling.
+    // These are sequential checks, not an atomic reservation across concurrent
+    // in-flight buys; the audit documents that remaining limitation.
+    if (this.openExposureSol() + sizeSol > this.cfg.limits.maxExposureSol + 1e-9) {
+      return 'skip:max_exposure_reached';
+    }
+    const activeExposure = [...ctx.engine.traders.values()]
+      .reduce((sum, t) => sum + t.openExposureSol(), 0);
+    if (activeExposure + sizeSol > g.riskGlobal.maxTotalExposureSol + 1e-9) {
+      return 'skip:global_max_exposure';
+    }
 
     /* 6 — execute */
     progress('Preparing a buy');
@@ -426,11 +438,15 @@ class Trader {
 
     for (const position of this.openPositions()) {
       const price = this.priceCache.get(position.mint);
-      if (!price) {
-        // No mark available: still let price-independent rules (the time stop)
-        // run, so a dead feed does not silently disable every exit.
-        const fallback = risk.evaluate(position, this.cfg, { priceStale: true });
-        if (fallback.length) await this._act(position, fallback, ctx);
+      const age = price ? Date.now() - Number(price.ts) : Infinity;
+      const maxAge = Math.max(5000, Number(process.env.PRICE_POLL_MS || 1200) * 3);
+      if (!price || !Number.isFinite(age) || age < 0 || age > maxAge) {
+        // A partial batch may return no account for this mint while retaining
+        // its OLD cache entry. Never evaluate tiers or stops against that mark.
+        // Even a mathematically due time stop cannot be filled or estimated
+        // honestly without fresh curve reserves. In particular, dry run must
+        // not book a fake 0-SOL sale from a missing/stale price. Defer until
+        // the next verified poll. Manual emergency exits remain separate.
         continue;
       }
 
@@ -508,6 +524,17 @@ class Trader {
         const pctSold = Number(sellTokens) / Number(position.originalTokens) * 100;
         const wasFullExit = sellTokens >= position.tokensHeld;
 
+        // recordExit emits updated/closed events synchronously. Mark the tier
+        // BEFORE those events, or an already-open Trades dialog (and a position
+        // snapshot taken on close) sees a sold partial with tier still unfilled.
+        if (d.tier !== undefined && d.tier !== null && position.tiers[d.tier]) {
+          position.tiers[d.tier].filled = true;
+        }
+        if (wasFullExit) {
+          for (const t of position.tiers) {
+            if (!t.filled) { t.filled = true; t.superseded = true; }
+          }
+        }
         position.recordExit({
           pctSold,
           tokensSold: sellTokens,
@@ -517,10 +544,6 @@ class Trader {
           signature: res.signature,
         });
 
-        if (d.tier !== undefined && d.tier !== null && position.tiers[d.tier]) {
-          position.tiers[d.tier].filled = true;
-        }
-
         const gain = position.priceGainPct();
         log.trade(
           `🔴 SOLD ${pctSold.toFixed(1)}% ${position.symbol} @ ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}% ` +
@@ -528,14 +551,7 @@ class Trader {
           { wallet: this.cfg.name }
         );
 
-        if (wasFullExit) {
-          // Resolve every remaining tier: the position is gone, so any tier
-          // that did not fire was superseded by a better exit.
-          for (const t of position.tiers) {
-            if (!t.filled) { t.filled = true; t.superseded = true; }
-          }
-          this._onPositionClosed(position);
-        }
+        if (wasFullExit) this._onPositionClosed(position);
         bus.safeEmit('position:exited', { position: position.toJSON(), decision: d, signature: res.signature });
       }
     }
@@ -677,6 +693,7 @@ class Trader {
     }
 
     const solReceived = res.fill?.solOut ?? expectedSol;
+    for (const t of position.tiers) if (!t.filled) { t.filled = true; t.superseded = true; }
     position.recordExit({
       pctSold: (Number(tokens) / Number(position.originalTokens)) * 100,
       tokensSold: tokens,
@@ -685,7 +702,6 @@ class Trader {
       tier: null,
       signature: res.signature,
     });
-    for (const t of position.tiers) if (!t.filled) { t.filled = true; t.superseded = true; }
     this._onPositionClosed(position);
 
     log.trade(

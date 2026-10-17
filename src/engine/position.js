@@ -75,6 +75,7 @@ class Position {
       entryPrice: this.entryPrice.toString(),
       lastPrice: this.lastPrice.toString(),
       highWaterPrice: this.highWaterPrice.toString(),
+      lastUpdated: this.lastUpdated,
       originalTokens: this.originalTokens.toString(),
       tokensHeld: this.tokensHeld.toString(),
       solSpent: this.solSpent.toString(),
@@ -100,6 +101,7 @@ class Position {
     p.realisedTokens = BigInt(s.realisedTokens || 0);
     p.highWaterPrice = BigInt(s.highWaterPrice || s.entryPrice);
     p.lastPrice = BigInt(s.lastPrice || s.entryPrice);
+    p.lastUpdated = Number(s.lastUpdated) || p.openedAt;
     if (Array.isArray(s.tiers)) p.tiers = s.tiers;
     if (Array.isArray(s.exits)) p.exits = s.exits;
     return p;
@@ -198,6 +200,7 @@ class Position {
       peakGainPct: this.peakGainPct(),
       remainingFraction: this.remainingFraction,
       stopLevelPct: this.stopLevelPct,
+      lastUpdated: this.lastUpdated,
       tiers: this.tiers,
       exits: this.exits,
       entryTxSignature: this.entryTxSignature,

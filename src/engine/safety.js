@@ -599,9 +599,10 @@ async function evaluate(candidate, cfg, ctx) {
       hardFails.push('top10_unverified');
     }
   }
-  if (f.requireSocial && metadata.socials && !metadata.hasSocial) {
-    reasons.push('no_socials');
-    score -= 20;
+  if (f.requireSocial && metadata.hasSocial !== true) {
+    // "Require" must fail closed, including when the external metadata API
+    // cannot be read. A mere 20-point score penalty used to approve buys.
+    hardFails.push(metadata.skipped ? 'socials_unverified' : 'no_socials');
   }
   if (metadata.lookalike) {
     reasons.push('unicode_lookalike_name');
@@ -611,7 +612,7 @@ async function evaluate(candidate, cfg, ctx) {
     reasons.push('symbol_collides_with_known_ticker');
     score -= 25;
   }
-  if (metadata.creator && f.devBlacklist.includes(metadata.creator)) {
+  if (f.devBlacklist.includes(candidate.creator) || (metadata.creator && f.devBlacklist.includes(metadata.creator))) {
     hardFails.push('dev_blacklisted');
   }
   if (f.mintBlacklist.includes(candidate.mint)) {

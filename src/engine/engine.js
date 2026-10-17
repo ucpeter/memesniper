@@ -350,9 +350,16 @@ class Engine {
 
         infos.forEach((info, i) => {
           const mint = mintList[i];
-          if (!info) return;
-          const parsed = safety.parseBondingCurve(info.data);
-          if (!parsed) return;
+          const parsed = info ? safety.parseBondingCurve(info.data) : null;
+          if (!parsed) {
+            // The cache may contain a mark from the immediately preceding
+            // batch (well under the age TTL). Invalidate its freshness now,
+            // otherwise this missing account is incorrectly re-evaluated as a
+            // successful new tick. Retain reserves/peak only for diagnostics.
+            const prev = this.priceCache.get(mint);
+            if (prev) this.priceCache.set(mint, { ...prev, ts: 0 });
+            return;
+          }
 
           const price = curve.spotPriceScaled(parsed.virtualSolReserves, parsed.virtualTokenReserves);
           const liquiditySol = Number(parsed.realSolReserves) / 1e9;

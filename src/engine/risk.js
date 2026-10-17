@@ -29,30 +29,33 @@ const lossCooldown = require('./loss-cooldown');
  * then the highest (tightest) of the three candidates wins. Because
  * `highWaterPrice` only ever increases, the trailing floor can only ratchet up.
  */
-function effectiveStopPct(position, cfg) {
-  const { stopLossPct } = cfg.exits;
-  const gain = position.priceGainPct();
+function stopRule(position, cfg) {
   const peak = position.peakGainPct();
-
-  let level = -Math.abs(stopLossPct);
-
-  // Break-even: once we've been up activationPct, never allow a full round-trip.
-  if (cfg.exits.breakEven?.enabled && peak >= cfg.exits.breakEven.activationPct) {
-    level = Math.max(level, cfg.exits.breakEven.offsetPct);
+  const lossFloor = -Math.abs(cfg.exits.stopLossPct);
+  let level = lossFloor;
+  let reason = 'stop_loss';
+  const breakEven = cfg.exits.breakEven;
+  if (breakEven?.enabled && peak >= breakEven.activationPct &&
+      breakEven.offsetPct > level) {
+    level = breakEven.offsetPct;
+    reason = 'break_even';
   }
-
-  // Trailing: floor = peak - trailPct, only once the trail has been activated.
-  if (cfg.exits.trailing?.enabled && peak >= cfg.exits.trailing.activationPct) {
-    let trailFloor = peak - cfg.exits.trailing.trailPct;
-    // Optional step quantisation: only move the stop in `stepPct` increments,
-    // which avoids over-tight stops on noisy micro-pumps.
-    if (cfg.exits.trailing.stepPct > 0) {
-      trailFloor = Math.floor(trailFloor / cfg.exits.trailing.stepPct) * cfg.exits.trailing.stepPct;
+  const trailing = cfg.exits.trailing;
+  if (trailing?.enabled && peak >= trailing.activationPct) {
+    let floor = peak - trailing.trailPct;
+    if (trailing.stepPct > 0) {
+      floor = Math.floor(floor / trailing.stepPct) * trailing.stepPct;
     }
-    level = Math.max(level, trailFloor);
+    // The displayed reason must use the QUANTISED floor, not the raw one.
+    // A step of 5% turns 22% into 20%; comparing 20 with 22 used to
+    // incorrectly label a triggered trailing exit as break_even.
+    if (floor > level) { level = floor; reason = 'trailing_stop'; }
   }
+  return { level, reason };
+}
 
-  return level;
+function effectiveStopPct(position, cfg) {
+  return stopRule(position, cfg).level;
 }
 
 /**
@@ -64,10 +67,12 @@ function effectiveStopPct(position, cfg) {
 function dueTiers(position, cfg) {
   const gain = position.priceGainPct();
   const due = [];
-  cfg.exits.takeProfitTiers.forEach((tier, index) => {
-    const state = position.tiers[index];
-    if (!state || state.filled) return;
-    if (gain >= tier.gainPct) due.push({ index, ...tier });
+  // The tier plan is copied to the position at BUY and persisted with it.
+  // Reading the wallet's *current* plan here retroactively changed open bags
+  // on every editor save, and index shifts could re-fire or skip a tier.
+  position.tiers.forEach((tier, index) => {
+    if (tier.filled) return;
+    if (gain >= tier.gainPct) due.push({ index, gainPct: tier.gainPct, sellPct: tier.sellPct });
   });
   return due.sort((a, b) => b.gainPct - a.gainPct);
 }
@@ -101,19 +106,14 @@ function evaluate(position, cfg, market = {}) {
 
   const gain = position.priceGainPct();
   const peak = position.peakGainPct();
-  const stopLevel = effectiveStopPct(position, cfg);
+  const stop = stopRule(position, cfg);
+  const stopLevel = stop.level;
   position.stopLevelPct = stopLevel;
 
   /* -------------------- 1. STOP LOSS / TRAILING / BREAK-EVEN ---------------- */
   if (gain <= stopLevel) {
-    const trailArmed = cfg.exits.trailing?.enabled && peak >= cfg.exits.trailing.activationPct;
-    const trailFloor = trailArmed ? peak - cfg.exits.trailing.trailPct : -Infinity;
-    const reason =
-      stopLevel <= -Math.abs(cfg.exits.stopLossPct) + 1e-9 ? 'stop_loss'
-        : stopLevel > 0 && Math.abs(stopLevel - trailFloor) < 1e-9 ? 'trailing_stop'
-          : stopLevel > 0 ? 'break_even'
-            : 'trailing_stop';
-    decisions.push({ action: 'SELL', tokens: position.tokensHeld, pct: 100, reason, stopLevel });
+    decisions.push({ action: 'SELL', tokens: position.tokensHeld, pct: 100,
+      reason: stop.reason, stopLevel, observedGainPct: gain, peakGainPct: peak });
     // A full exit voids every other rule for this tick.
     return decisions;
   }
