@@ -98,6 +98,22 @@ const test = async (label, fn) => { await fn(); passed += 1; console.log(`  ✓ 
       assert.equal(out.report.distribution.holderSample, 2);
       assert.ok(!('minHolders' in wallet.filters), 'old preset 8-holder gate is removed');
     });
+    await test('Require socials is a hard gate if external metadata cannot be verified', async () => {
+      wallet.filters.requireSocial = true;
+      const out = await verdict();
+      assert.equal(out.ok, false);
+      assert.equal(out.hard, true);
+      assert.ok(out.reasons.includes('socials_unverified'), out.reasons.join(','));
+      wallet.filters.requireSocial = false;
+    });
+    await test('blacklisted event creator blocks even if external metadata is unavailable', async () => {
+      wallet.filters.devBlacklist = [candidate.creator];
+      const out = await verdict();
+      assert.equal(out.ok, false);
+      assert.equal(out.hard, true);
+      assert.ok(out.reasons.includes('dev_blacklisted'), out.reasons.join(','));
+      wallet.filters.devBlacklist = [];
+    });
     await test('high current creator balance hard-blocks even when opening buy is low', async () => {
       creatorBalance = 250_000_000_000_000n;
       const out = await verdict();

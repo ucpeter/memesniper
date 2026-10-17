@@ -989,6 +989,75 @@ async function click(window, el) {
     assert.strictEqual(window.eval('S.wallets.length'), 2);
   });
 
+  await test('editor selects saved No limit and does not offer inert safety switches', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1 });
+    window.eval(`openWallet(S.wallets[0].id);
+      S.editing.cfg.exits.maxHoldMs = 0;
+      renderEditorPanes(document.querySelector('#modalRoot'));`);
+    assert.equal($('#f_maxhold').value, '0');
+    window.eval(`S.editing.cfg.exits.maxHoldMs = 5000;
+      renderEditorPanes(document.querySelector('#modalRoot'));`);
+    assert.equal($('#f_maxhold').value, '5000',
+      'a previously normalised 5-second setting cannot silently become 5 minutes');
+    assert.match($('#f_maxhold').selectedOptions[0].textContent, /Saved custom/);
+    assert.equal($('#f_compound'), null);
+    assert.equal($('#f_buytax'), null);
+    assert.equal($('#f_copycat'), null);
+    const text = $('#modalRoot').textContent;
+    assert.match(text, /tax checks — unavailable/);
+    assert.match(text, /Auto-compound — unavailable/);
+    assert.match(text, /Known-ticker blocking — unavailable/);
+  });
+
+  await test('a 148% tier plan is identified as capped requests, not 148% sold', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1 });
+    window.eval(`openWallet(S.wallets[0].id);
+      S.editing.cfg.exits.takeProfitTiers = [
+        { gainPct: 20, sellPct: 15 }, { gainPct: 50, sellPct: 33 },
+        { gainPct: 100, sellPct: 100 }
+      ]; renderTiers(document.querySelector('#modalRoot'));`);
+    const list = $('#tierList');
+    assert.match(list.textContent, /Planned tier requests: 148% of original/);
+    assert.match(list.textContent, /does not sell 148%/);
+    assert.match(list.textContent, /final 100% tier closes only the remainder/);
+    assert.doesNotMatch(list.textContent, /Total sold across tiers/);
+    assert.ok(list.querySelector('.warn'), 'over-100 request must not show as a green success');
+  });
+
+  await test('wallet Trades distinguishes marked P&L, price gain, real tier fills and a stale mark', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1 });
+    window.eval(`(function(){ const w = S.wallets[0];
+      S.positions = [{ id:'test_open', walletId:w.id, status:'OPEN', mint:'TEST_MINT',
+        symbol:'GRAB', simulated:true, solSpent:'715000000', pnlSol:0.18, pnlPct:25.2,
+        priceGainPct:18, peakGainPct:60, stopLevelPct:40, remainingFraction:0.85,
+        tiers:[{gainPct:20,sellPct:15,filled:true},{gainPct:50,sellPct:33,filled:false}],
+        exits:[{tier:0,pctSold:15,reason:'tp_20pct'}],lastUpdated:Date.now()-15000 }];
+      w.recentPositions = [{ id:'test_closed', walletId:w.id, status:'CLOSED',
+        mint:'OLD_MINT',symbol:'OLD',simulated:true,solSpent:'1000000000',
+        realisedSol:'900000000',pnlSol:-0.1,exitReason:'trailing_stop',
+        priceGainPct:-12,peakGainPct:60,openedAt:1,closedAt:2000,
+        tiers:[{gainPct:20}], exits:[{tier:0,pctSold:15,reason:'tp_20pct'},
+          {tier:null,pctSold:85,reason:'trailing_stop'}] }];
+      openWalletDetail(w.id);
+    })()`);
+    const openText = $('[data-wallet-open-rows]').textContent;
+    assert.match(openText, /Marked total/);
+    assert.match(openText, /P&L \/ spot gain/);
+    assert.match(openText, /\+20%: 15\.0% sold/);
+    assert.match(openText, /85\.0% held/);
+    assert.match(openText, /\+25\.2%/);
+    assert.match(openText, /spot \+18\.0%/);
+    assert.match(openText, /trigger \+40\.0%/);
+    assert.match(openText, /stale; price exits need a fresh read/);
+    const closedText = $('[data-wallet-closed-rows]').textContent;
+    assert.match(closedText, /trailing_stop/);
+    assert.match(closedText, /\+20%: 15\.0% sold/);
+    assert.match(closedText, /peak \+60\.0%/);
+    assert.match(closedText, /final spot -12\.0%/);
+    assert.match(window.document.querySelector('.modal-body').textContent,
+      /A stop is a trigger, not a guaranteed execution price/);
+  });
+
   await test('Trades shows 20 whole launch rows before inner scrolling; collapse exposes full trade sections', async () => {
     const { window, $ } = await bootDashboard({ wallets: 2 });
     window.eval(`S.scanFeed = Array.from({length: 55}, (_, i) => ({

@@ -318,6 +318,51 @@ test('partial sell sizes against the ORIGINAL position, not the remainder', () =
   assert.strictEqual(d[0].reason, 'tp_50pct_all', 'draining the position should be labelled _all');
 });
 
+test('step-quantised trailing stop is labelled trailing, not break-even', () => {
+  const t = makeTrader({ exits: {
+    stopLossPct: 25,
+    trailing: { enabled: true, activationPct: 40, trailPct: 18, stepPct: 5 },
+    breakEven: { enabled: true, activationPct: 30, offsetPct: 2 },
+  } });
+  const p = makePosition({ entrySol: 1, priceSol: 1.35 });
+  p.highWaterPrice = p.entryPrice * 16n / 10n; // +60% peak: floor +42% -> stepped +40%
+  assert.strictEqual(risk.effectiveStopPct(p, t.cfg), 40);
+  const exits = risk.evaluate(p, t.cfg);
+  assert.strictEqual(exits.length, 1);
+  assert.strictEqual(exits[0].reason, 'trailing_stop', 'stepping cannot change the reason');
+  assert.strictEqual(exits[0].stopLevel, 40);
+  assert.strictEqual(exits[0].observedGainPct, 35);
+});
+
+test('step quantisation delays tightening but the trailing floor never moves down', () => {
+  const t = makeTrader({ exits: {
+    trailing: { enabled: true, activationPct: 40, trailPct: 18, stepPct: 5 },
+    breakEven: { enabled: true, activationPct: 30, offsetPct: 2 },
+  } });
+  const p = makePosition({ entrySol: 1, priceSol: 1.60 });
+  assert.strictEqual(risk.effectiveStopPct(p, t.cfg), 40); // 60 - 18 = 42 -> 40
+  p.mark(p.entryPrice * 162n / 100n);
+  assert.strictEqual(risk.effectiveStopPct(p, t.cfg), 40); // 44 -> 40
+  p.mark(p.entryPrice * 166n / 100n);
+  assert.strictEqual(risk.effectiveStopPct(p, t.cfg), 45); // 48 -> 45
+  p.mark(p.entryPrice * 150n / 100n);
+  assert.strictEqual(risk.effectiveStopPct(p, t.cfg), 45, 'retracement cannot loosen it');
+});
+
+test('a price gap can trigger trailing at a loss despite a positive stop floor', () => {
+  const t = makeTrader({ exits: {
+    stopLossPct: 25,
+    trailing: { enabled: true, activationPct: 40, trailPct: 18, stepPct: 5 },
+    breakEven: { enabled: true, activationPct: 30, offsetPct: 2 },
+  } });
+  const p = makePosition({ entrySol: 1, priceSol: 0.9 });
+  p.highWaterPrice = p.entryPrice * 16n / 10n;
+  const d = risk.evaluate(p, t.cfg);
+  assert.strictEqual(d[0].reason, 'trailing_stop');
+  assert.ok(d[0].stopLevel > 0 && d[0].observedGainPct < 0,
+    'a stop is a trigger, not a guaranteed exit price');
+});
+
 console.log('\n── time & liquidity stops ────────────────────────────────');
 
 test('time stop fires after maxHoldMs', () => {
@@ -327,6 +372,15 @@ test('time stop fires after maxHoldMs', () => {
   pos.openedAt = Date.now() - 7000;
   const d = risk.evaluate(pos, t.cfg);
   assert.ok(d.some((x) => x.reason === 'time_stop'), show(d));
+});
+
+test('saved No limit stays zero and cannot become an instant time-stop exit', () => {
+  const t = makeTrader({ exits: { maxHoldMs: 0 } });
+  assert.equal(t.cfg.exits.maxHoldMs, 0);
+  const pos = makePosition({ entrySol: 1, priceSol: 1 });
+  pos.openedAt = Date.now() - 2 * 24 * 3600 * 1000;
+  assert.ok(!risk.evaluate(pos, t.cfg).some((x) => x.reason === 'time_stop'));
+  assert.ok(!risk.evaluate(pos, t.cfg, { priceStale: true }).some((x) => x.reason === 'time_stop'));
 });
 
 test('liquidity exit fires when the curve drains', () => {

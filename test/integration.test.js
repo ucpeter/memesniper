@@ -199,6 +199,27 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
     assert.strictEqual(trader.openPositions().length, 0, 'never pretend an unconfirmed order is a fill');
   });
 
+  await test('saved wallet exposure ceiling accounts for the proposed buy amount', async () => {
+    const { trader, executor } = makeTrader('balanced', {
+      buy: { minAmountSol: 0.5, maxAmountSol: 0.5 },
+      limits: { maxExposureSol: 0.4 },
+    });
+    const result = await trader.consider(CANDIDATE, { engine: ENGINE });
+    assert.strictEqual(result, 'skip:max_exposure_reached');
+    assert.strictEqual(executor.fills.length, 0);
+  });
+
+  await test('global exposure ceiling accounts for the proposed buy amount', async () => {
+    const { trader, executor } = makeTrader('balanced', {
+      buy: { minAmountSol: 0.5, maxAmountSol: 0.5 },
+    });
+    const old = trader.getConfig;
+    trader.getConfig = () => ({ ...old(), riskGlobal: { ...old().riskGlobal, maxTotalExposureSol: 0.4 } });
+    const result = await trader.consider(CANDIDATE, { engine: ENGINE });
+    assert.strictEqual(result, 'skip:global_max_exposure');
+    assert.strictEqual(executor.fills.length, 0);
+  });
+
   await test('same mint cannot be bought twice by the same wallet', async () => {
     const { trader } = makeTrader('balanced', NO_COOLDOWN);
     await trader.consider(CANDIDATE, { engine: ENGINE });
@@ -225,6 +246,81 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
     assert.strictEqual(p.realisedSol > 0n, true, 'should have banked SOL');
   });
 
+  await test('stale cache price cannot trigger a take-profit; fresh mark can', async () => {
+    const { trader, executor, priceCache } = makeTrader('balanced', { exits: {
+      takeProfitTiers: [{ gainPct: 20, sellPct: 15 }],
+    } });
+    await trader.consider(CANDIDATE, { engine: ENGINE });
+    const p = trader.openPositions()[0];
+    const oldUpdated = p.lastUpdated;
+    const vTok = curve.INITIAL_VIRTUAL_TOKEN_RESERVES;
+    const target = p.entryPrice * 13n / 10n;
+    const vSol = (target * vTok) / 1_000_000n;
+    priceCache.set(p.mint, { price: curve.spotPriceScaled(vSol, vTok),
+      virtualSolReserves: vSol, virtualTokenReserves: vTok,
+      liquidityDropPct: 0, ts: Date.now() - 60000 });
+    await trader.manage({ engine: ENGINE });
+    assert.strictEqual(executor.fills.length, 1, 'no sell at a stale +30% mark');
+    assert.strictEqual(p.tiers[0].filled, false);
+    assert.strictEqual(p.lastUpdated, oldUpdated, 'stale mark cannot appear fresh in the UI');
+    await tick(trader, priceCache, 30);
+    assert.strictEqual(executor.fills.length, 2, 'fresh +30% mark triggers 15% sell');
+    assert.strictEqual(p.tiers[0].filled, true);
+    assert.ok(p.lastUpdated >= oldUpdated);
+    assert.ok(p.toJSON().lastUpdated > 0);
+  });
+
+  await test('a missing account in a price batch invalidates even a one-second-old cache entry', async () => {
+    const Engine = require('../src/engine/engine');
+    const { Keypair } = require('@solana/web3.js');
+    const { trader, executor, priceCache } = makeTrader('balanced', { exits: {
+      takeProfitTiers: [{ gainPct: 20, sellPct: 15 }],
+    } });
+    const mint = Keypair.generate().publicKey.toBase58();
+    await trader.consider({ ...CANDIDATE, mint }, { engine: ENGINE });
+    const p = trader.openPositions()[0];
+    const vTok = curve.INITIAL_VIRTUAL_TOKEN_RESERVES;
+    const vSol = p.entryPrice * 13n / 10n * vTok / 1_000_000n;
+    priceCache.set(mint, { price: curve.spotPriceScaled(vSol, vTok),
+      virtualSolReserves: vSol, virtualTokenReserves: vTok, ts: Date.now() });
+    const engine = Object.create(Engine.prototype);
+    engine.running = true;
+    engine.traders = new Map([['self', trader]]);
+    engine.priceCache = priceCache;
+    engine.priceHealth = { consecutiveFailures: 0, ok: true, lastOkAt: 0 };
+    engine.executor = { conn: () => ({ getMultipleAccountsInfo: async () => [null] }) };
+    let poll;
+    const interval = global.setInterval;
+    try {
+      global.setInterval = (fn) => { poll = fn; return { unref() {} }; };
+      engine._startPricePoller();
+    } finally { global.setInterval = interval; }
+    await poll();
+    assert.equal(priceCache.get(mint).ts, 0, 'this batch did not verify the mark');
+    assert.equal(executor.fills.length, 1, 'the old +30% mark cannot sell the tier');
+    assert.equal(p.tiers[0].filled, false);
+    assert.ok(engine.priceHealth.ok, 'an absent account is per-mint, not a transport failure');
+  });
+
+  await test('due time stop defers rather than faking a zero-SOL dry-run fill while mark is stale', async () => {
+    const { trader, executor, priceCache } = makeTrader('balanced', {
+      exits: { maxHoldMs: 5000, takeProfitTiers: [{ gainPct: 100, sellPct: 100 }] },
+    });
+    await trader.consider(CANDIDATE, { engine: ENGINE });
+    const p = trader.openPositions()[0];
+    p.openedAt = Date.now() - 6000;
+    priceCache.set(p.mint, { price: p.entryPrice,
+      virtualSolReserves: curve.INITIAL_VIRTUAL_SOL_RESERVES,
+      virtualTokenReserves: curve.INITIAL_VIRTUAL_TOKEN_RESERVES,
+      ts: Date.now() - 60000 });
+    await trader.manage({ engine: ENGINE });
+    assert.strictEqual(executor.fills.length, 1);
+    assert.strictEqual(p.status, 'OPEN');
+    await tick(trader, priceCache, 0);
+    assert.strictEqual(executor.fills.length, 2, 'fresh reserve read permits time exit');
+    assert.strictEqual(p.exitReason, 'time_stop');
+  });
+
   await test('tier does not re-fire on a later tick below the next threshold', async () => {
     const { trader, executor, priceCache } = makeTrader('balanced');
     await trader.consider(CANDIDATE, { engine: ENGINE });
@@ -247,6 +343,109 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
     assert.strictEqual(trader.openPositions().length, 0);
     // Realised proceeds should exceed what was spent — this was a winner.
     assert.ok(p.realisedSol > p.solSpent, `realised ${p.realisedSol} should exceed spent ${p.solSpent}`);
+  });
+
+  await test('saved 20/15, 50/33, 100/100 plan sells 15%, 33%, then just the 52% remainder', async () => {
+    const { trader, executor, priceCache } = makeTrader('balanced', { exits: {
+      takeProfitTiers: [{ gainPct: 20, sellPct: 15 }, { gainPct: 50, sellPct: 33 }, { gainPct: 100, sellPct: 100 }],
+      trailing: { enabled: true, activationPct: 40, trailPct: 18, stepPct: 5 },
+      breakEven: { enabled: true, activationPct: 30, offsetPct: 2 },
+    } });
+    await trader.consider(CANDIDATE, { engine: ENGINE });
+    const p = trader.openPositions()[0];
+    assert.deepStrictEqual(p.tiers.map((x) => x.gainPct), [20, 50, 100]);
+    await tick(trader, priceCache, 25);
+    assert.strictEqual(executor.fills.length, 2, 'buy + 15% partial at first observed gain');
+    assert.strictEqual(p.tiers[0].filled, true);
+    assert.strictEqual(p.tiers[1].filled, false);
+    assert.ok(p.remainingFraction > .84 && p.remainingFraction < .86);
+    await tick(trader, priceCache, 60);
+    assert.strictEqual(executor.fills.length, 3);
+    assert.strictEqual(p.tiers[1].filled, true);
+    assert.ok(p.remainingFraction > .51 && p.remainingFraction < .53);
+    await tick(trader, priceCache, 110);
+    assert.strictEqual(p.status, 'CLOSED');
+    assert.strictEqual(executor.fills.length, 4);
+    assert.strictEqual(p.tokensHeld, 0n, 'never sells 148% of available tokens');
+    assert.strictEqual(p.exits.length, 3);
+    assert.ok(p.exits[0].pctSold > 14.9 && p.exits[0].pctSold < 15.1);
+    assert.ok(p.exits[1].pctSold > 32.9 && p.exits[1].pctSold < 33.1);
+    assert.ok(p.exits[2].pctSold > 51.9 && p.exits[2].pctSold < 52.1);
+  });
+
+  await test('position events carry already-updated tier state after a partial and final fill', async () => {
+    const bus = require('../src/util/events');
+    const { trader, priceCache } = makeTrader('balanced', { exits: {
+      takeProfitTiers: [{ gainPct: 20, sellPct: 15 }, { gainPct: 50, sellPct: 100 }],
+    } });
+    await trader.consider(CANDIDATE, { engine: ENGINE });
+    const p = trader.openPositions()[0];
+    const snapshots = [];
+    const onUpdate = (position) => { if (position.id === p.id) snapshots.push(structuredClone(position.toJSON())); };
+    bus.on('position:updated', onUpdate);
+    try {
+      await tick(trader, priceCache, 25);
+      await tick(trader, priceCache, 60);
+    } finally { bus.off('position:updated', onUpdate); }
+    assert.strictEqual(snapshots.length, 2);
+    assert.deepStrictEqual(snapshots[0].tiers.map((t) => t.filled), [true, false]);
+    assert.deepStrictEqual(snapshots[1].tiers.map((t) => t.filled), [true, true]);
+    assert.strictEqual(snapshots[1].status, 'CLOSED');
+  });
+
+  await test('editing saved tiers after a buy cannot silently rewrite that position’s original plan', async () => {
+    const { trader, executor, priceCache } = makeTrader('balanced', { exits: {
+      takeProfitTiers: [{ gainPct: 20, sellPct: 15 }, { gainPct: 50, sellPct: 33 }],
+    } });
+    await trader.consider(CANDIDATE, { engine: ENGINE });
+    const p = trader.openPositions()[0];
+    trader.cfg.exits.takeProfitTiers = [{ gainPct: 5, sellPct: 100 }];
+    await tick(trader, priceCache, 10);
+    assert.strictEqual(executor.fills.length, 1, 'new +5% tier does not close old position');
+    await tick(trader, priceCache, 25);
+    assert.strictEqual(executor.fills.length, 2);
+    assert.strictEqual(p.exits[0].pctSold > 14.9 && p.exits[0].pctSold < 15.1, true);
+    assert.strictEqual(p.tiers[0].gainPct, 20);
+    assert.strictEqual(p.tiers[1].gainPct, 50);
+    const restored = Position.fromSnapshot(p.snapshot());
+    assert.deepStrictEqual(restored.tiers.map((t) => t.gainPct), [20, 50]);
+  });
+
+  await test('failed partial sell is NOT marked filled and retries at next fresh price tick', async () => {
+    const { trader, executor, priceCache } = makeTrader('balanced', { exits: {
+      takeProfitTiers: [{ gainPct: 20, sellPct: 15 }],
+    } });
+    await trader.consider(CANDIDATE, { engine: ENGINE });
+    const p = trader.openPositions()[0];
+    const first = executor.signAndSend;
+    let failed = false;
+    executor.signAndSend = async (args) => {
+      if (!failed && args.label.startsWith('SELL')) { failed = true; return { ok: false, error: 'test_failure' }; }
+      return first(args);
+    };
+    await tick(trader, priceCache, 25);
+    assert.strictEqual(failed, true);
+    assert.strictEqual(p.tiers[0].filled, false);
+    assert.strictEqual(p.exits.length, 0);
+    assert.strictEqual(p.remainingFraction, 1);
+    await tick(trader, priceCache, 27);
+    assert.strictEqual(p.tiers[0].filled, true);
+    assert.strictEqual(p.exits.length, 1);
+    assert.ok(p.remainingFraction > .84 && p.remainingFraction < .86);
+  });
+
+  await test('a gap directly past +100% closes the remainder at the highest tier first', async () => {
+    const { trader, executor, priceCache } = makeTrader('balanced', { exits: {
+      takeProfitTiers: [{ gainPct: 20, sellPct: 15 }, { gainPct: 50, sellPct: 33 }, { gainPct: 100, sellPct: 100 }],
+    } });
+    await trader.consider(CANDIDATE, { engine: ENGINE });
+    const p = trader.openPositions()[0];
+    await tick(trader, priceCache, 110);
+    assert.strictEqual(p.status, 'CLOSED');
+    assert.strictEqual(executor.fills.length, 2);
+    assert.strictEqual(p.exits.length, 1);
+    assert.strictEqual(p.exits[0].tier, 2, 'higher tier wins on a skipped price interval');
+    assert.strictEqual(p.tiers[0].superseded, true);
   });
 
   console.log('\n── trailing stop ─────────────────────────────────────────');
