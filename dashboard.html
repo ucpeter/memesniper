@@ -1649,7 +1649,7 @@ async function api(path, opts = {}) {
     if (res.status === 401) {
       throw new Error('The bot restarted, so this page\'s session expired. Reload the page to continue.');
     }
-    throw new Error(detail.error === 'consecutive_loss_cooldown' || detail.error === 'invalid_loss_cooldown'
+    throw new Error(detail.error === 'consecutive_loss_cooldown' || detail.error === 'invalid_loss_cooldown' || detail.error === 'mode_change_blocked' || detail.error === 'use_mode_switch' || detail.error === 'position_mode_mismatch' || detail.error === 'price_unavailable'
       ? (detail.hint || 'This wallet is cooling down; press Start after its wait.')
       : (detail.error || detail.hint || `HTTP ${res.status}`));
   }
@@ -5032,7 +5032,6 @@ function openSettings() {
       }
       const body = {
         lossStreakCooldownMinutes: minutes,
-        dryRun: S.config?.dryRun,
         rpc: { endpoints: q('#g_rpc').value.split('\n').map((s) => s.trim()).filter(Boolean), wsEndpoint: q('#g_rpcws').value.trim() },
         jito: { enabled: q('#g_jito').checked, tipLamports: Number(q('#g_tip').value) },
         execution: { priorityFeeMicroLamports: Number(q('#g_cu').value) },
