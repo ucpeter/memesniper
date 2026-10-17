@@ -946,6 +946,9 @@ html, body { max-width: 100%; overflow-x: hidden; }
 /* 📄 Trades only: JS measures its first 20 painted rows and sets the inner
    viewport to that height; the rest scroll inside. Collapse exposes positions
    quickly on narrow phones. Do not cap this at 36vh (only ~5 visible rows). */
+/* Price age must be conspicuous even inside a green positive-P&L table cell.
+   There is no generic .warn text rule; the old label inherited green. */
+.mark-stale { color: var(--amber); font-weight: 700; line-height: 1.35; }
 .wallet-detail-head { gap: 8px; flex-wrap: wrap; }
 .wallet-detail-head [data-header-toggle] { margin-left: auto; }
 .trades-launches-section { position: relative; }
@@ -4002,10 +4005,10 @@ function winRateOf(st) {
  * actual position.exits ledger when describing what was sold. */
 function tierFillSummary(p) {
   const fills = (p.exits || []).filter((x) => x.tier !== null && x.tier !== undefined);
-  if (!fills.length) return 'No take-profit sell recorded';
+  if (!fills.length) return 'TP fills: none yet';
   return fills.map((x) => {
     const gain = p.tiers?.[x.tier]?.gainPct;
-    return `+${gain ?? '?'}%: ${Number(x.pctSold || 0).toFixed(1)}% sold`;
+    return `TP +${gain ?? '?'}%: ${Number(x.pctSold || 0).toFixed(1)}% of original sold`;
   }).join(' · ');
 }
 
@@ -4013,32 +4016,41 @@ function tierFillSummary(p) {
  * Replacing only changed sections leaves the modal body/scrollbar untouched. */
 function walletDetailRows(w, open, closed) {
   const openRows = open.length
-    ? `<table><thead><tr><th>Token / confirmed tier sells</th><th class="num">Spent</th><th class="num">Marked total</th><th class="num">P&amp;L / spot gain</th><th></th></tr></thead>
+    ? `<table><thead><tr><th>Token / TP fills / price age</th><th class="num">Spent</th><th class="num">Marked total</th><th class="num">Marked P&amp;L / spot gain</th><th></th></tr></thead>
         <tbody>${open.map((p) => {
           const val = (Number(p.solSpent) / 1e9) + (p.pnlSol || 0);
           const heldPct = Number.isFinite(Number(p.remainingFraction))
             ? `${(Number(p.remainingFraction) * 100).toFixed(1)}%` : '—';
+          const markAge = Number(p.lastUpdated) > 0 ? Date.now() - Number(p.lastUpdated) : Infinity;
+          const markLimit = Number(p.markFreshnessMs) > 0 ? Number(p.markFreshnessMs) : 5000;
+          const oldMark = !Number.isFinite(markAge) || markAge < 0 || markAge > markLimit;
+          const ageLabel = Number.isFinite(markAge) && markAge >= 0
+            ? (markAge < 1000 ? '0s' : fmtAge(markAge)) : 'unknown';
           return `<tr>
             <td class="sym">${esc(p.symbol)}${p.simulated ? '<span class="badge sim">SIM</span>' : ''}<div class="mute" style="font-size:10px;font-weight:400">${esc(short(p.mint, 5))}</div>
-              <div class="mute" style="font-size:10px">${esc(tierFillSummary(p))} · ${esc(heldPct)} held</div></td>
+              <div class="mute" style="font-size:10px">${esc(tierFillSummary(p))}</div>
+              <div class="mute" style="font-size:10px">Held: ${esc(heldPct)} of original tokens</div>
+              <div class="${oldMark ? 'mark-stale' : 'mute'}" data-mark-state="${oldMark ? 'stale' : 'fresh'}" style="font-size:11px">${oldMark
+                ? `⚠ PRICE OLD (${esc(ageLabel)}): automatic price exits await a fresh read`
+                : `Price updated ${esc(ageLabel)} ago`}</div></td>
             <td class="num">${esc((Number(p.solSpent) / 1e9).toFixed(3))}</td>
             <td class="num">${esc(val.toFixed(3))}</td>
             <td class="num ${cls(p.pnlPct ?? 0)}"><b>${fmtPct(p.pnlPct ?? 0)}</b><div class="mute" style="font-size:10px">${fmtSol(p.pnlSol, 4)}</div>
-              <div class="mute" style="font-size:10px">spot ${fmtPct(p.priceGainPct ?? 0)} · peak ${fmtPct(p.peakGainPct ?? 0)} · trigger ${p.stopLevelPct == null ? '—' : fmtPct(p.stopLevelPct)}</div>
-              <div class="${p.lastUpdated && Date.now() - p.lastUpdated > 5000 ? 'warn' : 'mute'}" style="font-size:10px">mark ${p.lastUpdated ? `${fmtAge(Date.now() - p.lastUpdated)} ago${Date.now() - p.lastUpdated > 5000 ? ' · stale; price exits need a fresh read' : ''}` : 'time unread'}</div></td>
+              <div class="mute" style="font-size:10px">spot ${fmtPct(p.priceGainPct ?? 0)} · peak ${fmtPct(p.peakGainPct ?? 0)} · stop trigger ${p.stopLevelPct == null ? '—' : fmtPct(p.stopLevelPct)}</div>
+              ${oldMark ? '<div class="mark-stale" style="font-size:10px">OLD MARK · not live</div>' : ''}</td>
             <td><button class="btn btn-sm btn-danger" data-exit="${esc(p.id)}">⛔ Kill</button></td>
           </tr>`;
         }).join('')}</tbody></table>`
     : `<div class="empty" style="padding:22px"><div class="empty-sub">${esc(w.name)} holds nothing right now.</div></div>`;
 
   const closedRows = closed.length
-    ? `<table><thead><tr><th>Token</th><th class="num">Spent</th><th class="num">Returned</th><th class="num">P&amp;L</th><th>Exit</th><th class="num">Held</th></tr></thead>
+    ? `<table><thead><tr><th>Token</th><th class="num">Spent</th><th class="num">Returned</th><th class="num">P&amp;L</th><th>Exit</th><th class="num">Time held</th></tr></thead>
         <tbody>${closed.map((p) => {
           const spent = Number(p.solSpent) / 1e9;
           const returned = Number(p.realisedSol || 0) / 1e9;
           const pnl = returned - spent;
           return `<tr>
-            <td class="sym">${esc(p.symbol || short(p.mint, 4))}${p.simulated ? '<span class="badge sim">SIM</span>' : ''}</td>
+            <td class="sym">${esc(p.symbol || short(p.mint, 4))}${p.simulated ? '<span class="badge sim">SIM</span>' : ''}<div class="mute" style="font-size:10px;font-weight:400">${esc(short(p.mint, 5))}</div></td>
             <td class="num">${esc(spent.toFixed(3))}</td>
             <td class="num">${esc(returned.toFixed(3))}</td>
             <td class="num ${cls(pnl)}"><b>${fmtSol(pnl, 4)}</b></td>
@@ -4131,10 +4143,11 @@ function openWalletDetail(walletId) {
         </section>
 
         <div class="section-label">Open positions (<span data-wallet-open-count>${open.length}</span>)</div>
-        <div class="hint">P&amp;L includes earlier partial proceeds and the remaining tokens marked at the last spot price; it is not a sell quote. Tiers and stops use <b>spot gain vs entry</b>, not this P&amp;L. Only a recorded tier sell confirms a partial fill. A stop is a trigger, not a guaranteed execution price.</div>
+        <div class="hint">Under a token, <b>TP +20%: 15% sold</b> means the price-gain target was +20% and 15% of the original tokens were sold; <b>Held</b> is the unsold share. <b>Marked P&amp;L</b> includes earlier partial proceeds plus unsold tokens valued at their last spot price; it is not cash you can withdraw. <b>Spot</b> is the last price gain against entry using integer-rounded token prices (cheap tokens can show +0% while marked P&amp;L differs), <b>peak</b> the highest price observed, and <b>stop trigger</b> the last computed exit threshold from observed prices—not a promised fill price. <b>Price updated</b> is time since the last successful curve-price read, not the age of the token. An <b>OLD PRICE</b> means the shown mark/P&amp;L may be out of date; automatic price exits wait for a fresh read.</div>
         <div class="tbl-wrap" data-wallet-open-rows>${openRows}</div>
 
         <div class="section-label">Trade history (<span data-wallet-closed-count>${closed.length}</span>)</div>
+        <div class="hint">Spent and Returned are SOL; P&amp;L is returned minus spent. The Exit badge names the <b>last</b> sell rule; any TP fills listed below it happened earlier. Final spot may be below a break-even/trailing trigger after a price gap. <b>Time held</b> is the duration from buy to final sale, not the share of tokens remaining. SIM figures are paper estimates, not real proceeds.</div>
         <div class="tbl-wrap" data-wallet-closed-rows>${closedRows}</div>
 
         <div class="notice info" style="margin-top:14px"><span class="ico">ℹ</span><div>
