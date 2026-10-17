@@ -140,7 +140,14 @@ const CANDIDATE = {
 async function tickAt(trader, priceCache, mint, entryPrice, gainPct, extra = {}) {
   const vTok = curve.INITIAL_VIRTUAL_TOKEN_RESERVES;
   const targetPrice = (BigInt(entryPrice) * BigInt(Math.round((100 + gainPct) * 1000))) / 100000n;
-  const vSol = (targetPrice * vTok) / 1_000_000n;
+  // Select observed raw reserves that yield this target in the paper
+  // counterfactual world, not a raw on-chain price that is subsequently moved
+  // by the simulated buy/sells. LIVE test positions have no paper offset.
+  const p = [...trader.positions.values()].find((x) => x.mint === mint && x.isOpen);
+  const solDelta = p?.paperCurve ? BigInt(p.paperCurve.solDelta) : 0n;
+  const tokDelta = p?.paperCurve ? BigInt(p.paperCurve.tokenDelta) : 0n;
+  const vSol = (targetPrice * (vTok + tokDelta) + 999_999n) / 1_000_000n - solDelta;
+  assert.ok(vSol > 0n && vTok + tokDelta > 0n);
 
   priceCache.set(mint, {
     price: curve.spotPriceScaled(vSol, vTok),
@@ -188,6 +195,141 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
       assert.strictEqual(result, 'skip:eval_timeout');
       assert.strictEqual(executor.fills.length, 0, 'no order may be sent after expiry');
     } finally { safety.evaluate = prev; }
+  });
+
+  await test('flat market paper round trip includes hypothetical buy impact, not a phantom-token loss', async () => {
+    const { trader, executor, priceCache } = makeTrader('balanced', {
+      buy: { minAmountSol: 0.8, maxAmountSol: 0.8 },
+      exits: { takeProfitTiers: [{ gainPct: 100, sellPct: 100 }],
+        trailing: { enabled: false }, breakEven: { enabled: false }, maxHoldMs: 0 },
+    });
+    await trader.consider(CANDIDATE, { engine: ENGINE });
+    const p = trader.openPositions()[0];
+    assert.equal(p.paperCurve?.version, 1);
+    assert.equal(p.toJSON().paperCurveModel, 'counterfactual-v1');
+    assert.equal(BigInt(p.paperCurve.solDelta), p.solSpent * 9900n / 10000n);
+    assert.equal(BigInt(p.paperCurve.tokenDelta), -p.originalTokens);
+    const vSol = curve.INITIAL_VIRTUAL_SOL_RESERVES;
+    const vTok = curve.INITIAL_VIRTUAL_TOKEN_RESERVES;
+    priceCache.set(p.mint, { price: curve.spotPriceScaled(vSol, vTok),
+      virtualSolReserves: vSol, virtualTokenReserves: vTok, liquidityDropPct: 0,
+      ts: Date.now() });
+    await trader.manage({ engine: ENGINE });
+    assert.equal(executor.fills.length, 1, 'flat observation is not a phantom stop');
+    assert.equal(p.lastPrice, curve.spotPriceScaled(vSol + BigInt(p.paperCurve.solDelta),
+      vTok + BigInt(p.paperCurve.tokenDelta)));
+    const expected = curve.solOutForTokensIn(p.tokensHeld,
+      vSol + p.solSpent * 9900n / 10000n, vTok - p.originalTokens);
+    const misleadingOld = curve.solOutForTokensIn(p.tokensHeld, vSol, vTok);
+    assert.ok(expected > misleadingOld, 'old estimate sells imaginary tokens against the unbought curve');
+    const saved = Position.fromSnapshot(JSON.parse(JSON.stringify(p.snapshot())));
+    assert.deepStrictEqual(saved.paperCurve, p.paperCurve, 'offset survives position JSON');
+    assert.equal(saved.toJSON().paperCurveModel, 'counterfactual-v1');
+    const res = await trader.killPosition(p.id, 'flat_quote_test');
+    assert.equal(res.ok, true);
+    assert.equal(p.realisedSol, expected);
+    assert.ok(Math.abs(Number(expected) / 1e9 - 0.78408) < .0003,
+      '0.8 SOL buy/sell at an otherwise unchanged 30-SOL curve has roughly 2% fees, not 7% phantom loss');
+  });
+
+  await test('paper partial sells ratchet hypothetical reserves after each SUCCESSFUL fill', async () => {
+    const { trader, priceCache } = makeTrader('balanced', { exits: {
+      takeProfitTiers: [{ gainPct: 20, sellPct: 15 }, { gainPct: 50, sellPct: 33 }],
+      trailing: { enabled: false }, breakEven: { enabled: false }, maxHoldMs: 0,
+    } });
+    await trader.consider(CANDIDATE, { engine: ENGINE });
+    const p = trader.openPositions()[0];
+    const before = { ...p.paperCurve };
+    await tick(trader, priceCache, 25);
+    assert.equal(p.exits.length, 1);
+    const firstTokens = p.realisedTokens;
+    const firstObserved = priceCache.get(p.mint);
+    const firstGross = curve.solOutForTokensIn(firstTokens,
+      firstObserved.virtualSolReserves + BigInt(before.solDelta),
+      firstObserved.virtualTokenReserves + BigInt(before.tokenDelta), 0);
+    assert.equal(BigInt(p.paperCurve.solDelta), BigInt(before.solDelta) - firstGross);
+    assert.equal(BigInt(p.paperCurve.tokenDelta), BigInt(before.tokenDelta) + firstTokens);
+    const afterFirst = { ...p.paperCurve };
+    await tick(trader, priceCache, 60);
+    assert.equal(p.exits.length, 2);
+    assert.equal(BigInt(p.paperCurve.tokenDelta) - BigInt(afterFirst.tokenDelta),
+      p.realisedTokens - firstTokens);
+    assert.equal(p.status, 'OPEN');
+    assert.deepStrictEqual(Position.fromSnapshot(p.snapshot()).paperCurve, p.paperCurve);
+  });
+
+  await test('dry-run kill without a fresh price refuses a fake zero-SOL sale', async () => {
+    const { trader, executor } = makeTrader('balanced');
+    await trader.consider(CANDIDATE, { engine: ENGINE });
+    const p = trader.openPositions()[0];
+    const res = await trader.killPosition(p.id, 'missing_quote_test');
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'price_unavailable');
+    assert.equal(executor.fills.length, 1);
+    assert.equal(p.status, 'OPEN');
+    assert.equal(p.exits.length, 0);
+  });
+
+  await test('LIVE quotes ignore a hypothetical paper offset entirely', async () => {
+    const { trader, executor } = makeTrader('balanced');
+    executor.dryRun = false;
+    const observed = { virtualSolReserves: 30_000_000_000n,
+      virtualTokenReserves: curve.INITIAL_VIRTUAL_TOKEN_RESERVES, price: 27n };
+    const p = new Position({ walletId: trader.cfg.id, mint: CANDIDATE.mint,
+      entryPrice: 28n, tokensHeld: 1_000_000n, solSpent: 28n });
+    p.paperCurve = { version: 1, solDelta: '990000000', tokenDelta: '-1000000' };
+    assert.equal(trader._quoteReserves(p, observed), observed);
+    const old = Position.fromSnapshot({ ...p.snapshot(), paperCurve: null });
+    executor.dryRun = true;
+    assert.equal(trader._quoteReserves(old, observed), observed,
+      'old paper positions without a saved shadow stay legacy; no invented past buys');
+  });
+
+  await test('paper snapshots re-adopt saved size and reserve offsets, never a chain balance', async () => {
+    const { trader, executor, priceCache } = makeTrader('balanced');
+    await trader.consider(CANDIDATE, { engine: ENGINE });
+    const before = trader.openPositions()[0];
+    const snap = JSON.parse(JSON.stringify(before.snapshot()));
+    trader.positions.clear();
+    trader.byMint.clear();
+    executor.getTokenBalanceRawOrThrow = async () => { throw Error('paper must never query token balance'); };
+    const restored = await trader.adoptPosition(snap);
+    assert.equal(restored.tokensHeld, before.tokensHeld);
+    assert.deepEqual(restored.paperCurve, before.paperCurve);
+    assert.equal(restored.meta.simulated, true);
+    assert.equal(restored.toJSON().paperCurveModel, 'counterfactual-v1');
+    // The current observed curve is still the pre-paper-buy market.
+    const obs = { virtualSolReserves: curve.INITIAL_VIRTUAL_SOL_RESERVES,
+      virtualTokenReserves: curve.INITIAL_VIRTUAL_TOKEN_RESERVES,
+      price: 1n, ts: Date.now() };
+    priceCache.set(restored.mint, obs);
+    assert.equal(trader._quoteReserves(restored, obs).virtualSolReserves,
+      obs.virtualSolReserves + BigInt(snap.paperCurve.solDelta));
+  });
+
+  await test('cross-mode exits fail closed: no real paper sale or simulated LIVE sale', async () => {
+    const { trader, executor, priceCache } = makeTrader('balanced');
+    await trader.consider(CANDIDATE, { engine: ENGINE });
+    const paper = trader.openPositions()[0];
+    const paperSnap = paper.snapshot();
+    priceCache.set(paper.mint, { price: 1n, virtualSolReserves: curve.INITIAL_VIRTUAL_SOL_RESERVES,
+      virtualTokenReserves: curve.INITIAL_VIRTUAL_TOKEN_RESERVES, ts: Date.now() });
+    executor.dryRun = false;
+    assert.equal((await trader.killPosition(paper.id)).error, 'position_mode_mismatch');
+    await trader.manage({ engine: ENGINE });
+    assert.equal(executor.fills.length, 1, 'no sell of the paper bag may reach LIVE');
+    trader.positions.clear(); trader.byMint.clear();
+    await assert.rejects(() => trader.adoptPosition(paperSnap), /position_mode_mismatch/);
+
+    const real = new Position({ walletId: trader.cfg.id, mint: CANDIDATE.mint,
+      entryPrice: 10n, tokensHeld: 1_000_000n, solSpent: 10n, meta: { simulated: false } });
+    trader.positions.set(real.id, real); trader.byMint.set(real.mint, real.id);
+    executor.dryRun = true;
+    assert.equal((await trader.killPosition(real.id)).error, 'position_mode_mismatch');
+    await trader.manage({ engine: ENGINE });
+    assert.equal(executor.fills.length, 1, 'no fake paper close of a real bag');
+    trader.positions.clear(); trader.byMint.clear();
+    await assert.rejects(() => trader.adoptPosition(real.snapshot()), /position_mode_mismatch/);
   });
 
   await test('a submitted but unconfirmed buy is not recorded as a managed position', async () => {
@@ -434,6 +576,7 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
     } });
     await trader.consider(CANDIDATE, { engine: ENGINE });
     const p = trader.openPositions()[0];
+    const beforeFailed = { ...p.paperCurve };
     const first = executor.signAndSend;
     let failed = false;
     executor.signAndSend = async (args) => {
@@ -445,6 +588,8 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
     assert.strictEqual(p.tiers[0].filled, false);
     assert.strictEqual(p.exits.length, 0);
     assert.strictEqual(p.remainingFraction, 1);
+    assert.deepStrictEqual(p.paperCurve, beforeFailed,
+      'an unsuccessful paper sell cannot move the hypothetical curve');
     await tick(trader, priceCache, 27);
     assert.strictEqual(p.tiers[0].filled, true);
     assert.strictEqual(p.exits.length, 1);
@@ -586,11 +731,12 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
     assert.strictEqual(A.trader.openPositions().length, 1);
     assert.strictEqual(B.trader.openPositions().length, 1);
 
-    // +20%: the scalper's first tier has fired, the degen's has not.
-    // Drive both from the same entry price so the comparison is apples-to-apples.
+    // Observe exactly the SAME external curve reserves for both wallets.
+    // Their independent hypothetical buys create different shadow reserves.
     const entry = A.trader.openPositions()[0].entryPrice;
     await tickAt(A.trader, A.priceCache, CANDIDATE.mint, entry, 20);
-    await tickAt(B.trader, B.priceCache, CANDIDATE.mint, entry, 20);
+    B.priceCache.set(CANDIDATE.mint, { ...A.priceCache.get(CANDIDATE.mint), ts: Date.now() });
+    await B.trader.manage({ engine: ENGINE });
 
     const pa = A.trader.openPositions()[0];
     const pb = B.trader.openPositions()[0];
@@ -649,11 +795,17 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
     assert.strictEqual(out, 'skip:wallet_disabled');
   });
 
-  await test('closeAll flattens every open position', async () => {
-    const { trader } = makeTrader('balanced', NO_COOLDOWN);
+  await test('closeAll flattens every paper position when fresh prices exist', async () => {
+    const { trader, priceCache } = makeTrader('balanced', NO_COOLDOWN);
     await trader.consider({ ...CANDIDATE, mint: 'M1'.padEnd(43, 'A') }, { engine: ENGINE });
     await trader.consider({ ...CANDIDATE, mint: 'M2'.padEnd(43, 'B') }, { engine: ENGINE });
     assert.strictEqual(trader.openPositions().length, 2);
+    for (const p of trader.openPositions()) priceCache.set(p.mint, {
+      price: curve.spotPriceScaled(curve.INITIAL_VIRTUAL_SOL_RESERVES, curve.INITIAL_VIRTUAL_TOKEN_RESERVES),
+      virtualSolReserves: curve.INITIAL_VIRTUAL_SOL_RESERVES,
+      virtualTokenReserves: curve.INITIAL_VIRTUAL_TOKEN_RESERVES,
+      ts: Date.now(),
+    });
     await trader.closeAll('test');
     assert.strictEqual(trader.openPositions().length, 0, 'all positions should be closed');
   });
@@ -1126,7 +1278,7 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
         const trader = new Trader({
           cfg: wcfg,
           keystore: { getKeypair: () => ({ publicKey: { toBase58: () => 'HoldWallet' } }) },
-          executor: { dryRun: true, getBalanceSol: async () => 1, getTokenBalanceRawOrThrow: async () => 400000n },
+          executor: { dryRun: false, getBalanceSol: async () => 1, getTokenBalanceRawOrThrow: async () => 400000n },
           getConfig: () => ({ ...cfg.defaultGlobalConfig(), _defaultProvider: null }),
           priceCache: new Map(),
         });
@@ -1167,6 +1319,34 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
     assert.strictEqual(r.statusRecovered, 1, 'status must report the recovery');
     assert.strictEqual(r.fileNow, 1, 'still tracked while open');
     assert.strictEqual(r.clearedAfterClose, true, 'a closed position must not be resurrected on the next restart');
+  });
+
+  await test('PERSIST: unresolved snapshots survive a write even when wallet is loaded', () => {
+    const { execFileSync } = require('node:child_process');
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'snipersol-unresolved-'));
+    const root = path.join(__dirname, '..');
+    const script = `
+      const Engine = require('${root}/src/engine/engine');
+      const cfg = require('${root}/src/config');
+      const fs = require('fs'); const path = require('path');
+      const engine = new Engine({ config: { global: cfg.defaultGlobalConfig(), wallets: [] },
+        keystore: { has: () => false } });
+      engine._resumed = true;
+      const pending = { id: 'pending-paper', mint: 'paper', meta: { simulated: true } };
+      engine._unresolved = { w: [pending] };
+      engine.traders.set('w', { cfg: { id: 'w', resumeAfterRestart: true }, openPositions: () => [] });
+      engine.persistPositions();
+      const file = JSON.parse(fs.readFileSync(path.join(cfg.DATA_DIR, 'positions.json'), 'utf8'));
+      process.stdout.write('###RESULT###' + JSON.stringify(file.wallets.w));
+    `;
+    const output = execFileSync(process.execPath, ['-e', script], {
+      env: { ...process.env, DATA_DIR: dir }, encoding: 'utf8',
+    });
+    assert.deepEqual(JSON.parse(output.slice(output.lastIndexOf('###RESULT###') + 12)),
+      [{ id: 'pending-paper', mint: 'paper', meta: { simulated: true } }]);
   });
 
   /* ──────────────── per-wallet stop / kill semantics ──────────────── */
@@ -1224,7 +1404,7 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
       tokensHeld: 350_000n,
       solSpent: 350_000_000n,
       txSignature: 'SIM',
-      meta: {},
+      meta: { simulated: true },
     });
     p.tiers = trader.cfg.exits.takeProfitTiers.map((t) => ({ ...t, filled: false }));
     trader.positions.set(p.id, p);

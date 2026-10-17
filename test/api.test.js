@@ -291,6 +291,48 @@ const api = async (method, url, body) => {
     assert.strictEqual(r.body.dryRun, true, 'and back to dry run needs no phrase — stopping risk is free');
   });
 
+  await test('mode switch refuses open positions and active buys in both directions', async () => {
+    const trader = engine.traders.get(createdId);
+    const paper = { isOpen: true, meta: { simulated: true } };
+    trader.positions.set('mode-paper', paper);
+    const before = saves;
+    let r = await post('/api/engine/dry-run', { dryRun: false, confirm: 'I_UNDERSTAND_THE_RISK' });
+    assert.strictEqual(r.status, 409);
+    assert.strictEqual(r.body.error, 'mode_change_blocked');
+    assert.strictEqual(config.global.dryRun, true);
+    assert.strictEqual(saves, before);
+    trader.positions.delete('mode-paper');
+
+    engine._unresolved = { [createdId]: [{ meta: { simulated: true } }] };
+    r = await post('/api/engine/dry-run', { dryRun: false, confirm: 'I_UNDERSTAND_THE_RISK' });
+    assert.strictEqual(r.status, 409, 'a locked/unrecovered paper snapshot also blocks switching');
+    engine._unresolved = {};
+
+    trader._inFlightBuy = 1;
+    r = await post('/api/engine/dry-run', { dryRun: false, confirm: 'I_UNDERSTAND_THE_RISK' });
+    assert.strictEqual(r.status, 409);
+    trader._inFlightBuy = 0;
+    r = await post('/api/engine/dry-run', { dryRun: false, confirm: 'I_UNDERSTAND_THE_RISK' });
+    assert.strictEqual(r.status, 200);
+    trader.positions.set('mode-live', { isOpen: true, meta: { simulated: false } });
+    r = await post('/api/engine/dry-run', { dryRun: true });
+    assert.strictEqual(r.status, 409, 'live positions cannot become fake paper sales');
+    assert.strictEqual(config.global.dryRun, false);
+    trader.positions.delete('mode-live');
+    r = await post('/api/engine/dry-run', { dryRun: true });
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(config.global.dryRun, true);
+  });
+
+  await test('generic settings cannot bypass LIVE confirmation or change modes', async () => {
+    let r = await api('PUT', '/api/config', { dryRun: false });
+    assert.strictEqual(r.status, 400);
+    assert.strictEqual(config.global.dryRun, true);
+    r = await api('PUT', '/api/config', { dryRun: true });
+    assert.strictEqual(r.status, 200, 'unchanged mode is accepted for old clients');
+    assert.strictEqual(config.global.dryRun, true);
+  });
+
   await test('the WebSocket snapshot carries the launch feed', async () => {
     // The client used to ignore this field, which is half the reason the panel
     // stayed empty on a live page while a reload would have filled it.
