@@ -201,6 +201,7 @@ class Position {
       remainingFraction: this.remainingFraction,
       stopLevelPct: this.stopLevelPct,
       lastUpdated: this.lastUpdated,
+      markFreshnessMs: Math.max(5000, Number(process.env.PRICE_POLL_MS || 1200) * 3),
       tiers: this.tiers,
       exits: this.exits,
       entryTxSignature: this.entryTxSignature,

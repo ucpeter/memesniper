@@ -24,6 +24,8 @@ const curve = require('./curve');
 const lossCooldown = require('./loss-cooldown');
 
 const todayKey = () => new Date().toISOString().slice(0, 10);
+// Symbols are reusable; show a short public mint ID when logging a decision.
+const mintRef = (mint) => mint ? `${mint.slice(0, 5)}…${mint.slice(-5)}` : 'mint unread';
 
 class Trader {
   constructor({ cfg, keystore, executor, getConfig, priceCache }) {
@@ -219,7 +221,7 @@ class Trader {
         bus.safeEmit('token:skipped', { walletId: this.cfg.id, wallet: this.cfg.name, candidate, reasons: verdict.reasons, infra: true });
         return 'skip:rpc_unavailable';
       }
-      log.debug(`Filtered ${candidate.symbol || candidate.mint.slice(0, 6)}: ${verdict.reasons.join(', ')}`, { wallet: this.cfg.name });
+      log.debug(`Filtered ${candidate.symbol || candidate.mint.slice(0, 6)} [${mintRef(candidate.mint)}]: ${verdict.reasons.join(', ')}`, { wallet: this.cfg.name });
       this.stats.skipped = (this.stats.skipped || 0) + 1;
       bus.safeEmit('token:skipped', { walletId: this.cfg.id, wallet: this.cfg.name, candidate, reasons: verdict.reasons, hard: verdict.hard });
       return `skip:${verdict.reasons[0] || 'filters'}`;
@@ -300,7 +302,7 @@ class Trader {
         result = await this.executor.signAndSend({
           walletId: this.cfg.id,
           tx: { dry: true },
-          label: `BUY ${sizeSol.toFixed(3)} SOL → ${candidate.symbol || mint.slice(0, 6)}`,
+          label: `BUY ${sizeSol.toFixed(3)} SOL → ${candidate.symbol || mint.slice(0, 6)} [${mintRef(mint)}]`,
           simulate: { tokensOut: expectedTokens, solIn: solLamports },
         });
       } else {
@@ -325,7 +327,7 @@ class Trader {
         result = await this.executor.signAndSend({
           walletId: this.cfg.id,
           tx: built.tx,
-          label: `BUY ${sizeSol.toFixed(3)} SOL → ${candidate.symbol || mint.slice(0, 6)}`,
+          label: `BUY ${sizeSol.toFixed(3)} SOL → ${candidate.symbol || mint.slice(0, 6)} [${mintRef(mint)}]`,
         });
       }
 
@@ -386,7 +388,7 @@ class Trader {
       this.stats.bought = (this.stats.bought || 0) + 1;
 
       log.trade(
-        `🟢 BOUGHT ${candidate.symbol || mint.slice(0, 6)} · ${sizeSol.toFixed(3)} SOL · ` +
+        `🟢 BOUGHT ${candidate.symbol || mint.slice(0, 6)} [${mintRef(mint)}] · ${sizeSol.toFixed(3)} SOL · ` +
         `${curve.baseUnitsToTokens(tokensHeld).toLocaleString()} tokens${this.executor.dryRun ? ' [SIM]' : ''}`,
         { wallet: this.cfg.name }
       );
@@ -483,7 +485,7 @@ class Trader {
           ? curve.solOutForTokensIn(sellTokens, price.virtualSolReserves, price.virtualTokenReserves)
           : 0n;
 
-        const label = `SELL ${d.pct >= 100 ? '100' : d.pct.toFixed(0)}% ${position.symbol} (${d.reason})`;
+        const label = `SELL ${d.pct >= 100 ? '100' : d.pct.toFixed(0)}% ${position.symbol} [${mintRef(position.mint)}] (${d.reason})`;
         const provider = this._providerFor(g);
 
         let res;
@@ -546,7 +548,7 @@ class Trader {
 
         const gain = position.priceGainPct();
         log.trade(
-          `🔴 SOLD ${pctSold.toFixed(1)}% ${position.symbol} @ ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}% ` +
+          `🔴 SOLD ${pctSold.toFixed(1)}% ${position.symbol} [${mintRef(position.mint)}] @ ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}% ` +
           `· ${(Number(expectedSol) / 1e9).toFixed(4)} SOL · ${d.reason}${this.executor.dryRun ? ' [SIM]' : ''}`,
           { wallet: this.cfg.name }
         );
@@ -594,7 +596,7 @@ class Trader {
     }
 
     log.info(
-      `Closed ${position.symbol}: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL ` +
+      `Closed ${position.symbol} [${mintRef(position.mint)}]: ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL ` +
       `(${position.exitReason}) · day ${this.stats.realisedPnlSol >= 0 ? '+' : ''}${this.stats.realisedPnlSol.toFixed(4)} SOL`,
       { wallet: this.cfg.name }
     );
