@@ -2489,18 +2489,35 @@ function winRateOf(st) {
  * wallets; this is the per-wallet view, so "which wallet bought and sold what"
  * always has an answer.
  */
+/** Recorded fills, not merely configured targets or touched prices.
+ * A 100%-of-original final tier is clamped to the remaining tokens; use the
+ * actual position.exits ledger when describing what was sold. */
+function tierFillSummary(p) {
+  const fills = (p.exits || []).filter((x) => x.tier !== null && x.tier !== undefined);
+  if (!fills.length) return 'No take-profit sell recorded';
+  return fills.map((x) => {
+    const gain = p.tiers?.[x.tier]?.gainPct;
+    return `+${gain ?? '?'}%: ${Number(x.pctSold || 0).toFixed(1)}% sold`;
+  }).join(' · ');
+}
+
 /** Both the initial modal and subsequent heartbeats use exactly these rows.
  * Replacing only changed sections leaves the modal body/scrollbar untouched. */
 function walletDetailRows(w, open, closed) {
   const openRows = open.length
-    ? `<table><thead><tr><th>Token</th><th class="num">Spent</th><th class="num">Value</th><th class="num">P&amp;L</th><th></th></tr></thead>
+    ? `<table><thead><tr><th>Token / confirmed tier sells</th><th class="num">Spent</th><th class="num">Marked total</th><th class="num">P&amp;L / spot gain</th><th></th></tr></thead>
         <tbody>${open.map((p) => {
           const val = (Number(p.solSpent) / 1e9) + (p.pnlSol || 0);
+          const heldPct = Number.isFinite(Number(p.remainingFraction))
+            ? `${(Number(p.remainingFraction) * 100).toFixed(1)}%` : '—';
           return `<tr>
-            <td class="sym">${esc(p.symbol)}${p.simulated ? '<span class="badge sim">SIM</span>' : ''}<div class="mute" style="font-size:10px;font-weight:400">${esc(short(p.mint, 5))}</div></td>
+            <td class="sym">${esc(p.symbol)}${p.simulated ? '<span class="badge sim">SIM</span>' : ''}<div class="mute" style="font-size:10px;font-weight:400">${esc(short(p.mint, 5))}</div>
+              <div class="mute" style="font-size:10px">${esc(tierFillSummary(p))} · ${esc(heldPct)} held</div></td>
             <td class="num">${esc((Number(p.solSpent) / 1e9).toFixed(3))}</td>
             <td class="num">${esc(val.toFixed(3))}</td>
-            <td class="num ${cls(p.pnlPct ?? 0)}"><b>${fmtPct(p.pnlPct ?? 0)}</b><div class="mute" style="font-size:10px">${fmtSol(p.pnlSol, 4)}</div></td>
+            <td class="num ${cls(p.pnlPct ?? 0)}"><b>${fmtPct(p.pnlPct ?? 0)}</b><div class="mute" style="font-size:10px">${fmtSol(p.pnlSol, 4)}</div>
+              <div class="mute" style="font-size:10px">spot ${fmtPct(p.priceGainPct ?? 0)} · peak ${fmtPct(p.peakGainPct ?? 0)} · trigger ${p.stopLevelPct == null ? '—' : fmtPct(p.stopLevelPct)}</div>
+              <div class="${p.lastUpdated && Date.now() - p.lastUpdated > 5000 ? 'warn' : 'mute'}" style="font-size:10px">mark ${p.lastUpdated ? `${fmtAge(Date.now() - p.lastUpdated)} ago${Date.now() - p.lastUpdated > 5000 ? ' · stale; price exits need a fresh read' : ''}` : 'time unread'}</div></td>
             <td><button class="btn btn-sm btn-danger" data-exit="${esc(p.id)}">⛔ Kill</button></td>
           </tr>`;
         }).join('')}</tbody></table>`
@@ -2517,7 +2534,9 @@ function walletDetailRows(w, open, closed) {
             <td class="num">${esc(spent.toFixed(3))}</td>
             <td class="num">${esc(returned.toFixed(3))}</td>
             <td class="num ${cls(pnl)}"><b>${fmtSol(pnl, 4)}</b></td>
-            <td><span class="badge ${pnl >= 0 ? 'won' : 'lost'}">${esc(p.exitReason || '—')}</span></td>
+            <td><span class="badge ${pnl >= 0 ? 'won' : 'lost'}">${esc(p.exitReason || '—')}</span>
+              <div class="mute" style="font-size:10px">${esc(tierFillSummary(p))}</div>
+              <div class="mute" style="font-size:10px">peak ${fmtPct(p.peakGainPct ?? 0)} · final spot ${fmtPct(p.priceGainPct ?? 0)}</div></td>
             <td class="num">${esc(fmtAge(p.closedAt && p.openedAt ? p.closedAt - p.openedAt : 0))}</td>
           </tr>`;
         }).join('')}</tbody></table>`
@@ -2604,6 +2623,7 @@ function openWalletDetail(walletId) {
         </section>
 
         <div class="section-label">Open positions (<span data-wallet-open-count>${open.length}</span>)</div>
+        <div class="hint">P&amp;L includes earlier partial proceeds and the remaining tokens marked at the last spot price; it is not a sell quote. Tiers and stops use <b>spot gain vs entry</b>, not this P&amp;L. Only a recorded tier sell confirms a partial fill. A stop is a trigger, not a guaranteed execution price.</div>
         <div class="tbl-wrap" data-wallet-open-rows>${openRows}</div>
 
         <div class="section-label">Trade history (<span data-wallet-closed-count>${closed.length}</span>)</div>
@@ -3058,8 +3078,8 @@ function renderEditorPanes(root) {
     <div class="grid3">
       <div class="field"><label>Max concurrent positions</label><input type="number" id="f_concurrent" value="${c.buy.maxConcurrentPositions}"/></div>
       <div class="field"><label>Cooldown between entries (ms)</label><input type="number" step="250" id="f_cooldown" value="${c.buy.cooldownMs}"/></div>
-      <div class="field"><label>Auto-compound</label>
-        <label class="switch"><input type="checkbox" id="f_compound" ${c.buy.autoCompound ? 'checked' : ''}/><span>Sweep profits into next snipe</span></label></div>
+      <div class="field"><label>Auto-compound — unavailable</label>
+        <div class="hint">No separate auto-compound action is implemented. % of balance / Kelly modes already size from the current wallet balance; fixed mode stays within your chosen range. Older saved auto-compound switches have no effect.</div></div>
     </div>`;
 
   /* ------------------------------ EXITS ------------------------------ */
@@ -3074,11 +3094,12 @@ function renderEditorPanes(root) {
     <div class="section-label">Loss limit (per trade)</div>
     <div class="grid2">
       <div class="field"><label>Stop loss (%)</label><input type="number" step="1" id="f_sl" value="${c.exits.stopLossPct}"/>
-        <div class="hint">Hard exit when the position is down this much.</div></div>
+        <div class="hint">Attempts a sell when fresh spot gain falls this far below entry; fill price is not guaranteed.</div></div>
       <div class="field"><label>Max hold time</label>
         <select id="f_maxhold">
           ${[[300000, '5 min'], [900000, '15 min'], [1800000, '30 min'], [3600000, '1 hour'], [7200000, '2 hours']].map(([v, l]) => `<option value="${v}" ${c.exits.maxHoldMs == v ? 'selected' : ''}>${l}</option>`).join('')}
-          <option value="0" ${c.exits.maxHoldMs > 7200000 ? 'selected' : ''}>No limit</option>
+          ${c.exits.maxHoldMs > 0 && ![300000, 900000, 1800000, 3600000, 7200000].includes(c.exits.maxHoldMs) ? `<option value="${c.exits.maxHoldMs}" selected>Saved custom: ${Math.round(c.exits.maxHoldMs / 60000)} min</option>` : ''}
+          <option value="0" ${c.exits.maxHoldMs === 0 ? 'selected' : ''}>No limit</option>
         </select>
         <div class="hint">Time stop — exit regardless once elapsed.</div></div>
     </div>
@@ -3132,7 +3153,7 @@ function renderEditorPanes(root) {
         <label class="switch"><input type="checkbox" id="f_mintrev" ${c.filters.requireMintAuthorityRevoked ? 'checked' : ''}/><span>Required</span></label></div>
       <div class="field"><label>Freeze authority revoked</label>
         <label class="switch"><input type="checkbox" id="f_freezerev" ${c.filters.requireFreezeAuthorityRevoked ? 'checked' : ''}/><span>Required</span></label></div>
-      <div class="field"><label>Max buy tax (%)</label><input type="number" id="f_buytax" value="${c.filters.maxBuyTaxPct}"/></div>
+      <div class="field"><label>Buy/sell tax checks — unavailable</label><div class="hint">No pre-buy tax simulation exists. Older saved tax percentages do not block buys; do not treat them as protection.</div></div>
     </div>
     <div class="section-label">Distribution</div>
     <div class="grid3">
@@ -3153,8 +3174,8 @@ function renderEditorPanes(root) {
     <div class="grid3">
       <div class="field"><label>Require socials</label>
         <label class="switch"><input type="checkbox" id="f_social" ${c.filters.requireSocial ? 'checked' : ''}/><span>Twitter/TG/site</span></label></div>
-      <div class="field"><label>Block copycat tickers</label>
-        <label class="switch"><input type="checkbox" id="f_copycat" ${c.filters.blockCopycatNames ? 'checked' : ''}/><span>Known-name collisions</span></label></div>
+      <div class="field"><label>Known-ticker blocking — unavailable</label>
+        <div class="hint">There is no verified known-ticker list. Unicode lookalikes remain a warning, not a guaranteed veto.</div></div>
       <div class="field"><label>Max token age (s)</label><input type="number" step="10" id="f_age" value="${Math.round(c.filters.maxAgeMs / 1000)}"/></div>
     </div>
     <div class="section-label">Timing</div>
@@ -3196,7 +3217,13 @@ function renderTiers(root) {
 
   const total = tiers.reduce((a, t) => a + Number(t.sellPct || 0), 0);
   list.insertAdjacentHTML('beforeend',
-    `<div class="hint" style="margin-bottom:12px">Total sold across tiers: <b class="${total >= 100 ? 'pos' : 'dim'}">${total}%</b>${total < 100 ? ` — the remaining <b>${100 - total}%</b> rides on the trailing stop / time stop.` : ''}</div>`);
+    `<div class="hint" style="margin-bottom:12px">Planned tier requests: <b class="${total > 100 ? 'warn' : 'dim'}">${total}% of original</b>. ` +
+    (total > 100
+      ? `This does <b>not</b> sell ${total}%: every tier is capped to tokens still held. A final 100% tier closes only the remainder; if price skips straight to the highest tier it runs first.`
+      : total < 100
+        ? `Up to ${100 - total}% may remain for trailing/time/liquidity exit.`
+        : `Up to 100% can be sold if prices reach these levels and sells succeed.`) +
+    ` These are <b>targets</b>, not proof a sale happened.</div>`);
 
   list.querySelectorAll('[data-tier-rm]').forEach((b) => b.onclick = () => {
     S.editing.cfg.exits.takeProfitTiers.splice(Number(b.dataset.tierRm), 1);
@@ -3236,7 +3263,6 @@ function wireEditor(root) {
   num('#f_kelly', (v) => { c().buy.kellyFraction = v; });
   num('#f_concurrent', (v) => { c().buy.maxConcurrentPositions = v; });
   num('#f_cooldown', (v) => { c().buy.cooldownMs = v; });
-  chk('#f_compound', (v) => { c().buy.autoCompound = v; });
 
   // exits
   num('#f_sl', (v) => { c().exits.stopLossPct = v; });
@@ -3259,7 +3285,6 @@ function wireEditor(root) {
   // filters
   chk('#f_mintrev', (v) => { c().filters.requireMintAuthorityRevoked = v; });
   chk('#f_freezerev', (v) => { c().filters.requireFreezeAuthorityRevoked = v; });
-  num('#f_buytax', (v) => { c().filters.maxBuyTaxPct = v; });
   num('#f_devhold', (v) => { c().filters.maxDevHoldPct = v; });
   num('#f_top10', (v) => { c().filters.maxTop10HoldersPct = v; });
   num('#f_minliq', (v) => { c().filters.minLiquidityUsd = v; });
@@ -3268,7 +3293,6 @@ function wireEditor(root) {
   num('#f_maxliq', (v) => { c().filters.maxLiquidityUsd = v || 0; });
   chk('#f_resume', (v) => { c().resumeAfterRestart = v; });
   chk('#f_social', (v) => { c().filters.requireSocial = v; });
-  chk('#f_copycat', (v) => { c().filters.blockCopycatNames = v; });
   num('#f_age', (v) => { c().filters.maxAgeMs = v * 1000; });
   num('#f_curve', (v) => { c().filters.maxBondingCurvePct = v; });
   txt('#f_devbl', (v) => { c().filters.devBlacklist = v.split('\n').map((s) => s.trim()).filter(Boolean); });
