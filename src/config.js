@@ -486,7 +486,9 @@ function normaliseWallet(cfg) {
   if (!['fixed', 'percent', 'kelly'].includes(w.buy.positionSizeMode)) w.buy.positionSizeMode = 'fixed';
 
   w.exits.stopLossPct = clamp(w.exits.stopLossPct, 1, 99, 25);
-  w.exits.maxHoldMs = clamp(w.exits.maxHoldMs, 5000, 24 * 3600 * 1000, 1800000);
+  w.exits.maxHoldMs = Number(w.exits.maxHoldMs) === 0
+    ? 0 // editor "No limit": never turn it into an immediate 5-second sale
+    : clamp(w.exits.maxHoldMs, 5000, 24 * 3600 * 1000, 1800000);
   w.exits.liquidityDropExitPct = clamp(w.exits.liquidityDropExitPct, 5, 100, 55);
   w.exits.trailing.activationPct = clamp(w.exits.trailing.activationPct, 1, 100000, 30);
   w.exits.trailing.trailPct = clamp(w.exits.trailing.trailPct, 0.5, 95, 15);
@@ -494,7 +496,7 @@ function normaliseWallet(cfg) {
   w.exits.breakEven.activationPct = clamp(w.exits.breakEven.activationPct, 1, 100000, 30);
   w.exits.breakEven.offsetPct = clamp(w.exits.breakEven.offsetPct, 0, 50, 2);
 
-  // Tier sanitation: valid, sorted ascending, cumulative sell <= 100%
+  // Tier sanitation: valid, sorted ascending; requests above 100% cap at remaining tokens
   if (!Array.isArray(w.exits.takeProfitTiers) || w.exits.takeProfitTiers.length === 0) {
     w.exits.takeProfitTiers = defaultWalletConfig().exits.takeProfitTiers;
   }
