@@ -56,6 +56,9 @@ class Position {
     this.stopLevelPct = null; // last computed effective stop (for UI)
     this.lastPrice = this.entryPrice;
     this.lastUpdated = Date.now();
+    // Dry-run only: hypothetical change to virtual reserves caused by this
+    // position's paper fills. Absent for LIVE and for pre-r32 paper positions.
+    this.paperCurve = null;
     this.closeTxSignature = null;
     this.exitReason = null;
   }
@@ -81,6 +84,7 @@ class Position {
       solSpent: this.solSpent.toString(),
       realisedSol: this.realisedSol.toString(),
       realisedTokens: this.realisedTokens.toString(),
+      paperCurve: this.paperCurve,
       entryTxSignature: this.entryTxSignature,
       tiers: this.tiers,
       exits: this.exits,
@@ -102,6 +106,11 @@ class Position {
     p.highWaterPrice = BigInt(s.highWaterPrice || s.entryPrice);
     p.lastPrice = BigInt(s.lastPrice || s.entryPrice);
     p.lastUpdated = Number(s.lastUpdated) || p.openedAt;
+    if (s.paperCurve?.version === 1 && /^-?\d+$/.test(s.paperCurve.solDelta || '') &&
+        /^-?\d+$/.test(s.paperCurve.tokenDelta || '')) {
+      p.paperCurve = { version: 1, solDelta: s.paperCurve.solDelta,
+        tokenDelta: s.paperCurve.tokenDelta };
+    }
     if (Array.isArray(s.tiers)) p.tiers = s.tiers;
     if (Array.isArray(s.exits)) p.exits = s.exits;
     return p;
@@ -202,6 +211,7 @@ class Position {
       stopLevelPct: this.stopLevelPct,
       lastUpdated: this.lastUpdated,
       markFreshnessMs: Math.max(5000, Number(process.env.PRICE_POLL_MS || 1200) * 3),
+      paperCurveModel: this.paperCurve ? 'counterfactual-v1' : null,
       tiers: this.tiers,
       exits: this.exits,
       entryTxSignature: this.entryTxSignature,

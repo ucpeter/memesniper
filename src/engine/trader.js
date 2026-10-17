@@ -277,6 +277,7 @@ class Trader {
   }
 
   async _executeBuy(candidate, sizeSol, report, aiResult, ctx) {
+    this._inFlightBuy = (this._inFlightBuy || 0) + 1;
     const g = this.getConfig();
     const mint = candidate.mint;
 
@@ -295,6 +296,7 @@ class Trader {
 
       const provider = this._providerFor(g);
       let result;
+      const buyWasPaper = this.isPaperTrading;
 
       if (Number.isFinite(ctx?.entryDeadlineAt) && Date.now() >= ctx.entryDeadlineAt) return 'skip:eval_timeout';
       if (this.executor.dryRun) {
@@ -322,6 +324,7 @@ class Trader {
         });
         // Building can involve network calls. Recheck BEFORE the first possible
         // submission, not after it; an in-flight order must be allowed to resolve.
+        if (buyWasPaper !== this.isPaperTrading) return 'skip:mode_changed';
         if (Number.isFinite(ctx?.entryDeadlineAt) && Date.now() >= ctx.entryDeadlineAt) return 'skip:eval_timeout';
         bus.safeEmit('token:stage', { candidate, walletId: this.cfg.id, wallet: this.cfg.name, stage: 'Submitting or confirming buy' });
         result = await this.executor.signAndSend({
@@ -371,9 +374,22 @@ class Trader {
           // Recorded at fill time, not read from the current mode: a paper trade
           // stays a paper trade after you switch to live, and a real one is
           // never relabelled as simulated by a later switch.
-          simulated: Boolean(this.executor && this.executor.dryRun),
+          simulated: buyWasPaper,
         },
       });
+
+      // Model this paper buy's counterfactual curve impact. A dry-run order
+      // never reaches the real chain; without this delta every later paper
+      // sale is quoted as if we had received tokens without paying into the
+      // pool. Net SOL is the same 1% input-fee assumption as curve.tokensOut.
+      // LIVE positions never receive a paper curve and keep their real quote.
+      if (buyWasPaper) {
+        position.paperCurve = {
+          version: 1,
+          solDelta: ((solLamports * 9900n) / 10000n).toString(),
+          tokenDelta: (-tokensHeld).toString(),
+        };
+      }
 
       // Seed the tier state machine so partials are tracked per position.
       position.tiers = this.cfg.exits.takeProfitTiers.map((t) => ({ ...t, filled: false }));
@@ -399,6 +415,8 @@ class Trader {
       // A provider can throw after a broadcast was attempted: the absence of a
       // recorded position does not prove the chain rejected the transaction.
       return 'buy_error';
+    } finally {
+      this._inFlightBuy -= 1;
     }
   }
 
@@ -422,10 +440,48 @@ class Trader {
   }
 
   /* -------------------------------- exits -------------------------------- */
+  /** An order's paper/real identity is fixed at entry, even if a config or
+   * restart later changes the global mode. Never silently cross that boundary. */
+  _exitModeMatches(position) {
+    const matches = Boolean(position.meta?.simulated) === this.isPaperTrading;
+    if (!matches && !position._modeMismatchWarned) {
+      position._modeMismatchWarned = true;
+      log.warn(`Exit held for ${position.symbol}: position mode differs from engine mode. Restore the entry mode before managing exits.`,
+        { wallet: this.cfg.name });
+    }
+    return matches;
+  }
+
   /**
    * Evaluate risk rules for every open position and act.
    * Called on each price tick from the engine's poller.
    */
+  /** Fresh on-chain reserves plus ONLY this position's hypothetical fills.
+   * Two wallets' paper positions remain separate counterfactual experiments.
+   * Legacy paper positions with no saved offset retain their old behaviour;
+   * inventing past fills on deployment would be less honest than marking them
+   * as legacy. This approximation cannot replay external traders' order flow.
+   */
+  _quoteReserves(position, observed) {
+    if (!observed) return null;
+    if (!this.isPaperTrading || !position.paperCurve) return observed;
+    if (observed.virtualSolReserves == null || observed.virtualTokenReserves == null) return null;
+    const virtualSolReserves = BigInt(observed.virtualSolReserves) + BigInt(position.paperCurve.solDelta);
+    const virtualTokenReserves = BigInt(observed.virtualTokenReserves) + BigInt(position.paperCurve.tokenDelta);
+    if (virtualSolReserves <= 0n || virtualTokenReserves <= 0n) return null;
+    return { ...observed, virtualSolReserves, virtualTokenReserves };
+  }
+
+  /** Update the hypothetical reserves only AFTER a successful paper fill.
+   * Gross SOL leaves the curve, while the 1% sell fee is kept out of proceeds.
+   */
+  _recordPaperSell(position, quoted, tokens) {
+    if (!this.isPaperTrading || !position.paperCurve) return;
+    const gross = curve.solOutForTokensIn(tokens, quoted.virtualSolReserves, quoted.virtualTokenReserves, 0);
+    position.paperCurve.solDelta = (BigInt(position.paperCurve.solDelta) - gross).toString();
+    position.paperCurve.tokenDelta = (BigInt(position.paperCurve.tokenDelta) + tokens).toString();
+  }
+
   async manage(ctx) {
     /* Deliberately NOT gated on cfg.enabled.
      *
@@ -439,6 +495,7 @@ class Trader {
     const g = this.getConfig();
 
     for (const position of this.openPositions()) {
+      if (!this._exitModeMatches(position)) continue;
       const price = this.priceCache.get(position.mint);
       const age = price ? Date.now() - Number(price.ts) : Infinity;
       const maxAge = Math.max(5000, Number(process.env.PRICE_POLL_MS || 1200) * 3);
@@ -452,7 +509,11 @@ class Trader {
         continue;
       }
 
-      position.mark(price.price, price.ts);
+      const quoted = this._quoteReserves(position, price);
+      if (!quoted) continue; // never mark against impossible counterfactual reserves
+      position.mark(position.paperCurve && this.isPaperTrading
+        ? curve.spotPriceScaled(quoted.virtualSolReserves, quoted.virtualTokenReserves)
+        : price.price, price.ts);
 
       if (price.liquidityDropPct !== undefined) {
         const decisions = risk.evaluate(position, this.cfg, { liquidityDropPct: price.liquidityDropPct });
@@ -465,6 +526,7 @@ class Trader {
   }
 
   async _act(position, decisions, ctx) {
+    if (!this._exitModeMatches(position)) return;
     const g = this.getConfig();
 
     for (const d of decisions) {
@@ -481,8 +543,10 @@ class Trader {
         if (sellTokens > position.tokensHeld) continue;
 
         const price = this.priceCache.get(position.mint);
-        const expectedSol = price
-          ? curve.solOutForTokensIn(sellTokens, price.virtualSolReserves, price.virtualTokenReserves)
+        const quoted = this._quoteReserves(position, price);
+        if (this.isPaperTrading && !quoted) continue; // no invented paper fill
+        const expectedSol = quoted
+          ? curve.solOutForTokensIn(sellTokens, quoted.virtualSolReserves, quoted.virtualTokenReserves)
           : 0n;
 
         const label = `SELL ${d.pct >= 100 ? '100' : d.pct.toFixed(0)}% ${position.symbol} [${mintRef(position.mint)}] (${d.reason})`;
@@ -537,6 +601,7 @@ class Trader {
             if (!t.filled) { t.filled = true; t.superseded = true; }
           }
         }
+        if (quoted) this._recordPaperSell(position, quoted, sellTokens);
         position.recordExit({
           pctSold,
           tokensSold: sellTokens,
@@ -647,12 +712,25 @@ class Trader {
     if (position.status === 'CLOSED' || position.tokensHeld <= 0n) {
       return { ok: false, error: 'already_closed' };
     }
+    if (!this._exitModeMatches(position)) return { ok: false, error: 'position_mode_mismatch',
+      hint: 'This position was opened in a different mode. Restore its original paper or LIVE mode before exiting it.' };
 
     const g = this.getConfig();
     const tokens = position.tokensHeld;
     const price = this.priceCache.get(position.mint);
-    const expectedSol = price
-      ? curve.solOutForTokensIn(tokens, price.virtualSolReserves, price.virtualTokenReserves)
+    const quoted = this._quoteReserves(position, price);
+    if (this.isPaperTrading) {
+      const age = price ? Date.now() - Number(price.ts) : Infinity;
+      const maxAge = Math.max(5000, Number(process.env.PRICE_POLL_MS || 1200) * 3);
+      // A manual paper kill at a missing/stale price used to book a fake
+      // zero-SOL sale. Keep the bag open until there is a fresh quote.
+      if (!quoted || !Number.isFinite(age) || age < 0 || age > maxAge) {
+        return { ok: false, error: 'price_unavailable',
+          hint: 'No fresh curve price is available. The paper position remains open; retry after a verified price update.' };
+      }
+    }
+    const expectedSol = quoted
+      ? curve.solOutForTokensIn(tokens, quoted.virtualSolReserves, quoted.virtualTokenReserves)
       : 0n;
     const label = `KILL ${position.symbol} (${reason})`;
 
@@ -695,6 +773,7 @@ class Trader {
     }
 
     const solReceived = res.fill?.solOut ?? expectedSol;
+    if (quoted) this._recordPaperSell(position, quoted, tokens);
     for (const t of position.tiers) if (!t.filled) { t.filled = true; t.superseded = true; }
     position.recordExit({
       pctSold: (Number(tokens) / Number(position.originalTokens)) * 100,
@@ -721,31 +800,45 @@ class Trader {
    * Re-adopt a position this wallet still holds, from a snapshot left by a
    * previous run (see config.resumeAfterRestart).
    *
-   * The on-chain balance is the source of truth, never the file: we adopt what
-   * is actually in the wallet, and if the read fails we adopt NOTHING rather
-   * than assume the bag is gone — a transport blip must not erase a live
-   * position that a 24h target is waiting on.
+   * LIVE: the on-chain balance is the source of truth, never the file: if the
+   * read fails, retain the snapshot instead of assuming the bag is gone.
+   * PAPER: no on-chain tokens exist, so the saved paper token amount is the
+   * source of truth. Neither type can be adopted in the other execution mode.
    */
   async adoptPosition(snap) {
     if (!snap || !snap.mint) return null;
     if (this.cfg.resumeAfterRestart === false) return null;
     if (this.byMint.has(snap.mint)) return null;
 
-    let held;
-    try {
-      held = await this.executor.getTokenBalanceRawOrThrow(this.publicKey, snap.mint);
-    } catch (err) {
-      log.warn(
-        `Could not verify ${snap.symbol || snap.mint} on chain (${err.message}) — keeping the snapshot for the next attempt`,
-        { wallet: this.cfg.name }
-      );
-      throw err;
+    const wasPaper = snap.meta?.simulated === true;
+    if (wasPaper !== this.isPaperTrading) {
+      // Keep the snapshot unresolved until the user restores its original mode.
+      // In particular, a real bag must never be "sold" by a paper executor.
+      log.warn(`Cannot resume ${snap.symbol || snap.mint}: saved ${wasPaper ? 'paper' : 'LIVE'} position needs ${wasPaper ? 'dry-run' : 'LIVE'} mode. Snapshot kept.`,
+        { wallet: this.cfg.name });
+      throw new Error('position_mode_mismatch');
     }
-    if (held <= 0n) return null; // genuinely empty: already sold, nothing to manage
+    let held;
+    if (wasPaper) {
+      // Paper tokens never reached the chain. Their saved size, not the real
+      // wallet's zero token balance, is the only valid paper recovery source.
+      held = BigInt(snap.tokensHeld || 0);
+    } else {
+      try {
+        held = await this.executor.getTokenBalanceRawOrThrow(this.publicKey, snap.mint);
+      } catch (err) {
+        log.warn(
+          `Could not verify ${snap.symbol || snap.mint} on chain (${err.message}) — keeping the snapshot for the next attempt`,
+          { wallet: this.cfg.name }
+        );
+        throw err;
+      }
+    }
+    if (held <= 0n) return null; // closed on paper, or genuinely empty on chain
 
     const p = Position.fromSnapshot(snap);
     p.wallet = this.cfg.name; // snapshots written before the name was stored still get one
-    p.tokensHeld = held; // chain wins
+    p.tokensHeld = held; // paper snapshot or verified chain balance wins
     if (p.tokensHeld > p.originalTokens) p.originalTokens = p.tokensHeld;
     p.status = 'OPEN';
     if (!p.lastPrice || p.lastPrice === 0n) p.lastPrice = p.entryPrice;
@@ -755,7 +848,7 @@ class Trader {
     this.byMint.set(p.mint, p.id);
 
     log.warn(
-      `♻ RESUMED ${p.symbol} from a previous run — ${(Number(held) / 1e6).toFixed(2)} tokens held, ` +
+      `♻ RESUMED ${p.symbol}${wasPaper ? ' [SIM]' : ''} from a previous run — ${(Number(held) / 1e6).toFixed(2)} tokens held, ` +
       `entry ${(Number(p.entryPrice) / 1e6).toFixed(8)} SOL/token`,
       { wallet: this.cfg.name }
     );

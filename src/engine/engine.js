@@ -503,8 +503,8 @@ class Engine {
    * Refuses to write until resume() has run once: hydrate() starts with an
    * empty book, and persisting that would overwrite the very file we need — a
    * restart would then look like "nothing to recover". Snapshots for wallets
-   * whose keys are not loaded yet (locked keystore) are carried through
-   * untouched for the same reason.
+   * whose keys are not loaded yet (locked keystore), or whose adoption was
+   * deferred by an RPC/mode mismatch, are carried through untouched.
    */
   persistPositions() {
     if (!this._resumed) return 0;
@@ -512,12 +512,19 @@ class Engine {
     let n = 0;
 
     for (const [walletId, snaps] of Object.entries(this._unresolved || {})) {
-      if (!this.traders.has(walletId)) { wallets[walletId] = snaps; n += snaps.length; }
+      // A wallet may be loaded while one of its snapshots could not yet be
+      // adopted (RPC outage or mode mismatch). Do not erase that unresolved
+      // record merely because the trader exists.
+      wallets[walletId] = [...snaps];
+      n += snaps.length;
     }
     for (const t of this.traders.values()) {
       if (t.cfg.resumeAfterRestart === false) continue;
       const snaps = t.openPositions().map((p) => p.snapshot());
-      if (snaps.length) { wallets[t.cfg.id] = snaps; n += snaps.length; }
+      const pending = wallets[t.cfg.id] || [];
+      const fresh = snaps.filter((snap) => !pending.some((saved) => saved.id === snap.id));
+      if (pending.length || fresh.length) wallets[t.cfg.id] = [...pending, ...fresh];
+      n += fresh.length;
     }
 
     try {
