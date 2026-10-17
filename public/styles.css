@@ -938,6 +938,9 @@ html, body { max-width: 100%; overflow-x: hidden; }
 /* 📄 Trades only: JS measures its first 20 painted rows and sets the inner
    viewport to that height; the rest scroll inside. Collapse exposes positions
    quickly on narrow phones. Do not cap this at 36vh (only ~5 visible rows). */
+/* Price age must be conspicuous even inside a green positive-P&L table cell.
+   There is no generic .warn text rule; the old label inherited green. */
+.mark-stale { color: var(--amber); font-weight: 700; line-height: 1.35; }
 .wallet-detail-head { gap: 8px; flex-wrap: wrap; }
 .wallet-detail-head [data-header-toggle] { margin-left: auto; }
 .trades-launches-section { position: relative; }
