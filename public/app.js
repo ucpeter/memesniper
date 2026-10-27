@@ -2394,6 +2394,23 @@ function walletFeed(w) {
   });
 }
 
+/** Safe explanations for a creator balance that could not be verified. */
+function creatorReadMessage(code) {
+  return ({
+    creator_address_missing: 'launch did not identify the creator',
+    creator_lookup_unavailable: 'creator account check unavailable',
+    mint_supply_unavailable: 'mint supply not readable',
+    creator_or_mint_invalid: 'creator or token address invalid',
+    creator_read_deadline: 'creator read exceeded entry time',
+    creator_rpc_unavailable: 'creator account read unavailable',
+    creator_lookup_failed: 'creator account read failed',
+    creator_response_invalid: 'creator account response invalid',
+    creator_account_invalid: 'creator account data invalid',
+    creator_empty_unconfirmed: 'empty creator accounts not yet verified',
+    creator_zero_unconfirmed: 'creator zero balance not yet verified',
+  })[code] || 'creator balance not verified';
+}
+
 /** What this wallet did about one launch, in its own words. */
 function walletVerdict(row, w) {
   const mine = Array.isArray(row.wallets) ? row.wallets.find((x) => x.walletId
@@ -2401,7 +2418,10 @@ function walletVerdict(row, w) {
   const bought = row.boughtById ? row.boughtById === w.id : row.boughtBy === w.name;
   if (bought || (mine && mine.action === 'bought')) return { label: 'BOUGHT', cls: 'won', reason: null };
   if (!mine) return { label: 'not evaluated', cls: 'sim', reason: 'the engine had not reached this launch for this wallet' };
-  if (mine.action === 'filtered') return { label: 'filtered', cls: 'sim', reason: mine.reason || 'its filters ruled the token out' };
+  if (mine.action === 'filtered') return { label: 'filtered', cls: 'sim',
+    reason: mine.reason === 'dev_hold_unread'
+      ? `Creator hold unread at decision: ${creatorReadMessage(row.creatorReadDetail)}${row.currentDevHoldPct != null ? ' (later read does not reopen trade)' : ''}`
+      : mine.reason || 'its filters ruled the token out' };
   if (mine.action === 'rpc_error') return { label: 'RPC unavailable', cls: 'lost', reason: 'Connection/rate limit — token not checked. Check RPC settings.' };
   if (mine.action === 'checking') return { label: 'evaluating…', cls: 'paper', reason: mine.stage || 'Checking token on-chain' };
   if (mine.action === 'slow') return { label: 'SLOW / PENDING', cls: 'paper', reason: mine.reason };
