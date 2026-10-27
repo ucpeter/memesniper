@@ -86,6 +86,23 @@ const candidate = (n) => ({
     });
   });
 
+  await test('creator read failure detail survives feed updates without inventing zero', () => {
+    withFeed((feed) => {
+      const c = candidate('detail');
+      feed.note(c);
+      feed.analyze({ walletId: 'a', wallet: 'Sniper 1', candidate: c, ok: false,
+        reasons: ['dev_hold_unread'], report: { creatorReadDetail: 'creator_empty_unconfirmed' } });
+      let row = feed.snapshot()[0];
+      assert.strictEqual(row.currentDevHoldPct, null);
+      assert.strictEqual(row.creatorReadDetail, 'creator_empty_unconfirmed');
+      feed.recon({ candidate: c, report: { devHoldPct: 0, creatorReadDetail: 'creator_zero_confirmed' } });
+      row = feed.snapshot()[0];
+      assert.strictEqual(row.currentDevHoldPct, 0);
+      assert.strictEqual(row.creatorReadDetail, 'creator_zero_confirmed');
+      assert.strictEqual(row.wallets[0].action, 'filtered', 'later fact must not retroactively turn a skip into a buy');
+    });
+  });
+
   await test('the checks publish liquidity, dev holdings and honeypot risk for the row', () => {
     withFeed((feed) => {
       const c = candidate(2);

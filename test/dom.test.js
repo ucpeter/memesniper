@@ -646,6 +646,24 @@ async function click(window, el) {
     assert.match($('#toasts').textContent, /no timed cooldown/i);
   });
 
+  await test('unread creator decision explains why, without claiming a later read was the buy decision', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1 });
+    window.eval(`
+      const w = S.wallets[0];
+      S.scanFeed = [{ mint: 'TraceMint11111111111111111111111111111111111', symbol: 'TRACE',
+        devHoldPct: 1.5, currentDevHoldPct: null,
+        creatorReadDetail: 'creator_empty_unconfirmed',
+        virtualLiquiditySol: 30, liquidityUsd: 3100, realLiquidityUsd: 900,
+        wallets: [{ walletId: w.id, name: w.name, action: 'filtered', reason: 'dev_hold_unread' }] }];
+      openWalletFeed(w.id);
+    `);
+    assert.match($('#modalRoot').textContent, /empty creator accounts not yet verified/i);
+    assert.match($('#modalRoot').textContent, /current unread/i);
+    window.eval(`S.scanFeed[0].currentDevHoldPct = 0; openWalletFeed(S.wallets[0].id);`);
+    assert.match($('#modalRoot').textContent, /later read does not reopen trade/i);
+    assert.match($('#modalRoot').textContent, /0\.0% current/i);
+  });
+
   /* ── paper trades are visibly paper ──────────────────────────────────── */
 
   await test('dry-run positions and history rows are labelled SIM', async () => {

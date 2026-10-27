@@ -129,6 +129,119 @@ const test = async (label, fn) => { await fn(); passed += 1; console.log(`  ✓ 
       assert.ok(out.reasons.some((r) => r.startsWith('dev_opening_buy_high(30.0%>20%)')));
       candidate.initialBuy = 10_000_000;
     });
+    await test('new mint: processed creator account succeeds while confirmed lookup is still behind', async () => {
+      const calls = [];
+      const fresh = {
+        getTokenAccountsByOwner: async (_owner, _filter, commitment) => {
+          calls.push(commitment);
+          if (commitment === 'confirmed') throw Error('mint not yet confirmed');
+          return { value: [{ account: tokenAccount(creator, 20_000_000_000_000n) }] };
+        },
+      };
+      const out = await safety.checkCreatorHold(fresh, candidate, supply, { entryDeadlineAt: Date.now() + 1000 });
+      assert.equal(out.pct, 2);
+      assert.equal(out.detail, 'creator_read_processed');
+      assert.deepEqual(calls, ['processed']);
+    });
+    await test('temporary creator lookup failure retries both commitments within entry window', async () => {
+      const calls = [];
+      const recovering = {
+        getTokenAccountsByOwner: async (_owner, _filter, commitment) => {
+          calls.push(commitment);
+          if (calls.length < 3) throw Error('mint not yet indexed');
+          return { value: [{ account: tokenAccount(creator, 20_000_000_000_000n) }] };
+        },
+      };
+      const out = await safety.checkCreatorHold(recovering, candidate, supply, { entryDeadlineAt: Date.now() + 1500 });
+      assert.equal(out.pct, 2);
+      assert.deepEqual(calls, ['processed', 'confirmed', 'processed']);
+    });
+    await test('a creator read recovered inside deadline can pass the full SAVED filter stack', async () => {
+      const previous = conn.getTokenAccountsByOwner;
+      let calls = 0;
+      try {
+        conn.getTokenAccountsByOwner = async (...args) => {
+          calls += 1;
+          if (calls < 3) throw Error('new mint not indexed yet');
+          return previous(...args);
+        };
+        const result = await safety.evaluate(candidate, wallet, { conn, config: globalConfig,
+          entryDeadlineAt: Date.now() + 1500 });
+        assert.equal(result.ok, true, result.reasons.join(','));
+        assert.equal(result.report.devHoldPct, 2);
+        assert.equal(result.report.creatorReadDetail, 'creator_read_processed');
+        assert.equal(wallet.filters.maxDevHoldPct, 20, 'saved concentration limit unchanged');
+      } finally { conn.getTokenAccountsByOwner = previous; }
+    });
+    await test('a provider transport failure is not retried in a loop or reported as a token fault', async () => {
+      let calls = 0;
+      const busy = { getTokenAccountsByOwner: async () => {
+        calls += 1; throw Error('RPC_ENDPOINTS_FAILED [endpoint 1: rate_limited]');
+      } };
+      const result = await safety.checkCreatorHold(busy, candidate, supply, { entryDeadlineAt: Date.now() + 1000 });
+      assert.match(result.reason, /^rpc_unavailable/);
+      assert.equal(result.detail, 'creator_rpc_unavailable');
+      assert.equal(calls, 2, 'one processed and one confirmed; no second retry round');
+    });
+    await test('zero at processed is not substituted for a nonzero confirmed balance', async () => {
+      const mixed = { getTokenAccountsByOwner: async (_owner, _filter, commitment) => ({
+        value: [{ account: tokenAccount(creator, commitment === 'processed' ? 0n : 20_000_000_000_000n) }],
+      }) };
+      const result = await safety.checkCreatorHold(mixed, candidate, supply);
+      assert.equal(result.pct, 2);
+      assert.equal(result.detail, 'creator_read_confirmed');
+    });
+    await test('zero creator accounts is verified at confirmed mint, not inferred from an early empty lookup', async () => {
+      let confirmedMintReads = 0;
+      const empty = {
+        getTokenAccountsByOwner: async () => ({ value: [] }),
+        getAccountInfo: async () => {
+          confirmedMintReads += 1;
+          if (confirmedMintReads === 1) return null;
+          const data = Buffer.alloc(82);
+          data.writeBigUInt64LE(supply, 36);
+          return { data };
+        },
+      };
+      const out = await safety.checkCreatorHold(empty, candidate, supply, { entryDeadlineAt: Date.now() + 1500 });
+      assert.equal(out.pct, 0);
+      assert.equal(out.detail, 'creator_zero_confirmed');
+      assert.equal(confirmedMintReads, 2, 'first empty result was not blindly accepted');
+    });
+    await test('creator read never invents 0 for unconfirmed empty accounts', async () => {
+      const empty = {
+        getTokenAccountsByOwner: async () => ({ value: [] }),
+        getAccountInfo: async () => null,
+      };
+      const out = await safety.checkCreatorHold(empty, candidate, supply, { entryDeadlineAt: Date.now() + 1000 });
+      assert.equal(out.pct, null);
+      assert.equal(out.reason, 'dev_hold_unread');
+      assert.equal(out.detail, 'creator_empty_unconfirmed');
+    });
+    await test('bad creator account, missing creator and expired entry stay unread', async () => {
+      const bad = { getTokenAccountsByOwner: async () => ({ value: [{ account: tokenAccount(other, 0n) }] }) };
+      const out = await safety.checkCreatorHold(bad, candidate, supply, { entryDeadlineAt: Date.now() + 1000 });
+      assert.equal(out.pct, null);
+      assert.equal(out.detail, 'creator_account_invalid');
+      const noCreator = await safety.checkCreatorHold(bad, { mint: candidate.mint }, supply);
+      assert.equal(noCreator.detail, 'creator_address_missing');
+      let calls = 0;
+      const expired = await safety.checkCreatorHold({ getTokenAccountsByOwner: async () => { calls++; } },
+        candidate, supply, { entryDeadlineAt: Date.now() - 1 });
+      assert.equal(expired.detail, 'creator_read_deadline');
+      assert.equal(calls, 0);
+    });
+    await test('Token-2022 creator account extension still reads its validated owner and balance', async () => {
+      const data = Buffer.alloc(170);
+      mint.toBuffer().copy(data, 0); creator.toBuffer().copy(data, 32);
+      data.writeBigUInt64LE(15_000_000_000_000n, 64);
+      const token22 = { getTokenAccountsByOwner: async () => ({ value: [{ account: {
+        data, owner: safety.TOKEN_2022_PROGRAM,
+      } }] }) };
+      const out = await safety.checkCreatorHold(token22, candidate, supply);
+      assert.equal(out.pct, 1.5);
+      assert.equal(out.reason, null);
+    });
     await test('creator balance remains required; no eight-holder or owner-sample wait', async () => {
       creatorAvailable = false;
       assert.ok((await verdict()).reasons.includes('dev_hold_unread'));
