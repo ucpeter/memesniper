@@ -274,33 +274,90 @@ function openingDevBuyPct(candidate) {
   return amount >= 0 && amount <= PUMP_FUN_TOTAL_SUPPLY ? amount / PUMP_FUN_TOTAL_SUPPLY * 100 : null;
 }
 
-/** Read the creator's token accounts BY OWNER; unlike getTokenLargestAccounts,
- * this actually identifies the creator. Any unreadable result fails closed for
- * entries. More than one account may belong to the same creator. */
-async function checkCreatorHold(conn, candidate, supply) {
-  if (!candidate?.creator || !conn?.getTokenAccountsByOwner || !supply) {
-    return { pct: null, reason: 'dev_hold_unread' };
-  }
-  try {
-    const owner = new PublicKey(candidate.creator);
-    const mint = new PublicKey(candidate.mint);
-    const accounts = await conn.getTokenAccountsByOwner(owner, { mint }, 'confirmed');
-    if (!Array.isArray(accounts?.value)) return { pct: null, reason: 'dev_hold_unread' };
-    let held = 0n;
-    for (const a of accounts.value) {
-      const raw = a.account?.data;
-      const data = Buffer.isBuffer(raw) ? raw
-        : Array.isArray(raw) && raw[1] === 'base64' ? Buffer.from(raw[0], 'base64')
-        : raw instanceof Uint8Array ? Buffer.from(raw) : null;
-      if (!data || data.length < 72 || !data.subarray(0, 32).equals(mint.toBuffer()) ||
-          !data.subarray(32, 64).equals(owner.toBuffer())) return { pct: null, reason: 'dev_hold_unread' };
-      held += data.readBigUInt64LE(64);
+/** The create event can be visible at "processed" before an owner-index read
+ * at "confirmed" knows the new mint. Check both levels and retry inconclusive
+ * answers briefly. Empty accounts at processed do NOT prove a zero holding.
+ * Codes are deliberately safe to show: no RPC URL, response body or key.
+ */
+async function checkCreatorHold(conn, candidate, supply, { entryDeadlineAt } = {}) {
+  const unread = (detail) => ({ pct: null, reason: 'dev_hold_unread', detail });
+  if (!candidate?.creator) return unread('creator_address_missing');
+  if (!conn?.getTokenAccountsByOwner) return unread('creator_lookup_unavailable');
+  if (!supply || BigInt(supply) <= 0n) return unread('mint_supply_unavailable');
+
+  let owner, mint;
+  try { owner = new PublicKey(candidate.creator); mint = new PublicKey(candidate.mint); }
+  catch { return unread('creator_or_mint_invalid'); }
+  const stillTime = () => !Number.isFinite(entryDeadlineAt) || Date.now() < entryDeadlineAt;
+  let lastDetail = 'creator_lookup_unavailable';
+  let transportReason = null;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (const commitment of ['processed', 'confirmed']) {
+      if (!stillTime()) return unread('creator_read_deadline');
+      let accounts;
+      try {
+        accounts = await conn.getTokenAccountsByOwner(owner, { mint }, commitment);
+      } catch (err) {
+        lastDetail = isTransportError(err) ? 'creator_rpc_unavailable' : 'creator_lookup_failed';
+        if (isTransportError(err)) transportReason = `rpc_unavailable(${rpcFailureSummary(err)})`;
+        continue;
+      }
+      if (!Array.isArray(accounts?.value)) {
+        lastDetail = 'creator_response_invalid';
+        continue;
+      }
+      if (accounts.value.length === 0) {
+        // A node can know the launch at processed and return [] at confirmed
+        // while its confirmed mint is not there yet. Never mistake that for
+        // proof that the developer holds zero tokens.
+        if (commitment === 'confirmed' && typeof conn.getAccountInfo === 'function') {
+          try {
+            const confirmedMint = await conn.getAccountInfo(mint, 'confirmed');
+            if (confirmedMint?.data && parseMint(confirmedMint.data)?.supply > 0n) {
+              return { pct: 0, reason: null, detail: 'creator_zero_confirmed' };
+            }
+          } catch { /* cannot verify the empty response yet */ }
+        }
+        lastDetail = 'creator_empty_unconfirmed';
+        continue;
+      }
+      let held = 0n;
+      let valid = true;
+      for (const a of accounts.value) {
+        const raw = a.account?.data;
+        const data = Buffer.isBuffer(raw) ? raw
+          : Array.isArray(raw) && raw[1] === 'base64' ? Buffer.from(raw[0], 'base64')
+          : raw instanceof Uint8Array ? Buffer.from(raw) : null;
+        if (!data || data.length < 72 || !data.subarray(0, 32).equals(mint.toBuffer()) ||
+            !data.subarray(32, 64).equals(owner.toBuffer())) { valid = false; break; }
+        held += data.readBigUInt64LE(64);
+      }
+      if (!valid) { lastDetail = 'creator_account_invalid'; continue; }
+      // An account already indexed at processed can still have an old zero
+      // balance; wait for its confirmed state before accepting zero.
+      if (held === 0n && commitment === 'processed') {
+        lastDetail = 'creator_zero_unconfirmed';
+        continue;
+      }
+      return { pct: Number((held * 10000n) / BigInt(supply)) / 100,
+        reason: null, detail: `creator_read_${commitment}` };
     }
-    return { pct: Number((held * 10000n) / BigInt(supply)) / 100, reason: null };
-  } catch (err) {
-    return { pct: null, reason: isTransportError(err)
-      ? `rpc_unavailable(${rpcFailureSummary(err)})` : 'dev_hold_unread' };
+    // A transport failure has already walked the configured RPC endpoint
+    // chain. Repeating it here can make a stressed public endpoint worse.
+    if (lastDetail === 'creator_rpc_unavailable' && transportReason) {
+      return { pct: null, reason: transportReason, detail: lastDetail };
+    }
+    if (attempt === 0 && stillTime()) {
+      const wait = Number.isFinite(entryDeadlineAt) ? Math.min(180, entryDeadlineAt - Date.now() - 1) : 180;
+      if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    }
   }
+  // A transport error should remain an infrastructure error, never be blamed
+  // on the token. All other states fail closed with a precise safe detail.
+  return transportReason && lastDetail === 'creator_rpc_unavailable'
+    ? { pct: null, reason: transportReason, detail: lastDetail }
+    : unread(lastDetail);
 }
 
 /**
@@ -477,6 +534,7 @@ async function recon(candidate, ctx = {}) {
       devHoldPctFromEvent: openingDevBuyPct(candidate),
       progressPct: curveReport && curveReport.confidence !== 'INFRA' ? curveReport.progressPct ?? null : null,
       devHoldPct: creator.pct,
+      creatorReadDetail: creator.detail ?? null,
       largestHolderPct: distribution?.largestHolderPct ?? null,
       top10Pct: distribution && distribution.top10Pct !== undefined ? distribution.top10Pct : null,
       holderSample: distribution ? distribution.holderSample ?? null : null,
@@ -580,7 +638,7 @@ async function evaluate(candidate, cfg, ctx) {
     checkDistribution(conn, candidate.mint, bondingCurvePda(candidate.mint), supply,
       mintReport.tokenProgram === TOKEN_2022_PROGRAM.toBase58() ? TOKEN_2022_PROGRAM : TOKEN_PROGRAM),
     checkMetadata(candidate.mint, { blockCopycatNames: f.blockCopycatNames }),
-    checkCreatorHold(conn, candidate, supply),
+    checkCreatorHold(conn, candidate, supply, { entryDeadlineAt: ctx.entryDeadlineAt }),
   ]);
   const openingBuyPct = openingDevBuyPct(candidate);
   const devHoldPct = creator.pct;
@@ -630,7 +688,7 @@ async function evaluate(candidate, cfg, ctx) {
   }
 
   if (hardFails.length) {
-    return { ok: false, score: 0, reasons: [...hardFails, ...reasons], hard: true, report: { mintReport, curveReport, distribution, metadata, devHoldPct, openingBuyPct } };
+    return { ok: false, score: 0, reasons: [...hardFails, ...reasons], hard: true, report: { mintReport, curveReport, distribution, metadata, devHoldPct, openingBuyPct, creatorReadDetail: creator.detail } };
   }
 
   // Base score rewards a healthy curve with real liquidity.
@@ -641,7 +699,7 @@ async function evaluate(candidate, cfg, ctx) {
     score,
     reasons,
     hard: false,
-    report: { mintReport, curveReport, distribution, metadata, devHoldPct, openingBuyPct, honeypot },
+    report: { mintReport, curveReport, distribution, metadata, devHoldPct, openingBuyPct, honeypot, creatorReadDetail: creator.detail },
   };
 }
 

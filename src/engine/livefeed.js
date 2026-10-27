@@ -165,6 +165,7 @@ class LiveFeed {
         ? (buy / PUMP_FUN_TOTAL_SUPPLY) * 100
         : null, // opening buy only; not the current creator balance
       currentDevHoldPct: null,
+      creatorReadDetail: null,
       largestHolderPct: null,
       virtualLiquiditySol: Number.isFinite(candidate.vSolInBondingCurve) ? candidate.vSolInBondingCurve : null,
       virtualLiquidityUsd: null,
@@ -305,8 +306,10 @@ class LiveFeed {
       row.devHoldPct = r.devHoldPctFromEvent;
       row.facts.devHold = 'opening_buy_event';
     }
+    if (r.creatorReadDetail && row.currentDevHoldPct === null) row.creatorReadDetail = r.creatorReadDetail;
     if (r.devHoldPct !== undefined && r.devHoldPct !== null) {
       row.currentDevHoldPct = r.devHoldPct;
+      row.creatorReadDetail = r.creatorReadDetail || null;
       row.facts.currentDevHold = 'creator_onchain';
     }
     if (r.largestHolderPct !== undefined && r.largestHolderPct !== null) row.largestHolderPct = r.largestHolderPct;

@@ -180,7 +180,8 @@ class Trader {
       }
     }
     progress('Reading on-chain safety checks');
-    const verdict = await safety.evaluate(candidate, this.cfg, { conn: this.executor.conn(), config: g });
+    const verdict = await safety.evaluate(candidate, this.cfg, { conn: this.executor.conn(), config: g,
+      entryDeadlineAt: ctx?.entryDeadlineAt });
     // Publish what the checks actually found, pass or fail. The live scanner view
     // shows dev holdings, liquidity and honeypot risk per launch; without this a row
     // could only ever say "skipped", which is the least useful half of the story.
@@ -200,6 +201,7 @@ class Trader {
           liquiditySol: curveRep.liquiditySol ?? null,
           virtualLiquiditySol: curveRep.virtualLiquiditySol ?? null,
           devHoldPct: rep.devHoldPct ?? null,
+          creatorReadDetail: rep.creatorReadDetail ?? null,
           devHoldPctFromEvent: rep.openingBuyPct ?? null,
           largestHolderPct: dist.largestHolderPct ?? null,
           top10Pct: dist.top10Pct ?? null,
@@ -220,6 +222,10 @@ class Trader {
         log.warn(`RPC unavailable while evaluating ${candidate.symbol || candidate.mint.slice(0, 6)}: ${verdict.reasons.join(', ')} — check your RPC endpoint and rate limits`, { wallet: this.cfg.name });
         bus.safeEmit('token:skipped', { walletId: this.cfg.id, wallet: this.cfg.name, candidate, reasons: verdict.reasons, infra: true });
         return 'skip:rpc_unavailable';
+      }
+      if (verdict.report?.creatorReadDetail && verdict.report.devHoldPct == null) {
+        log.info(`Creator holding unread for ${candidate.symbol || candidate.mint.slice(0, 6)} [${candidate.mint}] · ${verdict.report.creatorReadDetail} · entry skipped`,
+          { wallet: this.cfg.name });
       }
       log.debug(`Filtered ${candidate.symbol || candidate.mint.slice(0, 6)} [${mintRef(candidate.mint)}]: ${verdict.reasons.join(', ')}`, { wallet: this.cfg.name });
       this.stats.skipped = (this.stats.skipped || 0) + 1;
