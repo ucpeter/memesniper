@@ -153,7 +153,7 @@ async function tickAt(trader, priceCache, mint, entryPrice, gainPct, extra = {})
     price: curve.spotPriceScaled(vSol, vTok),
     virtualSolReserves: vSol,
     virtualTokenReserves: vTok,
-    realSolReserves: vSol,
+    realSolReserves: extra.realSolReserves ?? vSol,
     complete: false,
     liquidityDropPct: extra.liquidityDropPct ?? 0,
     peakLiquiditySol: 30,
@@ -705,7 +705,8 @@ async function tick(trader, priceCache, gainPct, extra = {}) {
     const { trader, priceCache } = makeTrader('balanced');
     await trader.consider(CANDIDATE, { engine: ENGINE });
     const p = trader.openPositions()[0];
-    await tick(trader, priceCache, 5, { liquidityDropPct: 80 }); // balanced threshold = 55%
+    await tick(trader, priceCache, 0, { realSolReserves: 30_000_000_000n });
+    await tick(trader, priceCache, 5, { realSolReserves: 6_000_000_000n }); // observed 80% drop
     assert.strictEqual(p.status, 'CLOSED');
     assert.strictEqual(p.exitReason, 'liquidity_exit');
   });

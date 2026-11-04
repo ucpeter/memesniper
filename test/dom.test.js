@@ -1086,6 +1086,30 @@ async function click(window, el) {
     assert.doesNotMatch($('[data-wallet-open-rows]').textContent, /PRICE OLD/);
   });
 
+  await test('Trades shows per-position real-SOL exit proof, leg cost and LIVE estimate warning', async () => {
+    const { window, $ } = await bootDashboard({ wallets: 1 });
+    window.eval(`(function(){const w=S.wallets[0]; w.stats={wins:3,losses:15,realisedPnlSol:-1.498};
+      w.recentPositions=[{id:'liq_audit',walletId:w.id,status:'CLOSED',symbol:'EXIT',mint:'LIQ_MINT',
+        simulated:false,solSpent:'800000000',realisedSol:'790000000',exitReason:'liquidity_exit',
+        originalTokens:'1000000',priceGainPct:-6.3,peakGainPct:37.5,openedAt:1,closedAt:2000,
+        tiers:[{gainPct:20,sellPct:15}],exits:[
+          {tier:0,pctSold:15,tokensSold:'150000',solReceived:'144000000',reason:'tp_20pct',proceedsSource:'live_wallet_delta'},
+          {tier:null,pctSold:85,tokensSold:'850000',solReceived:'646000000',reason:'liquidity_exit',
+            proceedsSource:'live_curve_estimate',liquidity:{peakLamports:'10000000000',
+              currentLamports:'4000000000',dropPct:60,thresholdPct:55,observedAt:Date.now(),slot:123}}
+        ]}]; openWalletDetail(w.id);})();`);
+    const text = $('[data-wallet-closed-rows]').textContent;
+    assert.match(text, /Observed real SOL: 4\.000 · position peak 10\.000 · drop 60\.0% \/ saved trigger 55\.0%/);
+    assert.match(text, /slot 123/);
+    assert.match(text, /tp_20pct: 15\.0% of original/);
+    assert.match(text, /leg net 0\.02400/);
+    assert.match(text, /LIVE ESTIMATE · chain fill unread/);
+    assert.match(text, /not chain-verified/);
+    const stats = $('#modalRoot .wallet-stats').textContent;
+    assert.match(stats, /Closed · total/);
+    assert.match(stats, /Realised · today UTC/);
+  });
+
   await test('Trades shows 20 whole launch rows before inner scrolling; collapse exposes full trade sections', async () => {
     const { window, $ } = await bootDashboard({ wallets: 2 });
     window.eval(`S.scanFeed = Array.from({length: 55}, (_, i) => ({
