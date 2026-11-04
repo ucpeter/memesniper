@@ -3419,7 +3419,7 @@ function renderOverall() {
             <th class="num" title="Positions that have CLOSED — won or lost. Open ones are counted in the last column, not here.">Closed</th>
             <th class="num">Won</th><th class="num">Lost</th>
             <th class="num" title="Wins as a share of closed trades — every wallet combined in the totals row.">Win rate</th>
-            <th class="num">Realised</th><th class="num">Open</th>
+            <th class="num" title="Realised P&L for the current UTC day; closed/win/loss counts are cumulative.">Realised · today UTC</th><th class="num">Open</th>
           </tr></thead>
           <tbody>
             ${ws.map((w) => {
@@ -3510,7 +3510,7 @@ function renderStats() {
       cls(totalPnl), cls(totalPnl) === 'pos' ? 'accent' : cls(totalPnl) === 'neg' ? 'red' : ''],
     [dry ? 'Unrealised · paper' : 'Unrealised', `${fmtSol(unrealised)} SOL`,
       [usdOf(unrealised), `${open.length} open${dry ? ' · simulated' : ''}`].filter(Boolean).join(' · '), cls(unrealised), 'blue'],
-    ['Win rate', wins + losses ? `${winRate.toFixed(1)}%` : '—', `${wins}W / ${losses}L${dry ? ' · paper' : ''}`, winRate >= 50 ? 'pos' : 'dim', ''],
+    ['Win rate · total', wins + losses ? `${winRate.toFixed(1)}%` : '—', `${wins}W / ${losses}L${dry ? ' · paper' : ''}`, winRate >= 50 ? 'pos' : 'dim', ''],
     [dry ? 'Exposure · paper' : 'Exposure', `${fmtSol(exposure, 2)} SOL`,
       [usdOf(exposure), dry ? 'simulated positions' : 'of ' + fmtSol(realBalance, 2) + ' balance'].filter(Boolean).join(' · '), 'dim', 'amber'],
     ['Tokens scanned', detected.toLocaleString(),
@@ -3714,8 +3714,8 @@ function renderWallets() {
           <div class="wstat-sub">${w.balanceSol === null || w.balanceSol === undefined ? 'on chain' : `${usdOf(w.balanceSol)} on chain`}</div>
         </div>
         <div class="wstat"><div class="wstat-k" title="Tokens this wallet BOUGHT. Won and lost are the ones that have CLOSED — a position still open counts as bought and nothing else yet.">Bought</div><div class="wstat-v">${st.bought || 0}</div><div class="wstat-sub">${(st.wins || 0)}W / ${(st.losses || 0)}L</div></div>
-        <div class="wstat"><div class="wstat-k">Realised</div><div class="wstat-v ${cls(pnl)}" title="Profit and loss booked from CLOSED trades on this wallet.">${fmtSol(pnl, 3)}</div><div class="wstat-sub">${usdOf(pnl)} · ${(st.wins || 0)}W / ${(st.losses || 0)}L</div></div>
-        <div class="wstat"><div class="wstat-k">Win rate</div><div class="wstat-v">${(st.wins || 0) + (st.losses || 0) ? `${winRateOf(st).toFixed(0)}%` : '—'}</div><div class="wstat-sub">closed trades</div></div>
+        <div class="wstat"><div class="wstat-k">Realised · today UTC</div><div class="wstat-v ${cls(pnl)}" title="Profit and loss booked today UTC from closed positions. Won/lost counts are cumulative, not only today.">${fmtSol(pnl, 3)}</div><div class="wstat-sub">${usdOf(pnl)} · ${(st.wins || 0)}W / ${(st.losses || 0)}L total</div></div>
+        <div class="wstat"><div class="wstat-k">Win rate · total</div><div class="wstat-v">${(st.wins || 0) + (st.losses || 0) ? `${winRateOf(st).toFixed(0)}%` : '—'}</div><div class="wstat-sub">closed trades</div></div>
         <div class="wstat"><div class="wstat-k">Open</div><div class="wstat-v">${open.length}/${cfg.buy?.maxConcurrentPositions ?? '—'}</div></div>
       </div>
 
@@ -4032,6 +4032,36 @@ function tierFillSummary(p) {
   }).join(' · ');
 }
 
+/** Transparent per-leg cost basis and provenance, not a second win counter. */
+function exitLegsDetail(p) {
+  const spent = Number(p.solSpent) / 1e9;
+  const original = Number(p.originalTokens);
+  return (p.exits || []).map((x) => {
+    const fraction = original > 0 && Number.isFinite(Number(x.tokensSold))
+      ? Number(x.tokensSold) / original : Number(x.pctSold || 0) / 100;
+    const received = Number(x.solReceived) / 1e9;
+    const cost = spent * fraction;
+    const type = x.proceedsSource === 'live_wallet_delta' ? 'observed wallet SOL change (fees/tips/rent included)'
+      : x.proceedsSource === 'live_curve_estimate' ? 'LIVE ESTIMATE · chain fill unread'
+      : x.proceedsSource === 'paper_curve_quote' ? 'SIM estimate' : 'source unverified (older record)';
+    if (!Number.isFinite(received) || !Number.isFinite(cost)) return '';
+    const entryCaveat = !p.simulated && p.meta?.entrySource !== 'live_wallet_delta'
+      ? ' · entry cost unverified' : '';
+    return `<div class="mute" style="font-size:10px">${esc(x.reason || 'exit')}: ${esc((fraction * 100).toFixed(1))}% of original · received ${esc(fmtSol(received, 5))} · allocated cost ${esc(fmtSol(cost, 5))} · leg net ${esc(fmtSol(received - cost, 5))} · ${esc(type)}${entryCaveat}</div>`;
+  }).join('');
+}
+
+function liquidityEvidence(p) {
+  const x = [...(p.exits || [])].reverse().find((e) => e.reason === 'liquidity_exit');
+  if (!x) return '';
+  const l = x.liquidity;
+  if (!l || !/^\d+$/.test(String(l.peakLamports)) || !/^\d+$/.test(String(l.currentLamports))) {
+    return '<div class="mute" style="font-size:10px">Real-SOL exit readings unavailable for this older trade.</div>';
+  }
+  const time = Number(l.observedAt) > 0 ? new Date(Number(l.observedAt)).toLocaleTimeString() : 'unknown';
+  return `<div class="mute" style="font-size:10px">Observed real SOL: ${esc((Number(l.currentLamports) / 1e9).toFixed(3))} · position peak ${esc((Number(l.peakLamports) / 1e9).toFixed(3))} · drop ${esc(Number(l.dropPct).toFixed(1))}% / saved trigger ${esc(Number(l.thresholdPct).toFixed(1))}% · read ${esc(time)} · slot ${l.slot == null ? 'unavailable' : esc(String(l.slot))}</div>`;
+}
+
 /** Both the initial modal and subsequent heartbeats use exactly these rows.
  * Replacing only changed sections leaves the modal body/scrollbar untouched. */
 function walletDetailRows(w, open, closed) {
@@ -4057,6 +4087,7 @@ function walletDetailRows(w, open, closed) {
             <td class="num">${esc(val.toFixed(3))}</td>
             <td class="num ${cls(p.pnlPct ?? 0)}"><b>${fmtPct(p.pnlPct ?? 0)}</b><div class="mute" style="font-size:10px">${fmtSol(p.pnlSol, 4)}</div>
               <div class="mute" style="font-size:10px">spot ${fmtPct(p.priceGainPct ?? 0)} · peak ${fmtPct(p.peakGainPct ?? 0)} · stop trigger ${p.stopLevelPct == null ? '—' : fmtPct(p.stopLevelPct)}</div>
+              ${p.lastLiquidityObservation ? `<div class="mute" style="font-size:10px">Observed real SOL: ${(Number(p.lastLiquidityObservation.currentLamports) / 1e9).toFixed(3)} · position peak ${(Number(p.lastLiquidityObservation.peakLamports) / 1e9).toFixed(3)} · drop ${Number(p.lastLiquidityObservation.dropPct).toFixed(1)}% / saved trigger ${Number(p.lastLiquidityObservation.thresholdPct).toFixed(1)}%</div>` : ''}
               ${oldMark ? '<div class="mark-stale" style="font-size:10px">OLD MARK · not live</div>' : ''}</td>
             <td><button class="btn btn-sm btn-danger" data-exit="${esc(p.id)}">⛔ Kill</button></td>
           </tr>`;
@@ -4069,14 +4100,17 @@ function walletDetailRows(w, open, closed) {
           const spent = Number(p.solSpent) / 1e9;
           const returned = Number(p.realisedSol || 0) / 1e9;
           const pnl = returned - spent;
+          const liveEstimate = !p.simulated && (p.meta?.entrySource !== 'live_wallet_delta' ||
+            (p.exits || []).some((x) => x.proceedsSource !== 'live_wallet_delta'));
           return `<tr>
             <td class="sym">${esc(p.symbol || short(p.mint, 4))}${p.simulated ? '<span class="badge sim">SIM</span>' : ''}<div class="mute" style="font-size:10px;font-weight:400">${esc(short(p.mint, 5))}</div></td>
             <td class="num">${esc(spent.toFixed(3))}</td>
-            <td class="num">${esc(returned.toFixed(3))}</td>
-            <td class="num ${cls(pnl)}"><b>${fmtSol(pnl, 4)}</b></td>
+            <td class="num">${esc(returned.toFixed(3))}${liveEstimate ? '<div class="mark-stale" style="font-size:10px">⚠ estimate / unverified</div>' : ''}</td>
+            <td class="num ${cls(pnl)}"><b>${fmtSol(pnl, 4)}</b>${liveEstimate ? '<div class="mark-stale" style="font-size:10px">not chain-verified</div>' : ''}</td>
             <td><span class="badge ${pnl >= 0 ? 'won' : 'lost'}">${esc(p.exitReason || '—')}</span>
               <div class="mute" style="font-size:10px">${esc(tierFillSummary(p))}</div>
-              <div class="mute" style="font-size:10px">peak ${fmtPct(p.peakGainPct ?? 0)} · final spot ${fmtPct(p.priceGainPct ?? 0)}</div></td>
+              <div class="mute" style="font-size:10px">peak ${fmtPct(p.peakGainPct ?? 0)} · final spot ${fmtPct(p.priceGainPct ?? 0)}</div>
+              ${liquidityEvidence(p)}${exitLegsDetail(p)}</td>
             <td class="num">${esc(fmtAge(p.closedAt && p.openedAt ? p.closedAt - p.openedAt : 0))}</td>
           </tr>`;
         }).join('')}</tbody></table>`
@@ -4144,11 +4178,11 @@ function openWalletDetail(walletId) {
       </div>
       <div class="modal-body">
         <div class="wallet-stats" style="grid-template-columns:repeat(6,1fr)">
-          ${stat('Trades', String((st.wins || 0) + (st.losses || 0)))}
-          ${stat('Won', String(st.wins || 0), 'pos')}
-          ${stat('Lost', String(st.losses || 0), 'neg')}
-          ${stat('Win rate', (st.wins || 0) + (st.losses || 0) ? `${winRateOf(st).toFixed(0)}%` : '—')}
-          ${stat('Realised', `${fmtSol(st.realisedPnlSol || 0, 3)}${usdOf(st.realisedPnlSol || 0) ? ` · ${usdOf(st.realisedPnlSol || 0)}` : ''}`, cls(st.realisedPnlSol || 0))}
+          ${stat('Closed · total', String((st.wins || 0) + (st.losses || 0)))}
+          ${stat('Won · total', String(st.wins || 0), 'pos')}
+          ${stat('Lost · total', String(st.losses || 0), 'neg')}
+          ${stat('Win % · total', (st.wins || 0) + (st.losses || 0) ? `${winRateOf(st).toFixed(0)}%` : '—')}
+          ${stat('Realised · today UTC', `${fmtSol(st.realisedPnlSol || 0, 3)}${usdOf(st.realisedPnlSol || 0) ? ` · ${usdOf(st.realisedPnlSol || 0)}` : ''}`, cls(st.realisedPnlSol || 0))}
           ${stat('Real balance', `${fmtSol(w.balanceSol, 3)} SOL${usdOf(w.balanceSol) ? ` · ${usdOf(w.balanceSol)}` : ''}`)}
         </div>
 
@@ -4167,7 +4201,7 @@ function openWalletDetail(walletId) {
         <div class="tbl-wrap" data-wallet-open-rows>${openRows}</div>
 
         <div class="section-label">Trade history (<span data-wallet-closed-count>${closed.length}</span>)</div>
-        <div class="hint">Spent and Returned are SOL; P&amp;L is returned minus spent. The Exit badge names the <b>last</b> sell rule; any TP fills listed below it happened earlier. Final spot may be below a break-even/trailing trigger after a price gap. <b>Time held</b> is the duration from buy to final sale, not the share of tokens remaining. SIM figures are paper estimates, not real proceeds.</div>
+        <div class="hint">Spent and Returned are SOL; whole-position P&amp;L is all recorded sale amounts minus original spend. Each leg below allocates original cost by the fraction of original tokens sold; a winning partial can coexist with a losing whole position. The Exit badge names the <b>last</b> sell rule, not the whole-trade outcome. Final spot can gap past a break-even/trailing trigger. For LIQUIDITY_EXIT, the saved real-SOL trigger readings are shown when available; this is not the $ entry floor. SIM amounts are paper estimates. LIVE wallet-delta amounts include transaction fees/tips/rent; LIVE ESTIMATE means the chain fill was unread and the displayed P&amp;L is not verified.</div>
         <div class="tbl-wrap" data-wallet-closed-rows>${closedRows}</div>
 
         <div class="notice info" style="margin-top:14px"><span class="ico">ℹ</span><div>
