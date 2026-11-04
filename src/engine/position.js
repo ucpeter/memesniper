@@ -59,6 +59,10 @@ class Position {
     // Dry-run only: hypothetical change to virtual reserves caused by this
     // position's paper fills. Absent for LIVE and for pre-r32 paper positions.
     this.paperCurve = null;
+    // Per-position observed on-chain real SOL peak; never shared across wallets
+    // or with another trade in the same mint. Null = baseline not yet observed.
+    this.realLiquidityPeakLamports = null;
+    this.lastLiquidityObservation = null;
     this.closeTxSignature = null;
     this.exitReason = null;
   }
@@ -85,6 +89,8 @@ class Position {
       realisedSol: this.realisedSol.toString(),
       realisedTokens: this.realisedTokens.toString(),
       paperCurve: this.paperCurve,
+      realLiquidityPeakLamports: this.realLiquidityPeakLamports,
+      lastLiquidityObservation: this.lastLiquidityObservation,
       entryTxSignature: this.entryTxSignature,
       tiers: this.tiers,
       exits: this.exits,
@@ -110,6 +116,12 @@ class Position {
         /^-?\d+$/.test(s.paperCurve.tokenDelta || '')) {
       p.paperCurve = { version: 1, solDelta: s.paperCurve.solDelta,
         tokenDelta: s.paperCurve.tokenDelta };
+    }
+    if (s.realLiquidityPeakLamports != null && /^\d+$/.test(String(s.realLiquidityPeakLamports))) {
+      p.realLiquidityPeakLamports = String(s.realLiquidityPeakLamports);
+    }
+    if (s.lastLiquidityObservation && typeof s.lastLiquidityObservation === 'object') {
+      p.lastLiquidityObservation = s.lastLiquidityObservation;
     }
     if (Array.isArray(s.tiers)) p.tiers = s.tiers;
     if (Array.isArray(s.exits)) p.exits = s.exits;
@@ -162,13 +174,15 @@ class Position {
     this.lastUpdated = ts;
   }
 
-  recordExit({ pctSold, tokensSold, solReceived, reason, tier = null, signature = null }) {
+  recordExit({ pctSold, tokensSold, solReceived, reason, tier = null, signature = null,
+    liquidity = null, proceedsSource = null }) {
     this.realisedSol += BigInt(solReceived);
     this.realisedTokens += BigInt(tokensSold);
     this.tokensHeld -= BigInt(tokensSold);
     if (this.tokensHeld < 0n) this.tokensHeld = 0n;
 
-    this.exits.push({ ts: Date.now(), pctSold, reason, tier, solReceived: solReceived.toString(), signature });
+    this.exits.push({ ts: Date.now(), pctSold, tokensSold: tokensSold.toString(), reason, tier,
+      solReceived: solReceived.toString(), proceedsSource, liquidity, signature });
 
     if (this.tokensHeld === 0n) {
       this.status = 'CLOSED';
@@ -212,6 +226,8 @@ class Position {
       lastUpdated: this.lastUpdated,
       markFreshnessMs: Math.max(5000, Number(process.env.PRICE_POLL_MS || 1200) * 3),
       paperCurveModel: this.paperCurve ? 'counterfactual-v1' : null,
+      realLiquidityPeakLamports: this.realLiquidityPeakLamports,
+      lastLiquidityObservation: this.lastLiquidityObservation,
       tiers: this.tiers,
       exits: this.exits,
       entryTxSignature: this.entryTxSignature,

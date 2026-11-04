@@ -37,6 +37,7 @@ const configStore = require('../config');
  * keystore this file holds no secrets — only mints, sizes and cost basis.
  */
 const POSITIONS_PATH = path.join(configStore.DATA_DIR, 'positions.json');
+const CLOSED_HISTORY_PATH = path.join(configStore.DATA_DIR, 'closed-positions.json');
 
 const providers = {
   pumpportal: require('./providers/pumpportal'),
@@ -71,7 +72,7 @@ class Engine {
      * column looked alive and meant nothing — which is a worse failure than the
      * blank cell it replaced, because a blank cell is visibly missing. */
     this.liveFeed = new LiveFeed({ globalConfig: () => this.config.global }).attach();
-    this.priceCache = new Map(); // mint -> { price, virtualSolReserves, virtualTokenReserves, ts, liquidityDropPct, initialLiquiditySol }
+    this.priceCache = new Map(); // mint -> latest verified observed curve reserves and price (no shared exit peak)
     this.running = false;
     this.priceTimer = null;
     this.priceHealth = { ok: true, consecutiveFailures: 0, lastOkAt: 0, lastError: null, suppressedSince: 0 };
@@ -89,6 +90,15 @@ class Engine {
     this._lockedBalances = new Map();
     this._unresolved = {}; // snapshots for wallets whose keys are not loaded yet
     this._persistedAt = 0;
+    // Preserve the last 200 closed-position evidence rows through a restart.
+    // These contain public trade metadata only, never a private key.
+    this.closedHistory = [];
+    try {
+      const saved = JSON.parse(fs.readFileSync(CLOSED_HISTORY_PATH, 'utf8'));
+      if (Array.isArray(saved)) this.closedHistory = saved.filter((p) => p?.id && p?.walletId).slice(-200);
+    } catch (err) {
+      if (err.code !== 'ENOENT') log.warn(`Could not read closed-position history: ${err.message}`);
+    }
   }
 
   /* ------------------------------ lifecycle ------------------------------ */
@@ -104,6 +114,7 @@ class Engine {
   start() {
     if (this.running) return;
     this.running = true;
+    this._pricePollGeneration = (this._pricePollGeneration || 0) + 1;
     this.stats.startedAt = Date.now();
 
     const missing = this.config.wallets.filter((c) => !this.keystore.has(c.id));
@@ -129,9 +140,13 @@ class Engine {
 
   stop() {
     this.running = false;
+    // Invalidate any pending RPC reply before a later Start; it must not
+    // update the price cache or submit exits after Stop/restart.
+    this._pricePollGeneration = (this._pricePollGeneration || 0) + 1;
+    this._pricePollBusy = false;
     // Stop wallet evaluation, not the public launch stream.
     // The live home feed stays connected even after an engine stop.
-    if (this.priceTimer) clearInterval(this.priceTimer);
+    if (this.priceTimer) { clearInterval(this.priceTimer); this.priceTimer = null; }
     if (this._priceTimer) { clearInterval(this._priceTimer); this._priceTimer = null; }
     log.info('Wallet evaluation stopped; launch feed still running');
     bus.safeEmit('engine:status', this.status());
@@ -334,85 +349,103 @@ class Engine {
   }
 
   _startPricePoller() {
+    const generation = this._pricePollGeneration || 0;
     const tick = async () => {
-      if (!this.running) return;
-      const mints = new Set();
-      for (const t of this.traders.values()) {
-        for (const p of t.openPositions()) mints.add(p.mint);
-      }
-      if (mints.size === 0) return;
-
+      // Keep a single outstanding RPC read. setInterval does not wait for
+      // async callbacks; an old reply must not replace a newer observation.
+      // Do not block reads while a LIVE sell confirms (see below).
+      if (!this.running || this._pricePollBusy || generation !== (this._pricePollGeneration || 0)) return;
+      this._pricePollBusy = true;
       try {
-        const mintList = [...mints];
-        const pdas = mintList.map((m) => safety.bondingCurvePda(m));
-        const conn = this.executor.conn();
-        const infos = await conn.getMultipleAccountsInfo(pdas, 'confirmed');
-
-        infos.forEach((info, i) => {
-          const mint = mintList[i];
-          const parsed = info ? safety.parseBondingCurve(info.data) : null;
-          if (!parsed) {
-            // The cache may contain a mark from the immediately preceding
-            // batch (well under the age TTL). Invalidate its freshness now,
-            // otherwise this missing account is incorrectly re-evaluated as a
-            // successful new tick. Retain reserves/peak only for diagnostics.
-            const prev = this.priceCache.get(mint);
-            if (prev) this.priceCache.set(mint, { ...prev, ts: 0 });
-            return;
-          }
-
-          const price = curve.spotPriceScaled(parsed.virtualSolReserves, parsed.virtualTokenReserves);
-          const liquiditySol = Number(parsed.realSolReserves) / 1e9;
-
-          const prev = this.priceCache.get(mint);
-          const peakLiquidity = prev ? Math.max(prev.peakLiquiditySol ?? 0, liquiditySol) : liquiditySol;
-          const liquidityDropPct = peakLiquidity > 0
-            ? Math.max(0, ((peakLiquidity - liquiditySol) / peakLiquidity) * 100)
-            : 0;
-
-          this.priceCache.set(mint, {
-            price,
-            virtualSolReserves: parsed.virtualSolReserves,
-            virtualTokenReserves: parsed.virtualTokenReserves,
-            realSolReserves: parsed.realSolReserves,
-            complete: parsed.complete,
-            liquidityDropPct,
-            peakLiquiditySol: peakLiquidity,
-            ts: Date.now(),
-          });
-        });
-
-        // Fan out to each wallet's independent risk engine.
-        await Promise.all([...this.traders.values()].map((t) => t.manage({ engine: this })));
-        bus.safeEmit('prices:updated', mintList.length);
-      } catch (err) {
-        const h = this.priceHealth;
-        h.consecutiveFailures += 1;
-        h.ok = false;
-        h.lastError = err.message;
-
-        // The price feed is the ONLY thing that can trigger an exit. If it dies,
-        // every open position becomes unmanaged — so this must never be a silent
-        // debug line the operator never sees. Warn on the way down, then at most
-        // once every 30s so a broken RPC cannot flood the console.
-        const now = Date.now();
-        if (h.consecutiveFailures === 3 || now - h.suppressedSince > 30000) {
-          h.suppressedSince = now;
-          log.warn(
-            `⚠ PRICE FEED DOWN (${h.consecutiveFailures} consecutive failures) — open positions are NOT being marked to market and exits are SUSPENDED. Last error: ${err.message.slice(0, 80)}`,
-          );
+        const mints = new Set();
+        for (const t of this.traders.values()) {
+          for (const p of t.openPositions()) mints.add(p.mint);
         }
-        // Back off instead of hammering an endpoint that is rate-limiting us.
-        await new Promise((r) => setTimeout(r, Math.min(15000, 1000 * h.consecutiveFailures)));
-        return;
-      }
+        if (mints.size === 0) return;
 
-      if (this.priceHealth.consecutiveFailures > 0) {
-        log.info(`Price feed recovered after ${this.priceHealth.consecutiveFailures} failure(s)`);
+        try {
+          const mintList = [...mints];
+          const pdas = mintList.map((m) => safety.bondingCurvePda(m));
+          const conn = this.executor.conn();
+          const batch = typeof conn.getMultipleAccountsInfoAndContext === 'function'
+            ? await conn.getMultipleAccountsInfoAndContext(pdas, 'confirmed')
+            : { value: await conn.getMultipleAccountsInfo(pdas, 'confirmed'), context: null };
+          if (!this.running || generation !== (this._pricePollGeneration || 0)) return;
+          const infos = batch.value;
+          const slot = Number.isSafeInteger(batch.context?.slot) ? batch.context.slot : null;
+
+          infos.forEach((info, i) => {
+            const old = this.priceCache.get(mintList[i]);
+            if (slot !== null && Number.isSafeInteger(old?.slot) && slot < old.slot) {
+              // A sequential read can still return an older chain view after
+              // a newer one (e.g. a read failover). Never roll back the mark.
+              return;
+            }
+            const mint = mintList[i];
+            const parsed = info ? safety.parseBondingCurve(info.data) : null;
+            if (!parsed) {
+              // The cache may contain a mark from the immediately preceding
+              // batch (well under the age TTL). Invalidate its freshness now,
+              // otherwise this missing account is incorrectly re-evaluated as a
+              // successful new tick. Retain old reserves only for diagnostics.
+              const prev = this.priceCache.get(mint);
+              if (prev) this.priceCache.set(mint, { ...prev, ts: 0 });
+              return;
+            }
+
+            const price = curve.spotPriceScaled(parsed.virtualSolReserves, parsed.virtualTokenReserves);
+            // Shared cache contains only this observed reserve. Position-specific
+            // historical peaks belong to Trader/Position, never to a mint key.
+            this.priceCache.set(mint, {
+              price,
+              virtualSolReserves: parsed.virtualSolReserves,
+              virtualTokenReserves: parsed.virtualTokenReserves,
+              realSolReserves: parsed.realSolReserves,
+              complete: parsed.complete,
+              slot,
+              ts: Date.now(),
+            });
+          });
+
+          // Release the read lock after cache update, NOT after a LIVE sell.
+          // Confirmation may take many seconds; freezing reads would also
+          // suspend every other wallet's price exits. Individual positions
+          // have their own in-flight sell guard in Trader.
+          void Promise.all([...this.traders.values()].map((t) => t.manage({ engine: this })))
+            .then(() => bus.safeEmit('prices:updated', mintList.length))
+            .catch((err) => log.warn(`Risk management pass failed: ${err.message}`));
+        } catch (err) {
+          const h = this.priceHealth;
+          h.consecutiveFailures += 1;
+          h.ok = false;
+          h.lastError = err.message;
+
+          // The price feed is the ONLY thing that can trigger an exit. If it dies,
+          // every open position becomes unmanaged — so this must never be a silent
+          // debug line the operator never sees. Warn on the way down, then at most
+          // once every 30s so a broken RPC cannot flood the console.
+          const now = Date.now();
+          if (h.consecutiveFailures === 3 || now - h.suppressedSince > 30000) {
+            h.suppressedSince = now;
+            log.warn(
+              `⚠ PRICE FEED DOWN (${h.consecutiveFailures} consecutive failures) — open positions are NOT being marked to market and exits are SUSPENDED. Last error: ${err.message.slice(0, 80)}`,
+            );
+          }
+          // Back off instead of hammering an endpoint that is rate-limiting us.
+          await new Promise((r) => setTimeout(r, Math.min(15000, 1000 * h.consecutiveFailures)));
+          return;
+        }
+
+        if (this.priceHealth.consecutiveFailures > 0) {
+          log.info(`Price feed recovered after ${this.priceHealth.consecutiveFailures} failure(s)`);
+        }
+        this.priceHealth.consecutiveFailures = 0;
+        this.priceHealth.ok = true;
+        this.priceHealth.lastOkAt = Date.now();
+      } finally {
+        // A stopped generation must not unlock a newer generation's poll.
+        if (generation === (this._pricePollGeneration || 0)) this._pricePollBusy = false;
       }
-      this.priceHealth.consecutiveFailures = 0;
-      this.priceHealth.ok = true;
-      this.priceHealth.lastOkAt = Date.now();
     };
 
     this.priceTimer = setInterval(tick, PRICE_POLL_INTERVAL);
@@ -495,6 +528,25 @@ class Engine {
       this.persistPositions();
     }, 750);
     if (this._persistTimer.unref) this._persistTimer.unref();
+  }
+
+  /** Store a bounded, restart-safe closed history for audit evidence. */
+  _recordClosedPosition(position) {
+    if (!position?.id || this.traders.get(position.walletId)?.positions.get(position.id) !== position) return;
+    this.closedHistory = this.closedHistory.filter((p) => p.id !== position.id);
+    this.closedHistory.push(position.toJSON());
+    this.closedHistory = this.closedHistory.slice(-200);
+    const trader = this.traders.get(position.walletId);
+    trader.closedHistory = this.closedHistory.filter((p) => p.walletId === position.walletId);
+    try {
+      fs.mkdirSync(configStore.DATA_DIR, { recursive: true, mode: 0o700 });
+      const tmp = `${CLOSED_HISTORY_PATH}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(this.closedHistory,
+        (_key, value) => typeof value === 'bigint' ? value.toString() : value, 2), { mode: 0o600 });
+      fs.renameSync(tmp, CLOSED_HISTORY_PATH);
+    } catch (err) {
+      log.warn(`Could not save closed-position history: ${err.message}`);
+    }
   }
 
   /**
@@ -620,6 +672,7 @@ class Engine {
         priceCache: this.priceCache,
       });
       trader.init();
+      trader.closedHistory = this.closedHistory.filter((p) => p.walletId === cfg.id);
       this.traders.set(cfg.id, trader);
       added += 1;
     }
@@ -631,6 +684,7 @@ class Engine {
       bus.on('position:opened', hook);
       bus.on('position:updated', hook);
       bus.on('position:closed', hook);
+      bus.on('position:closed', (position) => this._recordClosedPosition(position));
     }
 
     if (added) {
@@ -703,7 +757,7 @@ class Engine {
           pauseReason: cfg.stats.pauseReason || null,
         } : null,
         openPositions: [],
-        recentPositions: [],
+        recentPositions: this.closedHistory.filter((p) => p.walletId === cfg.id).slice(-25).reverse(),
         lastEntryAt: null,
       }));
   }
@@ -728,6 +782,7 @@ class Engine {
       priceCache: this.priceCache,
     });
     trader.init();
+    trader.closedHistory = this.closedHistory.filter((p) => p.walletId === cfg.id);
     this.traders.set(cfg.id, trader);
     if (this.running) trader.refreshBalance().catch(() => {});
     return trader;

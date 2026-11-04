@@ -352,9 +352,16 @@ class Trader {
       // Actual fill: in live mode read it from chain, otherwise use the curve estimate.
       let tokensHeld = expectedTokens;
       let solSpent = solLamports;
+      let entrySource = buyWasPaper ? 'paper_curve_quote' : 'live_curve_estimate';
       if (!this.executor.dryRun && result.signature) {
         const fill = await this._readFill(result.signature, mint, this.publicKey);
-        if (fill) { tokensHeld = fill.tokensOut; solSpent = fill.solIn; }
+        if (fill && fill.tokensOut > 0n && fill.solIn > 0n) {
+          tokensHeld = fill.tokensOut; solSpent = fill.solIn;
+          entrySource = 'live_wallet_delta';
+        } else {
+          log.warn(`LIVE buy ${result.signature} confirmed, but actual entry size/cost unread; position uses an ESTIMATE until independently reconciled`,
+            { wallet: this.cfg.name });
+        }
       }
 
       const entryPrice = (solSpent * 1_000_000n) / (tokensHeld === 0n ? 1n : tokensHeld);
@@ -377,6 +384,7 @@ class Trader {
           devHoldPct: report?.devHoldPct ?? null,
           detectedAt: candidate.detectedAt,
           source: candidate.source,
+          entrySource,
           // Recorded at fill time, not read from the current mode: a paper trade
           // stays a paper trade after you switch to live, and a real one is
           // never relabelled as simulated by a later switch.
@@ -395,6 +403,15 @@ class Trader {
           solDelta: ((solLamports * 9900n) / 10000n).toString(),
           tokenDelta: (-tokensHeld).toString(),
         };
+      }
+
+      // Entry-time on-chain real SOL from the safety read is the position's
+      // OWN liquidity baseline. A LIVE buy can raise this at the next poll;
+      // a paper buy cannot. Legacy positions start at their first fresh poll.
+      const entryRealSol = Number(report?.curveReport?.liquiditySol);
+      if (report?.curveReport?.liquiditySol != null &&
+          Number.isFinite(entryRealSol) && entryRealSol >= 0) {
+        position.realLiquidityPeakLamports = String(Math.round(entryRealSol * 1e9));
       }
 
       // Seed the tier state machine so partials are tracked per position.
@@ -445,6 +462,36 @@ class Trader {
     }
   }
 
+  /** Net SOL change for this wallet in a confirmed LIVE sell transaction.
+   * Includes network/priority fees, tips and rent refunds: unlike a curve
+   * quote, this is the economic SOL change the wallet actually experienced.
+   * A confirmed signature can appear in status before transaction detail is
+   * readable; retry briefly, then mark the quote as ESTIMATED, not observed.
+   */
+  async _readSellWalletDelta(signature) {
+    if (!signature || !this.publicKey || typeof this.executor.conn !== 'function') return null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const conn = this.executor.conn();
+        if (typeof conn.getParsedTransaction !== 'function') return null;
+        const tx = await conn.getParsedTransaction(signature, {
+          maxSupportedTransactionVersion: 0, commitment: 'confirmed',
+        });
+        if (tx?.meta && !tx.meta.err) {
+          const keys = tx.transaction.message.accountKeys.map((key) =>
+            typeof key.pubkey === 'string' ? key.pubkey : key.pubkey.toBase58());
+          const i = keys.indexOf(this.publicKey);
+          if (i >= 0 && Number.isSafeInteger(tx.meta.preBalances[i]) &&
+              Number.isSafeInteger(tx.meta.postBalances[i])) {
+            return BigInt(tx.meta.postBalances[i]) - BigInt(tx.meta.preBalances[i]);
+          }
+        }
+      } catch { /* retry briefly; a failed RPC read is not a zero-SOL fill */ }
+      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 350));
+    }
+    return null;
+  }
+
   /* -------------------------------- exits -------------------------------- */
   /** An order's paper/real identity is fixed at entry, even if a config or
    * restart later changes the global mode. Never silently cross that boundary. */
@@ -488,6 +535,28 @@ class Trader {
     position.paperCurve.tokenDelta = (BigInt(position.paperCurve.tokenDelta) + tokens).toString();
   }
 
+  /** Only observed, fresh on-chain real SOL counts toward the per-position
+   * peak. No paper buy is added to the actual liquidity safety signal. */
+  _observeLiquidity(position, price) {
+    if (price?.realSolReserves == null) return undefined;
+    let current;
+    try { current = BigInt(price.realSolReserves); } catch { return undefined; }
+    if (current < 0n) return undefined;
+    let peak = position.realLiquidityPeakLamports == null
+      ? current : BigInt(position.realLiquidityPeakLamports);
+    if (current > peak) peak = current;
+    position.realLiquidityPeakLamports = peak.toString();
+    const dropPct = peak > 0n ? Math.max(0,
+      (Number(peak - current) / Number(peak)) * 100) : 0;
+    position.lastLiquidityObservation = {
+      currentLamports: current.toString(), peakLamports: peak.toString(),
+      dropPct, thresholdPct: this.cfg.exits.liquidityDropExitPct,
+      observedAt: price.ts,
+      slot: Number.isSafeInteger(price.slot) ? price.slot : null,
+    };
+    return dropPct;
+  }
+
   async manage(ctx) {
     /* Deliberately NOT gated on cfg.enabled.
      *
@@ -521,114 +590,133 @@ class Trader {
         ? curve.spotPriceScaled(quoted.virtualSolReserves, quoted.virtualTokenReserves)
         : price.price, price.ts);
 
-      if (price.liquidityDropPct !== undefined) {
-        const decisions = risk.evaluate(position, this.cfg, { liquidityDropPct: price.liquidityDropPct });
-        if (decisions.length) await this._act(position, decisions, ctx);
-      } else {
-        const decisions = risk.evaluate(position, this.cfg, {});
-        if (decisions.length) await this._act(position, decisions, ctx);
+      const liquidityDropPct = this._observeLiquidity(position, price);
+      const decisions = risk.evaluate(position, this.cfg,
+        liquidityDropPct === undefined ? {} : { liquidityDropPct });
+      for (const d of decisions) {
+        if (d.reason === 'liquidity_exit') d.liquidity = { ...position.lastLiquidityObservation };
       }
+      if (decisions.length) await this._act(position, decisions, ctx);
     }
   }
 
   async _act(position, decisions, ctx) {
-    if (!this._exitModeMatches(position)) return;
-    const g = this.getConfig();
+    if (!this._exitModeMatches(position) || !position.isOpen || position.tokensHeld <= 0n) return;
+    // The poller is serialized too, but manual Kill, Panic and other callers
+    // must not race an already-submitted partial/full sell for this position.
+    this._exitInFlight ??= new Set();
+    if (this._exitInFlight.has(position.id)) return;
+    this._exitInFlight.add(position.id);
+    try {
+      const g = this.getConfig();
 
-    for (const d of decisions) {
-      if (d.action === 'HOLD') continue;
+      for (const d of decisions) {
+        if (d.action === 'HOLD') continue;
 
-      if (d.action === 'SELL') {
-        // Risk returns ABSOLUTE token amounts so sequential tier fills in the
-        // same tick each get their full intended size.
-        const sellTokens = d.tokens ?? (d.pct >= 100
-          ? position.tokensHeld
-          : (position.tokensHeld * BigInt(Math.round(d.pct * 100))) / 10000n);
+        if (d.action === 'SELL') {
+          // Risk returns ABSOLUTE token amounts so sequential tier fills in the
+          // same tick each get their full intended size.
+          const sellTokens = d.tokens ?? (d.pct >= 100
+            ? position.tokensHeld
+            : (position.tokensHeld * BigInt(Math.round(d.pct * 100))) / 10000n);
 
-        if (sellTokens <= 0n) continue;
-        if (sellTokens > position.tokensHeld) continue;
+          if (sellTokens <= 0n) continue;
+          if (sellTokens > position.tokensHeld) continue;
 
-        const price = this.priceCache.get(position.mint);
-        const quoted = this._quoteReserves(position, price);
-        if (this.isPaperTrading && !quoted) continue; // no invented paper fill
-        const expectedSol = quoted
-          ? curve.solOutForTokensIn(sellTokens, quoted.virtualSolReserves, quoted.virtualTokenReserves)
-          : 0n;
+          const price = this.priceCache.get(position.mint);
+          const quoted = this._quoteReserves(position, price);
+          if (this.isPaperTrading && !quoted) continue; // no invented paper fill
+          const expectedSol = quoted
+            ? curve.solOutForTokensIn(sellTokens, quoted.virtualSolReserves, quoted.virtualTokenReserves)
+            : 0n;
 
-        const label = `SELL ${d.pct >= 100 ? '100' : d.pct.toFixed(0)}% ${position.symbol} [${mintRef(position.mint)}] (${d.reason})`;
-        const provider = this._providerFor(g);
+          const label = `SELL ${d.pct >= 100 ? '100' : d.pct.toFixed(0)}% ${position.symbol} [${mintRef(position.mint)}] (${d.reason})`;
+          const provider = this._providerFor(g);
 
-        let res;
-        if (this.executor.dryRun) {
-          res = await this.executor.signAndSend({
-            walletId: this.cfg.id, tx: { dry: true }, label,
-            simulate: { solOut: expectedSol, tokensIn: sellTokens },
-          });
-        } else {
-          res = await this.executor.sellWithEscalation({
-            walletId: this.cfg.id,
-            tokenAmountRaw: sellTokens,
-            baseSlippageBps: this.cfg.buy.slippageBps,
-            label,
-            buildSell: ({ slippageBps }) => provider.sell({
-              conn: this.executor.conn(),
-              publicKey: this.publicKey,
-              mint: position.mint,
-              tokenAmount: sellTokens.toString(),
-              tokenAmountRaw: sellTokens.toString(),
-              minSolLamports: (expectedSol * BigInt(10000 - slippageBps)) / 10000n,
-              slippageBps,
-              priorityFeeSol: Number(g.execution.priorityFeeMicroLamports) / 1e6,
-              priorityFeeMicroLamports: g.execution.priorityFeeMicroLamports,
-              computeUnitLimit: g.execution.computeUnitLimit,
-              creator: position.meta?.creator,
-            }),
-          });
-        }
-
-        if (!res.ok) {
-          // Leave the tier unfilled so the rule re-fires on the next tick.
-          log.error(`Exit failed for ${position.symbol} (${d.reason}) — will retry next tick`, { wallet: this.cfg.name });
-          bus.safeEmit('trade:failed', { walletId: this.cfg.id, side: 'sell', mint: position.mint, error: res.error, reason: d.reason });
-          continue;
-        }
-
-        const pctSold = Number(sellTokens) / Number(position.originalTokens) * 100;
-        const wasFullExit = sellTokens >= position.tokensHeld;
-
-        // recordExit emits updated/closed events synchronously. Mark the tier
-        // BEFORE those events, or an already-open Trades dialog (and a position
-        // snapshot taken on close) sees a sold partial with tier still unfilled.
-        if (d.tier !== undefined && d.tier !== null && position.tiers[d.tier]) {
-          position.tiers[d.tier].filled = true;
-        }
-        if (wasFullExit) {
-          for (const t of position.tiers) {
-            if (!t.filled) { t.filled = true; t.superseded = true; }
+          let res;
+          if (this.executor.dryRun) {
+            res = await this.executor.signAndSend({
+              walletId: this.cfg.id, tx: { dry: true }, label,
+              simulate: { solOut: expectedSol, tokensIn: sellTokens },
+            });
+          } else {
+            res = await this.executor.sellWithEscalation({
+              walletId: this.cfg.id,
+              tokenAmountRaw: sellTokens,
+              baseSlippageBps: this.cfg.buy.slippageBps,
+              label,
+              buildSell: ({ slippageBps }) => provider.sell({
+                conn: this.executor.conn(),
+                publicKey: this.publicKey,
+                mint: position.mint,
+                tokenAmount: sellTokens.toString(),
+                tokenAmountRaw: sellTokens.toString(),
+                minSolLamports: (expectedSol * BigInt(10000 - slippageBps)) / 10000n,
+                slippageBps,
+                priorityFeeSol: Number(g.execution.priorityFeeMicroLamports) / 1e6,
+                priorityFeeMicroLamports: g.execution.priorityFeeMicroLamports,
+                computeUnitLimit: g.execution.computeUnitLimit,
+                creator: position.meta?.creator,
+              }),
+            });
           }
+
+          if (!res.ok) {
+            // Leave the tier unfilled so the rule re-fires on the next tick.
+            log.error(`Exit failed for ${position.symbol} (${d.reason}) — will retry next tick`, { wallet: this.cfg.name });
+            bus.safeEmit('trade:failed', { walletId: this.cfg.id, side: 'sell', mint: position.mint, error: res.error, reason: d.reason });
+            continue;
+          }
+
+          const liveDelta = this.isPaperTrading ? null : await this._readSellWalletDelta(res.signature);
+          if (!this.isPaperTrading && liveDelta === null) {
+            log.warn(`LIVE sell ${res.signature || '(no signature)'} confirmed, but wallet SOL change unread; displayed proceeds are a curve ESTIMATE, not a verified fill`,
+              { wallet: this.cfg.name });
+          }
+          const solReceived = liveDelta ?? expectedSol;
+          const proceedsSource = this.isPaperTrading ? 'paper_curve_quote'
+            : liveDelta === null ? 'live_curve_estimate' : 'live_wallet_delta';
+          const pctSold = Number(sellTokens) / Number(position.originalTokens) * 100;
+          const wasFullExit = sellTokens >= position.tokensHeld;
+
+          // recordExit emits updated/closed events synchronously. Mark the tier
+          // BEFORE those events, or an already-open Trades dialog (and a position
+          // snapshot taken on close) sees a sold partial with tier still unfilled.
+          if (d.tier !== undefined && d.tier !== null && position.tiers[d.tier]) {
+            position.tiers[d.tier].filled = true;
+          }
+          if (wasFullExit) {
+            for (const t of position.tiers) {
+              if (!t.filled) { t.filled = true; t.superseded = true; }
+            }
+          }
+          if (quoted) this._recordPaperSell(position, quoted, sellTokens);
+          position.recordExit({
+            pctSold,
+            tokensSold: sellTokens,
+            solReceived,
+            reason: d.reason,
+            tier: d.tier ?? null,
+            signature: res.signature,
+            liquidity: d.liquidity || null,
+            proceedsSource,
+          });
+
+          const gain = position.priceGainPct();
+          log.trade(
+            `🔴 SOLD ${pctSold.toFixed(1)}% ${position.symbol} [${mintRef(position.mint)}] @ ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}% ` +
+            `· ${(Number(solReceived) / 1e9).toFixed(4)} SOL${proceedsSource === 'live_curve_estimate' ? ' [ESTIMATE]' : ''} · ${d.reason}${this.executor.dryRun ? ' [SIM]' : ''}`,
+            { wallet: this.cfg.name }
+          );
+
+          if (wasFullExit) this._onPositionClosed(position);
+          bus.safeEmit('position:exited', { position: position.toJSON(), decision: d, signature: res.signature });
         }
-        if (quoted) this._recordPaperSell(position, quoted, sellTokens);
-        position.recordExit({
-          pctSold,
-          tokensSold: sellTokens,
-          solReceived: expectedSol,
-          reason: d.reason,
-          tier: d.tier ?? null,
-          signature: res.signature,
-        });
-
-        const gain = position.priceGainPct();
-        log.trade(
-          `🔴 SOLD ${pctSold.toFixed(1)}% ${position.symbol} [${mintRef(position.mint)}] @ ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}% ` +
-          `· ${(Number(expectedSol) / 1e9).toFixed(4)} SOL · ${d.reason}${this.executor.dryRun ? ' [SIM]' : ''}`,
-          { wallet: this.cfg.name }
-        );
-
-        if (wasFullExit) this._onPositionClosed(position);
-        bus.safeEmit('position:exited', { position: position.toJSON(), decision: d, signature: res.signature });
       }
+      void ctx;
+    } finally {
+      this._exitInFlight.delete(position.id);
     }
-    void ctx;
   }
 
   /** Update daily P&L, streaks and circuit breakers when a position fully closes. */
@@ -720,7 +808,18 @@ class Trader {
     }
     if (!this._exitModeMatches(position)) return { ok: false, error: 'position_mode_mismatch',
       hint: 'This position was opened in a different mode. Restore its original paper or LIVE mode before exiting it.' };
+    this._exitInFlight ??= new Set();
+    if (this._exitInFlight.has(position.id)) return { ok: false, error: 'exit_in_progress',
+      hint: 'An exit is already being submitted for this position. Wait for its result before retrying.' };
+    this._exitInFlight.add(position.id);
+    try {
+      return await this._killPositionUnlocked(position, reason);
+    } finally {
+      this._exitInFlight.delete(position.id);
+    }
+  }
 
+  async _killPositionUnlocked(position, reason) {
     const g = this.getConfig();
     const tokens = position.tokensHeld;
     const price = this.priceCache.get(position.mint);
@@ -778,7 +877,14 @@ class Trader {
       return res;
     }
 
-    const solReceived = res.fill?.solOut ?? expectedSol;
+    const liveDelta = this.isPaperTrading ? null : await this._readSellWalletDelta(res.signature);
+    if (!this.isPaperTrading && liveDelta === null) {
+      log.warn(`LIVE kill ${res.signature || '(no signature)'} confirmed, but wallet SOL change unread; displayed proceeds are a curve ESTIMATE, not a verified fill`,
+        { wallet: this.cfg.name });
+    }
+    const solReceived = liveDelta ?? (res.fill?.solOut ?? expectedSol);
+    const proceedsSource = this.isPaperTrading ? 'paper_curve_quote'
+      : liveDelta === null ? 'live_curve_estimate' : 'live_wallet_delta';
     if (quoted) this._recordPaperSell(position, quoted, tokens);
     for (const t of position.tiers) if (!t.filled) { t.filled = true; t.superseded = true; }
     position.recordExit({
@@ -788,11 +894,12 @@ class Trader {
       reason,
       tier: null,
       signature: res.signature,
+      proceedsSource,
     });
     this._onPositionClosed(position);
 
     log.trade(
-      `⛔ KILLED ${position.symbol} · ${(Number(solReceived) / 1e9).toFixed(4)} SOL · ${reason}` +
+      `⛔ KILLED ${position.symbol} · ${(Number(solReceived) / 1e9).toFixed(4)} SOL${proceedsSource === 'live_curve_estimate' ? ' [ESTIMATE]' : ''} · ${reason}` +
       `${this.executor.dryRun ? ' [SIM]' : ''}`,
       { wallet: this.cfg.name }
     );
@@ -884,7 +991,10 @@ class Trader {
       config: this.cfg,
       stats: this.stats,
       openPositions: this.openPositions().map((p) => p.toJSON()),
-      recentPositions: [...this.positions.values()].slice(-25).reverse().map((p) => p.toJSON()),
+      recentPositions: [...new Map([
+        ...(this.closedHistory || []).slice(-40).map((p) => [p.id, p]),
+        ...[...this.positions.values()].slice(-40).map((p) => [p.id, p.toJSON()]),
+      ]).values()].slice(-40).reverse(),
       lastEntryAt: this.lastEntryAt,
     };
   }
